@@ -5,8 +5,9 @@
  *   1. Extract ordered boundary loop from mesh edges (faceGrouper.js)
  *   2. Snap boundary vertices onto the fitted analytic surface
  *   3. Build an OCCT wire from straight 3D edges
- *   4. Build an OCCT face: plane uses analytic gp_Pln;
- *      cylinder/cone/sphere/NURBS fall back to BRepBuilderAPI_MakeFace (wire-only)
+ *   4. Build an OCCT face: plane uses analytic gp_Pln + simplified wire;
+ *      cylinder/cone/sphere use MakeFace_11/12/13 (UV-bounds only, no PCurves);
+ *      NURBS falls back to BRepBuilderAPI_MakeFace (wire-only)
  *   5. Assemble all faces into a TopoDS_Compound
  *   6. Write STEP via STEPControl_Writer; chdir('/') first so the bare filename
  *      is always resolved to '/', then pre-create the inode for O_WRONLY safety
@@ -20,7 +21,7 @@ import { extractBoundaryLoop } from './faceGrouper.js';
 // ── Build version ─────────────────────────────────────────────────────────────
 
 /** Increment this string with each release to verify live-site deployments. */
-export const BUILD_VERSION = 'v0.4.3';
+export const BUILD_VERSION = 'v0.4.4';
 
 // ── OpenCASCADE lazy loader ───────────────────────────────────────────────────
 
@@ -130,6 +131,52 @@ function snapToCone(p, apex, axis, halfAngle) {
   ];
 }
 
+// ── Loop simplification ──────────────────────────────────────────────────────
+
+/**
+ * Remove collinear intermediate vertices from a closed 3-D polygon loop.
+ *
+ * A vertex is considered collinear (and removed) when the sine of the turn
+ * angle between the incoming and outgoing edge is below `angleTol`.  Multiple
+ * passes are made until the loop is stable.  Returns the original loop if the
+ * reduced version would have fewer than 3 vertices.
+ *
+ * @param {Array<[number,number,number]>} loop
+ * @param {number} [angleTol=1e-4]  sine-of-angle threshold
+ * @returns {Array<[number,number,number]>}
+ */
+function simplifyLoop(loop, angleTol = 1e-4) {
+  if (loop.length <= 3) return loop;
+  let pts = loop.slice();
+  let changed = true;
+  while (changed && pts.length > 3) {
+    changed = false;
+    const next = [];
+    const n = pts.length;
+    for (let i = 0; i < n; i++) {
+      const prev = pts[(i + n - 1) % n];
+      const curr = pts[i];
+      const nxt  = pts[(i + 1) % n];
+      const d1x = curr[0]-prev[0], d1y = curr[1]-prev[1], d1z = curr[2]-prev[2];
+      const d2x = nxt[0]-curr[0],  d2y = nxt[1]-curr[1],  d2z = nxt[2]-curr[2];
+      const l1 = Math.sqrt(d1x*d1x+d1y*d1y+d1z*d1z);
+      const l2 = Math.sqrt(d2x*d2x+d2y*d2y+d2z*d2z);
+      if (l1 < 1e-14 || l2 < 1e-14) { next.push(curr); continue; }
+      // |cross(d1,d2)| / (|d1|*|d2|) = sin of turn angle
+      const cx = d1y*d2z-d1z*d2y, cy = d1z*d2x-d1x*d2z, cz = d1x*d2y-d1y*d2x;
+      const sinA = Math.sqrt(cx*cx+cy*cy+cz*cz) / (l1*l2);
+      if (sinA > angleTol) {
+        next.push(curr);
+      } else {
+        changed = true; // drop this collinear vertex
+      }
+    }
+    if (next.length < 3) return pts; // safety: don't over-reduce
+    pts = next;
+  }
+  return pts;
+}
+
 // ── Wire builder ─────────────────────────────────────────────────────────────
 
 /**
@@ -209,7 +256,10 @@ function buildFace(oc, group, geometry, toDelete) {
   if (dedupLoop.length < 3) return null;
 
   if (type === 'plane') {
-    return _buildPlaneFace(oc, params, dedupLoop, toDelete);
+    // Simplify collinear boundary vertices so a rectangular face gets exactly
+    // 4 edges instead of dozens of tiny triangulation-artifact segments.
+    const simplified = simplifyLoop(dedupLoop);
+    return _buildPlaneFace(oc, params, simplified, toDelete);
   } else if (type === 'cylinder') {
     return _buildCylinderFace(oc, params, dedupLoop, toDelete);
   } else if (type === 'cone') {
@@ -240,25 +290,116 @@ function _buildPlaneFace(oc, params, loop, toDelete) {
 }
 
 function _buildCylinderFace(oc, params, loop, toDelete) {
-  // Straight 3D line segments between snapped vertices do not lie on the
-  // cylinder surface, so BRepBuilderAPI_MakeFace_17 would compute degenerate
-  // PCurves that silently pass IsDone() but crash inside STEPControl_Writer.
-  // Use a planar best-fit face (wire-only) instead.
-  return _buildFallbackFace(oc, loop, toDelete);
+  // Build an analytical cylindrical face using UV parameter bounds.
+  // BRepBuilderAPI_MakeFace_11(gp_Cylinder, UMin, UMax, VMin, VMax) creates a
+  // proper Geom_CylindricalSurface face without requiring PCurves, avoiding the
+  // null-PCurve crash that MakeFace_17 (cylinder + wire) triggers inside
+  // STEPControl_Writer when the wire edges are straight 3-D line segments.
+  const { axisPoint, axis, radius } = params;
+  try {
+    // V (axial) extent: project every boundary vertex onto the cylinder axis
+    let vmin = Infinity, vmax = -Infinity;
+    for (const p of loop) {
+      const v = (p[0]-axisPoint[0])*axis[0] +
+                (p[1]-axisPoint[1])*axis[1] +
+                (p[2]-axisPoint[2])*axis[2];
+      if (v < vmin) vmin = v;
+      if (v > vmax) vmax = v;
+    }
+    if (vmax - vmin < 1e-10) return _buildFallbackFace(oc, loop, toDelete);
+
+    const ax3 = makeAx3(oc, axisPoint, axis);
+    toDelete.push(ax3);
+    const cyl = new oc.gp_Cylinder_2(ax3, radius);
+    toDelete.push(cyl);
+
+    // U: full circle (0 … 2π) — correct for a complete cylindrical hole or boss.
+    // A small padding on V avoids degenerate edge artefacts at exact boundaries.
+    const pad = (vmax - vmin) * 1e-6;
+    const mf = new oc.BRepBuilderAPI_MakeFace_11(
+      cyl, 0.0, 2 * Math.PI, vmin - pad, vmax + pad,
+    );
+    toDelete.push(mf);
+    if (!mf.IsDone()) return _buildFallbackFace(oc, loop, toDelete);
+    return mf.Face();
+  } catch {
+    return _buildFallbackFace(oc, loop, toDelete);
+  }
 }
 
 function _buildConeFace(oc, params, loop, toDelete) {
-  // Straight 3D edges between snapped vertices are not generators of the cone,
-  // so they don't lie exactly on the cone surface. BRepBuilderAPI_MakeFace with
-  // a Geom_ConicalSurface would produce degenerate PCurves. Use the wire-only
-  // planar fallback — correct boundary shape, no null-PCurve crash.
-  return _buildFallbackFace(oc, loop, toDelete);
+  // Build an analytical conical face using UV parameter bounds.
+  // BRepBuilderAPI_MakeFace_12(gp_Cone, UMin, UMax, VMin, VMax) avoids the
+  // null-PCurve crash that occurs when using a wire of straight 3-D edges.
+  const { apex, axis, halfAngle } = params;
+  try {
+    // V is the signed axial distance from the apex along the cone axis.
+    let vmin = Infinity, vmax = -Infinity;
+    for (const p of loop) {
+      const v = (p[0]-apex[0])*axis[0] +
+                (p[1]-apex[1])*axis[1] +
+                (p[2]-apex[2])*axis[2];
+      if (v < vmin) vmin = v;
+      if (v > vmax) vmax = v;
+    }
+    if (vmax - vmin < 1e-10 || vmin < -1e-6) {
+      // Degenerate extent or apex behind origin — use planar fallback
+      return _buildFallbackFace(oc, loop, toDelete);
+    }
+
+    const ax3 = makeAx3(oc, apex, axis);
+    toDelete.push(ax3);
+    // gp_Cone_2(Ax3, HalfAngle, RadiusAtOrigin): origin is at apex, radius=0 there.
+    const cone = new oc.gp_Cone_2(ax3, halfAngle, 0.0);
+    toDelete.push(cone);
+
+    const pad = (vmax - vmin) * 1e-6;
+    const mf = new oc.BRepBuilderAPI_MakeFace_12(
+      cone, 0.0, 2 * Math.PI, vmin - pad, vmax + pad,
+    );
+    toDelete.push(mf);
+    if (!mf.IsDone()) return _buildFallbackFace(oc, loop, toDelete);
+    return mf.Face();
+  } catch {
+    return _buildFallbackFace(oc, loop, toDelete);
+  }
 }
 
 function _buildSphereFace(oc, params, loop, toDelete) {
-  // Same reasoning as cylinder: straight edges between snapped vertices lie
-  // inside the sphere, not on it. Skip MakeFace_19 and use the planar fallback.
-  return _buildFallbackFace(oc, loop, toDelete);
+  // Build an analytical spherical face using UV parameter bounds.
+  // BRepBuilderAPI_MakeFace_13(gp_Sphere, UMin, UMax, VMin, VMax) avoids the
+  // null-PCurve crash from straight-edge wires.  Latitude is computed using the
+  // Z-axis of a default frame centered at the sphere's centre; for a full or
+  // near-full hemisphere use -π/2 … π/2.
+  const { center, radius } = params;
+  try {
+    // V (latitude) extent: arcsin of (dz / r) relative to Z-up frame
+    let vmin =  Math.PI / 2;
+    let vmax = -Math.PI / 2;
+    for (const p of loop) {
+      const dz = p[2] - center[2];
+      const lat = Math.asin(Math.max(-1, Math.min(1, dz / radius)));
+      if (lat < vmin) vmin = lat;
+      if (lat > vmax) vmax = lat;
+    }
+    if (vmax - vmin < 1e-10) return _buildFallbackFace(oc, loop, toDelete);
+
+    // Place the sphere centre at `center` with default Z-up orientation
+    const ax3 = new oc.gp_Ax3_4(makePnt(oc, center), makeDir(oc, [0, 0, 1]));
+    toDelete.push(ax3);
+    const sph = new oc.gp_Sphere_2(ax3, radius);
+    toDelete.push(sph);
+
+    const pad = Math.max((vmax - vmin) * 1e-6, 1e-8);
+    const mf = new oc.BRepBuilderAPI_MakeFace_13(
+      sph, 0.0, 2 * Math.PI, vmin - pad, vmax + pad,
+    );
+    toDelete.push(mf);
+    if (!mf.IsDone()) return _buildFallbackFace(oc, loop, toDelete);
+    return mf.Face();
+  } catch {
+    return _buildFallbackFace(oc, loop, toDelete);
+  }
 }
 
 /**
