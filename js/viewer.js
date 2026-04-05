@@ -553,18 +553,27 @@ export function setViewerTheme(isLight) {
  * @param {THREE.BufferGeometry} geometry   non-indexed source geometry
  * @param {Array<{triangleIndices:Set<number>}>} groups
  */
+
+// Multiplier that distributes hues using the golden angle (≈137.508°)
+const GOLDEN_ANGLE_DEG = 137.508;
+// HSL parameters for face-group colours — saturated and mid-lightness
+const GROUP_COLOR_SATURATION = 0.72;
+const GROUP_COLOR_LIGHTNESS  = 0.52;
+
 export function showFaceGroupColors(geometry, groups) {
   if (!currentMesh) return;
 
   if (!groups || groups.length === 0) {
-    // Restore default material
+    // Restore default material and always ensure vertex normals are present
     if (currentMesh.material) currentMesh.material.dispose();
     currentMesh.material = new THREE.MeshStandardMaterial({
       color: 0xaaaacc, roughness: 0.6, metalness: 0.1, side: THREE.DoubleSide,
     });
     if (currentMesh.geometry !== geometry) {
       currentMesh.geometry = geometry;
-      if (!currentMesh.geometry.attributes.normal) currentMesh.geometry.computeVertexNormals();
+    }
+    if (!currentMesh.geometry.attributes.normal) {
+      currentMesh.geometry.computeVertexNormals();
     }
     return;
   }
@@ -573,8 +582,8 @@ export function showFaceGroupColors(geometry, groups) {
   const colors = new Float32Array(count * 3);
 
   groups.forEach((group, idx) => {
-    const hue = (idx * 137.508) % 360; // golden-angle hue spacing
-    const c = new THREE.Color().setHSL(hue / 360, 0.72, 0.52);
+    const hue = (idx * GOLDEN_ANGLE_DEG) % 360;
+    const c = new THREE.Color().setHSL(hue / 360, GROUP_COLOR_SATURATION, GROUP_COLOR_LIGHTNESS);
     for (const triIdx of group.triangleIndices) {
       for (let v = 0; v < 3; v++) {
         const vi = triIdx * 3 + v;

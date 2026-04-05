@@ -1188,7 +1188,7 @@ input[type="number"].val:focus { outline: none; border-color: var(--accent); }
   margin-top: 8px;
   font-size: 11px;
   color: var(--text-muted);
-  min-height: 16px;
+  min-height: 16px; /* reserve one line so layout doesn't jump when text appears */
 }
 
 /* ── Surface list container ──────────────────────────────────────────── */
