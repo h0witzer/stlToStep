@@ -202,6 +202,38 @@
   <!-- Hidden file input — placed at body level so it is never inside a display:none container -->
   <input type="file" id="stl-file-input" accept=".stl,.obj,.3mf" style="display:none" />
 
+  <!-- Catch module-load failures and show a readable error instead of a silent blank UI -->
+  <div id="load-error" style="display:none;position:fixed;inset:0;z-index:9999;background:#1a1a20;
+       color:#f88;font:16px/1.6 system-ui,sans-serif;padding:2rem;white-space:pre-wrap;"></div>
+  <script>
+    window.addEventListener('error', function (e) {
+      var box = document.getElementById('load-error');
+      if (!box) return;
+      box.style.display = 'block';
+      box.textContent =
+        '⚠️  A script failed to load. If you opened this file directly (file://) please\n' +
+        'use a local HTTP server instead:\n\n' +
+        '  node server.js\n\n' +
+        'Then open  http://localhost:3000  in your browser.\n\n' +
+        '──────────────────────────────\n' +
+        'Technical detail: ' + (e.message || e.type) + '\n' +
+        (e.filename ? 'File: ' + e.filename + (e.lineno ? ':' + e.lineno : '') : '');
+    });
+    window.addEventListener('unhandledrejection', function (e) {
+      var box = document.getElementById('load-error');
+      if (!box || box.style.display !== 'none') return; // already showing an error
+      box.style.display = 'block';
+      var reason = e.reason ? (e.reason.message || String(e.reason)) : String(e);
+      box.textContent =
+        '⚠️  A script failed to load. If you opened this file directly (file://) please\n' +
+        'use a local HTTP server instead:\n\n' +
+        '  node server.js\n\n' +
+        'Then open  http://localhost:3000  in your browser.\n\n' +
+        '──────────────────────────────\n' +
+        'Technical detail: ' + reason;
+    });
+  </script>
+
   <script type="module" src="js/main.js"></script>
 </body>
 </html>
