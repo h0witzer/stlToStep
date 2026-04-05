@@ -276,7 +276,18 @@ export async function buildAndExportSTEP(groups, geometry, options = {}, onStatu
 
   if (faces.length === 0) throw new Error('No valid B-rep faces could be constructed.');
 
-  onStatus?.(`Writing ${faces.length} faces to STEP…`, 70);
+  onStatus?.(`Assembling ${faces.length} faces…`, 55);
+
+  // Assemble all faces into a compound. All faces are built with MakeFace_15 (wire-only
+  // best-fit plane) or MakeFace_16 (analytic plane), so they have valid PCurves and can
+  // be transferred to STEP in a single call without triggering OCCT null-pointer traps.
+  const builder = new oc.BRep_Builder();
+  const compound = new oc.TopoDS_Compound();
+  toDelete.push(compound);
+  builder.MakeCompound(compound);
+  for (const f of faces) builder.Add(compound, f);
+
+  onStatus?.('Writing STEP file…', 80);
 
   // Set STEP schema
   try {
@@ -289,27 +300,22 @@ export async function buildAndExportSTEP(groups, geometry, options = {}, onStatu
   const writer = new oc.STEPControl_Writer_1();
   toDelete.push(writer);
 
-  // Transfer each face individually so a single bad face can't abort the export.
-  // STEPControl_Writer accumulates shapes across Transfer calls; one Write() at the end.
-  let transferredCount = 0;
-  for (const face of faces) {
-    try {
-      const result = writer.Transfer(
-        face,
-        oc.STEPControl_StepModelType.STEPControl_AsIs,
-        true,
-      );
-      if (result === oc.IFSelect_ReturnStatus.IFSelect_RetDone) transferredCount++;
-    } catch (err) {
-      console.warn('STEP transfer failed for face:', err.message);
-    }
+  const transferResult = writer.Transfer(
+    compound,
+    oc.STEPControl_StepModelType.STEPControl_AsIs,
+    true,
+  );
+
+  if (transferResult !== oc.IFSelect_ReturnStatus.IFSelect_RetDone) {
+    throw new Error(`STEPControl_Writer.Transfer failed (status ${transferResult}).`);
   }
 
-  if (transferredCount === 0) throw new Error('No faces could be transferred to STEP.');
-
-  onStatus?.('Writing STEP file…', 85);
   const stepPath = '/brep_export.stp';
-  writer.Write(stepPath);
+  const writeResult = writer.Write(stepPath);
+  if (writeResult !== oc.IFSelect_ReturnStatus.IFSelect_RetDone) {
+    throw new Error(`STEPControl_Writer.Write failed (status ${writeResult}).`);
+  }
+
   const stepContent = oc.FS.readFile(stepPath, { encoding: 'utf8' });
   try { oc.FS.unlink(stepPath); } catch { /* ignore */ }
 
