@@ -227,6 +227,98 @@ export function fitCylinder(vertices, normals) {
   return { axis, axisPoint, radius, rms: Math.sqrt(rms/nv) };
 }
 
+// ── Cone fitting ─────────────────────────────────────────────────────────────
+
+/**
+ * Fit a cone to a vertex/normal cloud.
+ *
+ * Strategy:
+ *  1. The cone axis is the eigenvector of the normal covariance with the
+ *     smallest eigenvalue (same starting point as cylinder fitting).
+ *  2. Discriminate from cylinder by checking mean projection of normals onto
+ *     that axis: for a cylinder ≈ 0; for a cone ≈ ±sin(halfAngle).
+ *  3. Estimate the apex by linear regression: r_i = |z_i - z_apex| * tan(α).
+ *
+ * @param {Float32Array} vertices  flat [x,y,z, …]
+ * @param {Float32Array} normals   flat [nx,ny,nz, …]
+ * @returns {{ axis, apex, halfAngle, rms } | null}
+ */
+export function fitCone(vertices, normals) {
+  const nn = normals.length / 3;
+  const nv = vertices.length / 3;
+  if (nn < 6 || nv < 6) return null;
+
+  // 1. Axis estimate via normal covariance (smallest eigenvalue direction)
+  let c00=0,c01=0,c02=0,c11=0,c12=0,c22=0;
+  for (let i = 0; i < nn; i++) {
+    const x=normals[i*3], y=normals[i*3+1], z=normals[i*3+2];
+    c00+=x*x; c01+=x*y; c02+=x*z; c11+=y*y; c12+=y*z; c22+=z*z;
+  }
+  const sc = 1/nn;
+  const { vectors } = eigen3([c00*sc,c01*sc,c02*sc,c11*sc,c12*sc,c22*sc]);
+  let axis = normalize(vectors[0]); // smallest eigenvalue
+
+  // 2. Mean projection of normals onto axis = ±sin(halfAngle) for a cone
+  let meanProj = 0;
+  for (let i = 0; i < nn; i++) {
+    meanProj += normals[i*3]*axis[0]+normals[i*3+1]*axis[1]+normals[i*3+2]*axis[2];
+  }
+  meanProj /= nn;
+
+  const absMeanProj = Math.abs(meanProj);
+  // Discard if too close to cylinder (absMeanProj ≈ 0) or degenerate
+  if (absMeanProj < 0.08 || absMeanProj > 0.98) return null;
+
+  // Orient axis so normals project negatively (outward normals tilt away from axis)
+  if (meanProj > 0) axis = [-axis[0], -axis[1], -axis[2]];
+
+  const halfAngle = Math.asin(absMeanProj);
+  const tanA = Math.tan(halfAngle);
+  if (!isFinite(tanA) || tanA < 1e-6) return null;
+
+  // 3. Vertex centroid
+  let cx=0, cy=0, cz=0;
+  for (let i=0;i<nv;i++){cx+=vertices[i*3];cy+=vertices[i*3+1];cz+=vertices[i*3+2];}
+  cx/=nv; cy/=nv; cz/=nv;
+
+  // 4. Apex estimation: z_apex = z_i - r_i/tanA (if apex below section)
+  //    OR z_apex = z_i + r_i/tanA (if apex above section)
+  //    Try both; pick the one with lower variance.
+  let sum1=0, sum2=0;
+  for (let i=0;i<nv;i++){
+    const dx=vertices[i*3]-cx, dy=vertices[i*3+1]-cy, dz=vertices[i*3+2]-cz;
+    const az = dx*axis[0]+dy*axis[1]+dz*axis[2];
+    const rx=dx-az*axis[0], ry=dy-az*axis[1], rz=dz-az*axis[2];
+    const r = Math.sqrt(rx*rx+ry*ry+rz*rz);
+    sum1 += az - r/tanA;
+    sum2 += az + r/tanA;
+  }
+  const zapex1=sum1/nv, zapex2=sum2/nv;
+
+  let var1=0, var2=0;
+  for (let i=0;i<nv;i++){
+    const dx=vertices[i*3]-cx, dy=vertices[i*3+1]-cy, dz=vertices[i*3+2]-cz;
+    const az = dx*axis[0]+dy*axis[1]+dz*axis[2];
+    const rx=dx-az*axis[0], ry=dy-az*axis[1], rz=dz-az*axis[2];
+    const r = Math.sqrt(rx*rx+ry*ry+rz*rz);
+    var1 += (az-r/tanA-zapex1)**2;
+    var2 += (az+r/tanA-zapex2)**2;
+  }
+  const zapex = var1 <= var2 ? zapex1 : zapex2;
+  const apex = [cx+zapex*axis[0], cy+zapex*axis[1], cz+zapex*axis[2]];
+
+  // 5. Vertex RMS (radial error on cone surface)
+  let rms = 0;
+  for (let i=0;i<nv;i++){
+    const dx=vertices[i*3]-apex[0], dy=vertices[i*3+1]-apex[1], dz=vertices[i*3+2]-apex[2];
+    const az = dx*axis[0]+dy*axis[1]+dz*axis[2];
+    const rx=dx-az*axis[0], ry=dy-az*axis[1], rz=dz-az*axis[2];
+    const r = Math.sqrt(rx*rx+ry*ry+rz*rz);
+    rms += (r - Math.abs(az)*tanA)**2;
+  }
+  return { axis, apex, halfAngle, rms: Math.sqrt(rms/nv) };
+}
+
 // ── Sphere fitting ────────────────────────────────────────────────────────────
 
 /**
@@ -299,7 +391,7 @@ function _solve4(A, b) {
  * @param {{ triangleIndices: Set<number> }} group
  * @param {THREE.BufferGeometry} geometry
  * @returns {{
- *   type: 'plane'|'cylinder'|'sphere'|'nurbs',
+ *   type: 'plane'|'cylinder'|'cone'|'sphere'|'nurbs',
  *   params: object,
  *   rms: number
  * }}
@@ -323,6 +415,16 @@ export function classifyGroup(group, geometry) {
   const candidates = [
     { type: 'plane', params: planeFit, rms: planeFit.rms },
   ];
+
+  // Try cone (needs normals)
+  if (n >= 6) {
+    try {
+      const coneFit = fitCone(vertices, normals);
+      if (coneFit && coneFit.halfAngle > 0 && isFinite(coneFit.rms)) {
+        candidates.push({ type: 'cone', params: coneFit, rms: coneFit.rms });
+      }
+    } catch { /* skip */ }
+  }
 
   // Try cylinder (needs normals)
   if (n >= 3) {
@@ -373,8 +475,8 @@ export function classifyGroup(group, geometry) {
   }
 
   // Choose best candidate: lowest rms relative to scale
-  // Apply a bias against complex surfaces (prefer plane > cyl > sphere)
-  const bias = { plane: 1.0, cylinder: 1.15, sphere: 1.5, nurbs: 9999 };
+  // Apply a bias against complex surfaces (prefer plane > cyl > cone > sphere)
+  const bias = { plane: 1.0, cylinder: 1.15, cone: 1.25, sphere: 1.5, nurbs: 9999 };
   candidates.sort((a, b) => (a.rms * bias[a.type]) - (b.rms * bias[b.type]));
 
   const best = candidates[0];

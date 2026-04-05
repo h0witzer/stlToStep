@@ -18,7 +18,7 @@ import { loadModelFile, computeBounds, getTriangleCount } from './stlLoader.js';
 import { t, initLang, setLang, getLang, applyTranslations } from './i18n.js';
 import { groupFaces } from './faceGrouper.js';
 import { fitAllGroups } from './surfaceFitter.js';
-import { initOC, buildAndExportSTEP, downloadSTEP } from './brepBuilder.js';
+import { initOC, buildAndExportSTEP, downloadSTEP, BUILD_VERSION } from './brepBuilder.js';
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
@@ -61,6 +61,12 @@ const exportProgBar  = document.getElementById('export-progress-bar');
 const exportProgLbl  = document.getElementById('export-progress-label');
 
 // ── Init ──────────────────────────────────────────────────────────────────────
+
+// Stamp the build version badge in the header
+(function () {
+  const badge = document.getElementById('build-badge');
+  if (badge) badge.textContent = BUILD_VERSION;
+})();
 
 initViewer(canvas);
 

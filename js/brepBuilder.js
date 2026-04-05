@@ -5,9 +5,9 @@
  *   1. Extract ordered boundary loop from mesh edges (faceGrouper.js)
  *   2. Snap boundary vertices onto the fitted analytic surface
  *   3. Build an OCCT wire from straight 3D edges
- *   4. Build an OCCT face: plane/cylinder/sphere uses the matching gp_* surface;
- *      NURBS / fallback uses BRepBuilderAPI_MakeFace from the wire alone
- *   5. Sew all faces into a shell; attempt ShapeFix_Solid promotion
+ *   4. Build an OCCT face: plane uses analytic gp_Pln;
+ *      cylinder/cone/sphere/NURBS fall back to BRepBuilderAPI_MakeFace (wire-only)
+ *   5. Assemble all faces into a TopoDS_Compound
  *   6. Write STEP via STEPControl_Writer
  *
  * opencascade.js is loaded lazily via dynamic import() when the user first
@@ -15,6 +15,11 @@
  */
 
 import { extractBoundaryLoop } from './faceGrouper.js';
+
+// ── Build version ─────────────────────────────────────────────────────────────
+
+/** Increment this string with each release to verify live-site deployments. */
+export const BUILD_VERSION = 'v0.4.0';
 
 // ── OpenCASCADE lazy loader ───────────────────────────────────────────────────
 
@@ -107,6 +112,23 @@ function snapToSphere(p, center, radius) {
   return [center[0]+dp[0]*s, center[1]+dp[1]*s, center[2]+dp[2]*s];
 }
 
+/** Project point p onto the cone surface (apex, axis, halfAngle). */
+function snapToCone(p, apex, axis, halfAngle) {
+  const tanA = Math.tan(halfAngle);
+  const dp = [p[0]-apex[0], p[1]-apex[1], p[2]-apex[2]];
+  const az = dp[0]*axis[0]+dp[1]*axis[1]+dp[2]*axis[2];
+  const rx = dp[0]-az*axis[0], ry = dp[1]-az*axis[1], rz = dp[2]-az*axis[2];
+  const r = Math.sqrt(rx*rx+ry*ry+rz*rz);
+  const targetR = Math.abs(az) * tanA;
+  if (r < 1e-14) return p; // on axis — can't determine radial direction
+  const s = targetR / r;
+  return [
+    apex[0] + az*axis[0] + rx*s,
+    apex[1] + az*axis[1] + ry*s,
+    apex[2] + az*axis[2] + rz*s,
+  ];
+}
+
 // ── Wire builder ─────────────────────────────────────────────────────────────
 
 /**
@@ -166,6 +188,9 @@ function buildFace(oc, group, geometry, toDelete) {
   } else if (type === 'cylinder') {
     const { axisPoint, axis, radius } = params;
     snappedLoop = rawLoop.map(p => snapToCylinder(p, axisPoint, axis, radius));
+  } else if (type === 'cone') {
+    const { apex, axis, halfAngle } = params;
+    snappedLoop = rawLoop.map(p => snapToCone(p, apex, axis, halfAngle));
   } else if (type === 'sphere') {
     const { center, radius } = params;
     snappedLoop = rawLoop.map(p => snapToSphere(p, center, radius));
@@ -186,6 +211,8 @@ function buildFace(oc, group, geometry, toDelete) {
     return _buildPlaneFace(oc, params, dedupLoop, toDelete);
   } else if (type === 'cylinder') {
     return _buildCylinderFace(oc, params, dedupLoop, toDelete);
+  } else if (type === 'cone') {
+    return _buildConeFace(oc, params, dedupLoop, toDelete);
   } else if (type === 'sphere') {
     return _buildSphereFace(oc, params, dedupLoop, toDelete);
   } else {
@@ -216,6 +243,14 @@ function _buildCylinderFace(oc, params, loop, toDelete) {
   // cylinder surface, so BRepBuilderAPI_MakeFace_17 would compute degenerate
   // PCurves that silently pass IsDone() but crash inside STEPControl_Writer.
   // Use a planar best-fit face (wire-only) instead.
+  return _buildFallbackFace(oc, loop, toDelete);
+}
+
+function _buildConeFace(oc, params, loop, toDelete) {
+  // Straight 3D edges between snapped vertices are not generators of the cone,
+  // so they don't lie exactly on the cone surface. BRepBuilderAPI_MakeFace with
+  // a Geom_ConicalSurface would produce degenerate PCurves. Use the wire-only
+  // planar fallback — correct boundary shape, no null-PCurve crash.
   return _buildFallbackFace(oc, loop, toDelete);
 }
 
@@ -315,16 +350,29 @@ export async function buildAndExportSTEP(groups, geometry, options = {}, onStatu
 
   // All confirmed working opencascade.js examples pass a bare filename (no leading
   // slash) to writer.Write — OSD_Path under Emscripten mis-handles absolute paths.
-  // The Emscripten MEMFS CWD is '/', so 'brep_export.stp' resolves to '/brep_export.stp'.
+  // We also pre-create the file via oc.FS.writeFile so that OSD_File can open it
+  // with O_WRONLY even if OCCT omits O_CREAT in the Emscripten build.
   const stepFile = 'brep_export.stp';
   const stepPath = '/' + stepFile;
+
+  // Clean up any leftover file from a previous failed export
+  try { oc.FS.unlink(stepPath); } catch { /* ignore */ }
+  // Pre-create so that OSD_File can open an existing path for writing
+  oc.FS.writeFile(stepPath, '');
 
   const writeResult = writer.Write(stepFile);
   if (writeResult !== DONE) {
     throw new Error(`STEPControl_Writer.Write failed (status ${writeResult}).`);
   }
 
-  const stepContent = oc.FS.readFile(stepPath, { encoding: 'utf8' });
+  let stepContent;
+  try {
+    stepContent = oc.FS.readFile(stepPath, { encoding: 'utf8' });
+  } catch (fsErr) {
+    // Diagnostic: log MEMFS root so the user/developer can see what was written
+    try { console.error('MEMFS / contents after Write:', oc.FS.readdir('/')); } catch { /* ignore */ }
+    throw new Error(`STEP file not found in virtual FS after Write (${fsErr.message}). MEMFS root logged above.`);
+  }
   if (!stepContent || !stepContent.startsWith('ISO-10303')) {
     throw new Error('STEP export produced empty or invalid output. Transfer returned DONE but no ISO-10303 header found.');
   }
