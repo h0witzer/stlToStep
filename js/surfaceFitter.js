@@ -522,3 +522,60 @@ export function fitAllGroups(groups, geometry) {
     group.surface = classifyGroup(group, geometry);
   }
 }
+
+/**
+ * Force a specific surface type for a group, re-running the appropriate fit
+ * function so params match the declared type.  Returns a surface object with
+ * the correct { type, params, rms } for that type, falling back to the auto-
+ * classified surface when the forced fit is degenerate.
+ *
+ * @param {'plane'|'cylinder'|'cone'|'sphere'|'nurbs'} forcedType
+ * @param {{ triangleIndices: Set<number> }} group
+ * @param {THREE.BufferGeometry} geometry
+ * @returns {{ type, params, rms }}
+ */
+export function classifyGroupAs(forcedType, group, geometry) {
+  const vertices = extractGroupVertices(geometry, group.triangleIndices);
+  const normals  = extractGroupNormals(geometry, group.triangleIndices);
+  const n = vertices.length / 3;
+
+  if (forcedType === 'plane') {
+    const fit = fitPlane(vertices);
+    // Orient to mesh normals
+    const nn = normals.length / 3;
+    let mx = 0, my = 0, mz = 0;
+    for (let i = 0; i < nn; i++) { mx += normals[i*3]; my += normals[i*3+1]; mz += normals[i*3+2]; }
+    if (fit.normal[0]*mx + fit.normal[1]*my + fit.normal[2]*mz < 0) {
+      fit.normal = [-fit.normal[0], -fit.normal[1], -fit.normal[2]];
+    }
+    return { type: 'plane', params: fit, rms: fit.rms };
+  }
+
+  if (forcedType === 'cylinder') {
+    try {
+      const fit = fitCylinder(vertices, normals);
+      if (fit && fit.radius > 1e-6 && isFinite(fit.rms)) return { type: 'cylinder', params: fit, rms: fit.rms };
+    } catch { /* fall through */ }
+  }
+
+  if (forcedType === 'cone') {
+    try {
+      const fit = fitCone(vertices, normals);
+      if (fit && fit.halfAngle > 0 && isFinite(fit.rms)) return { type: 'cone', params: fit, rms: fit.rms };
+    } catch { /* fall through */ }
+  }
+
+  if (forcedType === 'sphere') {
+    try {
+      const fit = fitSphere(vertices);
+      if (fit && fit.radius > 1e-6 && isFinite(fit.rms)) return { type: 'sphere', params: fit, rms: fit.rms };
+    } catch { /* fall through */ }
+  }
+
+  if (forcedType === 'nurbs') {
+    return { type: 'nurbs', params: { vertices, normals }, rms: Infinity };
+  }
+
+  // Forced fit was degenerate — return auto classification
+  return classifyGroup(group, geometry);
+}

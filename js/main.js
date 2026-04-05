@@ -18,7 +18,7 @@ import {
 import { loadModelFile, computeBounds, getTriangleCount } from './stlLoader.js';
 import { t, initLang, setLang, getLang, applyTranslations } from './i18n.js';
 import { groupFaces } from './faceGrouper.js';
-import { fitAllGroups } from './surfaceFitter.js';
+import { fitAllGroups, classifyGroupAs } from './surfaceFitter.js';
 import { initOC, buildAndExportSTEP, downloadSTEP, BUILD_VERSION } from './brepBuilder.js';
 import { buildBrepOverlay } from './brepVisualizer.js';
 
@@ -282,7 +282,9 @@ function renderSurfaceList() {
 
     const rmsEl = document.createElement('span');
     rmsEl.className = 'surface-rms';
-    rmsEl.textContent = isFinite(rms) ? `RMS ${rms.toFixed(4)}` : '';
+    rmsEl.textContent = isFinite(rms) && rms > 0
+      ? `RMS ${rms < 0.001 ? rms.toExponential(2) : rms.toFixed(4)}`
+      : '';
 
     // Manual override select
     const sel = document.createElement('select');
@@ -295,12 +297,28 @@ function renderSurfaceList() {
     });
     sel.addEventListener('change', () => {
       const val = sel.value;
-      if (val === 'auto') { delete g._override; g.surface = g._autoSurface; }
-      else {
+      if (val === 'auto') {
+        delete g._override;
+        g.surface = g._autoSurface;
+      } else {
         g._autoSurface = g._autoSurface ?? g.surface;
         g._override    = val;
-        g.surface      = { ...g.surface, type: val };
+        g.surface      = classifyGroupAs(val, g, currentGeometry);
+        g.surface.type = val; // ensure type label matches selection even if fit fell back
       }
+      // Refresh the row's RMS display
+      const newRms = g.surface?.rms ?? 0;
+      rmsEl.textContent = isFinite(newRms) && newRms > 0
+        ? `RMS ${newRms < 0.001 ? newRms.toExponential(2) : newRms.toFixed(4)}`
+        : '';
+      // Update the colour dot
+      const newColor = TYPE_COLORS[g.surface?.type] ?? '#aaa';
+      dot.style.background = newColor;
+      name.textContent = `Group ${i + 1} — ${TYPE_LABELS[g.surface?.type] ?? g.surface?.type}`;
+      // Rebuild the B-rep overlay to reflect the new surface type
+      const overlay = buildBrepOverlay(currentGroups, currentGeometry, TYPE_COLORS);
+      setBrepOverlay(overlay);
+      if (brepOverlayToggle?.checked) setBrepOverlayVisible(true);
     });
     // Remember the auto classification
     g._autoSurface = g._autoSurface ?? g.surface;
