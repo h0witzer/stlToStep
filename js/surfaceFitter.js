@@ -403,6 +403,21 @@ export function classifyGroup(group, geometry) {
 
   // Compute bounding sphere radius for relative RMS thresholds
   const planeFit = fitPlane(vertices);
+
+  // Orient the plane normal to agree with the mesh normals.
+  // PCA yields an arbitrary sign; align it to the mean mesh-vertex normal so
+  // OCCT always sees a consistently outward-pointing face normal.
+  {
+    const nn = normals.length / 3;
+    let mx = 0, my = 0, mz = 0;
+    for (let i = 0; i < nn; i++) {
+      mx += normals[i*3]; my += normals[i*3+1]; mz += normals[i*3+2];
+    }
+    if (planeFit.normal[0]*mx + planeFit.normal[1]*my + planeFit.normal[2]*mz < 0) {
+      planeFit.normal = [-planeFit.normal[0], -planeFit.normal[1], -planeFit.normal[2]];
+    }
+  }
+
   let maxDist = 0;
   for (let i=0;i<n;i++){
     const dx=vertices[i*3]-planeFit.origin[0],
