@@ -306,44 +306,18 @@ export async function buildAndExportSTEP(groups, geometry, options = {}, onStatu
 
   if (faces.length === 0) throw new Error('No valid B-rep faces could be constructed.');
 
-  onStatus?.(`Sewing ${faces.length} faces…`, 55);
+  onStatus?.(`Assembling ${faces.length} faces…`, 55);
 
-  // Sew all faces into a shell
-  // BRepBuilderAPI_Sewing has a single constructor (no _N suffix); all 5 params required.
-  const sewing = new oc.BRepBuilderAPI_Sewing(sewTol, true, true, true, false);
-  toDelete.push(sewing);
-  for (const f of faces) sewing.Add(f);
-  sewing.Perform();
-  const sewedShape = sewing.SewedShape();
-
-  onStatus?.('Attempting solid closure…', 65);
-
-  // Try to promote closed shell to solid
-  let finalShape = sewedShape;
-  try {
-    // ShapeFix_Shape has 2 constructors: _1=no-arg, _2=takes shape.
-    const fixer = new oc.ShapeFix_Shape_2(sewedShape);
-    toDelete.push(fixer);
-    fixer.Perform();
-    const fixed = fixer.Shape();
-
-    // Try to make a solid
-    const solidMaker = new oc.ShapeFix_Solid_1();
-    toDelete.push(solidMaker);
-    const solid = solidMaker.SolidFromShell(new oc.TopoDS_Shell());
-    // SolidFromShell needs a TopoDS_Shell — extract if sewedShape is a shell
-    const shapeType = sewedShape.ShapeType();
-    const SHELL = oc.TopAbs_ShapeEnum.TopAbs_SHELL;
-    if (shapeType === SHELL) {
-      const shell = oc.TopoDS.Shell_1(sewedShape);
-      const solidResult = solidMaker.SolidFromShell(shell);
-      if (solidResult && !solidResult.IsNull()) finalShape = solidResult;
-    } else {
-      finalShape = fixed;
-    }
-  } catch {
-    // Solid promotion failed — keep sewedShape (valid shell)
-  }
+  // BRepBuilderAPI_Sewing::Perform requires a Handle(Message_ProgressIndicator) argument
+  // that opencascade.js@1.1.4 (OCCT 7.4.0p1) does not expose as a constructible JS type.
+  // Use BRep_Builder + TopoDS_Compound instead — no Perform() needed, and the compound
+  // exports cleanly to STEP with all analytic faces intact.
+  const builder = new oc.BRep_Builder();
+  const compound = new oc.TopoDS_Compound();
+  toDelete.push(compound);
+  builder.MakeCompound(compound);
+  for (const f of faces) builder.Add(compound, f);
+  const finalShape = compound;
 
   onStatus?.('Writing STEP file…', 80);
 
@@ -365,8 +339,8 @@ export async function buildAndExportSTEP(groups, geometry, options = {}, onStatu
   );
 
   if (transferResult !== oc.IFSelect_ReturnStatus.IFSelect_RetDone) {
-    // Try with the raw sewed shape as fallback
-    writer.Transfer(sewedShape, oc.STEPControl_StepModelType.STEPControl_AsIs, true);
+    // Transfer failed with finalShape — no fallback available
+    throw new Error('STEPControl_Writer.Transfer failed.');
   }
 
   const stepPath = '/brep_export.stp';
