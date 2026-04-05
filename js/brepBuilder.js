@@ -2,10 +2,13 @@
  * brepBuilder.js — B-rep topology assembly via opencascade.js + STEP export
  *
  * Pipeline per face group:
- *   1. Extract ordered boundary loop from mesh edges (faceGrouper.js)
- *   2. Snap boundary vertices onto the fitted analytic surface
- *   3. Build an OCCT wire from straight 3D edges
- *   4. Build an OCCT face: plane uses analytic gp_Pln + simplified wire;
+ *   1. Build group adjacency map (groups that share mesh edges)
+ *   2. For planar faces: compute analytical boundary corners via 3-plane
+ *      intersection (current plane + two mutually-adjacent neighbour planes);
+ *      sort corners by azimuth around the face normal → clean polygon
+ *   3. Fallback (non-planar or insufficient neighbours): extract ordered mesh
+ *      boundary loop from edge topology, snap onto the fitted surface
+ *   4. Build an OCCT face: plane uses analytic gp_Pln + corner wire;
  *      cylinder/cone/sphere use MakeFace_11/12/13 (UV-bounds only, no PCurves);
  *      NURBS falls back to BRepBuilderAPI_MakeFace (wire-only)
  *   5. Sew all faces into a TopoDS_Shell → TopoDS_Solid (MANIFOLD_SOLID_BREP)
@@ -21,7 +24,7 @@ import { extractBoundaryLoop } from './faceGrouper.js';
 // ── Build version ─────────────────────────────────────────────────────────────
 
 /** Increment this string with each release to verify live-site deployments. */
-export const BUILD_VERSION = 'v0.4.5';
+export const BUILD_VERSION = 'v0.4.6';
 
 // ── OpenCASCADE lazy loader ───────────────────────────────────────────────────
 
@@ -131,6 +134,156 @@ function snapToCone(p, apex, axis, halfAngle) {
   ];
 }
 
+// ── Group adjacency ─────────────────────────────────────────────────────────
+
+/**
+ * Build a symmetric adjacency map between face groups by scanning every mesh
+ * edge. Two groups are adjacent when a mesh edge (identified by its quantised
+ * vertex keys) belongs to a triangle in each group.
+ *
+ * @param {object[]} groups   array of { triangleIndices }
+ * @param {THREE.BufferGeometry} geometry
+ * @returns {Map<number, Set<number>>}  groupIdx → set of adjacent groupIdxs
+ */
+function buildGroupAdjacencyMap(groups, geometry) {
+  const posAttr = geometry.attributes.position;
+  const QUANT = 1e4;
+  const qk = (x, y, z) =>
+    `${Math.round(x * QUANT)}_${Math.round(y * QUANT)}_${Math.round(z * QUANT)}`;
+
+  // Map: edge-key → first group index that claimed this edge
+  const edgeOwner = new Map();
+  const result = new Map();
+  for (let i = 0; i < groups.length; i++) result.set(i, new Set());
+
+  for (let gi = 0; gi < groups.length; gi++) {
+    for (const t of groups[gi].triangleIndices) {
+      for (let e = 0; e < 3; e++) {
+        const ai = t * 3 + e;
+        const bi = t * 3 + (e + 1) % 3;
+        const ka = qk(posAttr.getX(ai), posAttr.getY(ai), posAttr.getZ(ai));
+        const kb = qk(posAttr.getX(bi), posAttr.getY(bi), posAttr.getZ(bi));
+        const key = ka < kb ? `${ka}|${kb}` : `${kb}|${ka}`;
+        const prev = edgeOwner.get(key);
+        if (prev === undefined) {
+          edgeOwner.set(key, gi);
+        } else if (prev !== gi && prev !== -1) {
+          result.get(gi).add(prev);
+          result.get(prev).add(gi);
+          edgeOwner.set(key, -1); // mark as claimed by multiple groups
+        }
+      }
+    }
+  }
+
+  return result;
+}
+
+// ── Analytical boundary helpers ──────────────────────────────────────────────
+
+function _d3(a, b)  { return a[0]*b[0] + a[1]*b[1] + a[2]*b[2]; }
+function _x3(a, b)  {
+  return [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+}
+function _n3(v)     { return Math.sqrt(v[0]*v[0]+v[1]*v[1]+v[2]*v[2]); }
+function _u3(v)     { const n = _n3(v); return n > 1e-14 ? [v[0]/n, v[1]/n, v[2]/n] : v; }
+
+/**
+ * Compute the unique point at the intersection of three planes.
+ * Each plane is given by (unitNormal, pointOnPlane).
+ * Returns null when the determinant is below threshold (parallel planes).
+ */
+function _intersect3Planes(n1, o1, n2, o2, n3, o3) {
+  const d1 = _d3(n1, o1), d2 = _d3(n2, o2), d3 = _d3(n3, o3);
+  const c23 = _x3(n2, n3);
+  const det = _d3(n1, c23);
+  if (Math.abs(det) < 1e-10) return null;
+  const c31 = _x3(n3, n1);
+  const c12 = _x3(n1, n2);
+  return [
+    (d1*c23[0] + d2*c31[0] + d3*c12[0]) / det,
+    (d1*c23[1] + d2*c31[1] + d3*c12[1]) / det,
+    (d1*c23[2] + d2*c31[2] + d3*c12[2]) / det,
+  ];
+}
+
+/**
+ * Compute the analytical boundary loop for a planar face.
+ *
+ * For each pair of planar neighbours (j, k) that are BOTH adjacent to face i
+ * AND adjacent to each other, the three planes (i, j, k) share exactly one
+ * corner point. Collecting all such corners and sorting them by azimuth
+ * around the face normal yields the correct boundary polygon.
+ *
+ * This completely bypasses mesh edge topology so the resulting face extent is
+ * defined by the intersection of analytical surfaces, not by triangulation
+ * artefacts.
+ *
+ * @param {number}   gi         group index of the planar face
+ * @param {object[]} groups     all groups with fitted surfaces
+ * @param {Map}      adjacency  output of buildGroupAdjacencyMap()
+ * @returns {Array<[number,number,number]>|null}  ordered corners, or null
+ */
+function _analyticalPlaneBoundary(gi, groups, adjacency) {
+  const { params: pi } = groups[gi].surface;
+  const ni = pi.normal, oi = pi.origin;
+
+  // Only planar neighbours can contribute straight-line boundaries.
+  const planeNeighbors = [...(adjacency.get(gi) ?? [])]
+    .filter(j => groups[j].surface?.type === 'plane');
+
+  if (planeNeighbors.length < 3) return null;
+
+  const rawCorners = [];
+
+  for (let a = 0; a < planeNeighbors.length; a++) {
+    for (let b = a + 1; b < planeNeighbors.length; b++) {
+      const j = planeNeighbors[a];
+      const k = planeNeighbors[b];
+      // j and k must be directly adjacent to each other to form a corner
+      if (!adjacency.get(j)?.has(k)) continue;
+      const pj = groups[j].surface.params;
+      const pk = groups[k].surface.params;
+      const pt = _intersect3Planes(ni, oi, pj.normal, pj.origin, pk.normal, pk.origin);
+      if (pt) rawCorners.push(pt);
+    }
+  }
+
+  if (rawCorners.length < 3) return null;
+
+  // Deduplicate numerically coincident corners
+  const CTOL2 = 1e-8; // squared distance threshold
+  const corners = [];
+  for (const pt of rawCorners) {
+    if (!corners.some(c => {
+      const dx=pt[0]-c[0], dy=pt[1]-c[1], dz=pt[2]-c[2];
+      return dx*dx+dy*dy+dz*dz < CTOL2;
+    })) corners.push(pt);
+  }
+
+  if (corners.length < 3) return null;
+
+  // Sort corners by azimuth angle around the face normal so the polygon is
+  // wound consistently (required by OCCT's wire builder).
+  const cx = corners.reduce((s, p) => s + p[0], 0) / corners.length;
+  const cy = corners.reduce((s, p) => s + p[1], 0) / corners.length;
+  const cz = corners.reduce((s, p) => s + p[2], 0) / corners.length;
+  const nu = _u3(ni);
+  // Local X axis: pick a reference direction perpendicular to the face normal
+  const ref = Math.abs(nu[2]) < 0.9 ? [0, 0, 1] : [1, 0, 0];
+  const lx = _u3(_x3(nu, ref));
+  const ly = _x3(nu, lx); // second in-plane axis (nu × lx)
+
+  corners.sort((a, b) => {
+    const [dax, day, daz] = [a[0]-cx, a[1]-cy, a[2]-cz];
+    const [dbx, dby, dbz] = [b[0]-cx, b[1]-cy, b[2]-cz];
+    return Math.atan2(_d3([dax,day,daz], ly), _d3([dax,day,daz], lx))
+         - Math.atan2(_d3([dbx,dby,dbz], ly), _d3([dbx,dby,dbz], lx));
+  });
+
+  return corners;
+}
+
 // ── Loop simplification ──────────────────────────────────────────────────────
 
 /**
@@ -219,12 +372,37 @@ function buildWire(oc, loop, toDelete) {
 /**
  * Build a single OCCT face from a classified face group.
  *
+ * For planar faces, attempts to derive the boundary analytically from
+ * neighbouring analytical surfaces (3-plane intersections), which produces
+ * clean rectangular / polygonal faces irrespective of mesh triangulation.
+ * Falls back to mesh-edge topology when analytical corners are insufficient.
+ *
+ * @param {object} oc
+ * @param {object} group          { triangleIndices, surface: {type, params} }
+ * @param {THREE.BufferGeometry} geometry
+ * @param {object[]} toDelete
+ * @param {number}   [groupIdx]   index of this group in allGroups
+ * @param {object[]} [allGroups]  all groups (needed for analytical boundary)
+ * @param {Map}      [adjacency]  output of buildGroupAdjacencyMap()
  * @returns {object|null}  TopoDS_Face or null
  */
-function buildFace(oc, group, geometry, toDelete) {
+function buildFace(oc, group, geometry, toDelete, groupIdx, allGroups, adjacency) {
   const { type, params } = group.surface;
 
-  // Extract boundary loop from mesh topology
+  // ── Analytical boundary for planar faces ────────────────────────────────
+  // Build the boundary by intersecting neighbouring analytical planes rather
+  // than tracing mesh edge topology. This gives a clean polygon whose extents
+  // match the fitted analytical surfaces, not the triangulation artefacts.
+  if (type === 'plane' && allGroups && adjacency) {
+    const analyticalLoop = _analyticalPlaneBoundary(groupIdx, allGroups, adjacency);
+    if (analyticalLoop) {
+      return _buildPlaneFace(oc, params, analyticalLoop, toDelete);
+    }
+    // Not enough planar neighbours → fall through to mesh-topology boundary
+  }
+
+  // ── Mesh-topology boundary fallback ────────────────────────────────────
+  // Extract boundary loop from mesh edges (faceGrouper.js)
   const rawLoop = extractBoundaryLoop(geometry, group.triangleIndices);
   if (!rawLoop || rawLoop.length < 3) return null;
 
@@ -436,6 +614,10 @@ export async function buildAndExportSTEP(groups, geometry, options = {}, onStatu
 
   onStatus?.('Building B-rep faces…', 20);
 
+  // Pre-compute group adjacency so planar faces can use analytical boundary
+  // construction (3-plane intersections) instead of mesh edge topology.
+  const adjacency = buildGroupAdjacencyMap(groups, geometry);
+
   const toDelete = []; // OCCT objects to free after export
   const faces = [];
 
@@ -443,7 +625,7 @@ export async function buildAndExportSTEP(groups, geometry, options = {}, onStatu
     const g = groups[i];
     if (!g.surface) continue;
     try {
-      const face = buildFace(oc, g, geometry, toDelete);
+      const face = buildFace(oc, g, geometry, toDelete, i, groups, adjacency);
       if (face) faces.push(face);
     } catch (err) {
       console.warn(`Face ${i} (${g.surface.type}) failed:`, err);
