@@ -349,21 +349,40 @@ export async function buildAndExportSTEP(groups, geometry, options = {}, onStatu
     throw new Error(`STEPControl_Writer.Transfer failed (status ${transferResult}).`);
   }
 
-  // Pin the process CWD to '/' so bare filenames resolve predictably.
-  // In some OCCT/Emscripten builds the CWD is initialised to a non-root path
-  // (e.g. '/home/web_user') which causes Write to produce a file that is
-  // invisible from a '/' lookup.
+  // ── STEP file write ─────────────────────────────────────────────────────────
+  //
+  // OCCT's OSD_Path resolves bare filenames differently across Emscripten builds.
+  // Evidence (observed diagnostics): writing to CWD='/' with a bare filename
+  // results in an empty file at the expected inode — the actual content lands in
+  // a garbled/unexpected MEMFS entry elsewhere in '/'.
+  //
+  // Strategy:
+  //  1. Use '/tmp' as the write directory; it is always present in OCCT's MEMFS.
+  //  2. Pre-create the inode (in case OSD_File uses O_WRONLY without O_CREAT).
+  //  3. Delete the C++ writer object BEFORE reading so fclose() flushes the
+  //     FILE* buffer to MEMFS (STEPControl_Writer uses C stdio internally).
+  //  4. After flushing, try to read the file.  If the expected path is empty,
+  //     scan a fixed set of candidate directories; the writer may have resolved
+  //     the path differently.
+  //  5. Log the full MEMFS state BEFORE cleanup so the diagnostic is useful.
+
   const stepFile = 'brep_export.stp';
   const savedCwd = typeof oc.FS.cwd === 'function' ? oc.FS.cwd() : '/';
-  try { oc.FS.chdir('/'); } catch { /* not fatal — best effort */ }
 
-  // Capture the ACTUAL CWD after the chdir attempt.  If chdir('/') succeeded
-  // this is '/'; if it threw we're still in the original directory.  Both the
-  // pre-created inode and the readFile call below MUST use this same path so
-  // that writer.Write(stepFile) and oc.FS.readFile(stepPath) refer to the
-  // exact same MEMFS inode.
-  const writeCwd = typeof oc.FS.cwd === 'function' ? oc.FS.cwd() : savedCwd;
-  const stepPath = writeCwd === '/' ? '/' + stepFile : writeCwd + '/' + stepFile;
+  // Prefer '/tmp' — it exists in all OCCT Emscripten builds and is a real
+  // directory node (not root), which avoids the root-path resolution quirk.
+  let writeCwd = '/tmp';
+  try {
+    oc.FS.chdir('/tmp');
+    writeCwd = typeof oc.FS.cwd === 'function' ? oc.FS.cwd() : '/tmp';
+  } catch {
+    // '/tmp' unavailable — fall back to root
+    writeCwd = '/';
+    try { oc.FS.chdir('/'); } catch { /* best effort */ }
+    writeCwd = typeof oc.FS.cwd === 'function' ? oc.FS.cwd() : writeCwd;
+  }
+
+  const stepPath = writeCwd.endsWith('/') ? writeCwd + stepFile : writeCwd + '/' + stepFile;
 
   // Clean up any leftover from a previous failed export, then pre-create the
   // inode so that OSD_File can open it with O_WRONLY even if OCCT's libc open()
@@ -373,7 +392,7 @@ export async function buildAndExportSTEP(groups, geometry, options = {}, onStatu
 
   const writeResult = writer.Write(stepFile);
 
-  // Restore the CWD regardless of outcome
+  // Restore the CWD regardless of outcome.
   try { if (writeCwd !== savedCwd) oc.FS.chdir(savedCwd); } catch { /* ignore */ }
 
   if (writeResult !== DONE) {
@@ -390,29 +409,79 @@ export async function buildAndExportSTEP(groups, geometry, options = {}, onStatu
   if (writerIdx !== -1) toDelete.splice(writerIdx, 1);
   try { writer.delete(); } catch { /* ignore */ }
 
-  let stepContent;
-  try {
-    const raw = oc.FS.readFile(stepPath);
-    // readFile returns a Uint8Array by default in Emscripten; decode it.
-    const text = typeof raw === 'string' ? raw : new TextDecoder().decode(raw);
-    // Allow for a leading BOM (U+FEFF) or stray whitespace before the header.
-    if (text && text.includes('ISO-10303')) {
-      stepContent = text;
-    }
-  } catch { /* fall through to error below */ }
+  // ── Read back the written file ──────────────────────────────────────────────
+  // Helper: decode and validate a candidate path.
+  const tryRead = (p) => {
+    try {
+      const raw = oc.FS.readFile(p);
+      const text = typeof raw === 'string' ? raw : new TextDecoder().decode(raw);
+      return (text && text.includes('ISO-10303')) ? text : null;
+    } catch { return null; }
+  };
 
-  try { oc.FS.unlink(stepPath); } catch { /* ignore */ }
+  // Build a list of candidate locations to check in priority order.
+  // The writer may resolve the bare filename relative to its internal CWD,
+  // HOME, or some other Emscripten path rather than the POSIX CWD we set.
+  const candidatePaths = [
+    stepPath,                          // our explicit target (e.g. /tmp/brep_export.stp)
+    '/' + stepFile,                    // root fallback
+    '/home/web_user/' + stepFile,      // OCCT Emscripten HOME default
+    '/home/' + stepFile,
+  ];
+
+  let stepContent = null;
+  let usedPath = null;
+  for (const p of candidatePaths) {
+    const c = tryRead(p);
+    if (c) { stepContent = c; usedPath = p; break; }
+  }
+
+  // Last resort: walk the filesystem (depth-limited) looking for any file
+  // that contains the ISO-10303 header.  This handles exotic path resolution.
+  if (!stepContent) {
+    const scanDir = (dir, depth) => {
+      if (depth > 2) return null;
+      let entries;
+      try { entries = oc.FS.readdir(dir); } catch { return null; }
+      for (const e of entries) {
+        if (e === '.' || e === '..') continue;
+        const full = dir === '/' ? '/' + e : `${dir}/${e}`;
+        try {
+          const st = oc.FS.stat(full);
+          if (oc.FS.isDir(st.mode)) {
+            const found = scanDir(full, depth + 1);
+            if (found) return found;
+          } else if (st.size > 50) {
+            const c = tryRead(full);
+            if (c) return { path: full, content: c };
+          }
+        } catch { /* skip */ }
+      }
+      return null;
+    };
+    const found = scanDir('/', 0);
+    if (found) { stepContent = found.content; usedPath = found.path; }
+  }
+
+  // Log the MEMFS state BEFORE cleanup so the diagnostic is actionable.
+  if (!stepContent) {
+    try {
+      console.error('STEP Write diagnostics',
+        '| writeCwd:', writeCwd,
+        '| stepPath:', stepPath,
+        '| candidatePaths:', candidatePaths,
+        '| /tmp contents:', oc.FS.readdir('/tmp'),
+        '| / contents:', oc.FS.readdir('/'),
+      );
+    } catch { /* ignore */ }
+  }
+
+  // Clean up all candidate inodes.
+  for (const p of [...candidatePaths, ...(usedPath ? [usedPath] : [])]) {
+    try { oc.FS.unlink(p); } catch { /* ignore */ }
+  }
 
   if (!stepContent) {
-    // Diagnostic: log MEMFS state so developers can pinpoint the issue.
-    // We log the writeCwd (where the file was expected) and the root dir so
-    // the developer can verify whether the file was written at all and where.
-    try {
-      console.error('STEP Write diagnostics — writeCwd:', writeCwd,
-        '| stepPath:', stepPath,
-        '| writeCwd contents:', oc.FS.readdir(writeCwd),
-        '| / contents:', oc.FS.readdir('/'));
-    } catch { /* ignore */ }
     throw new Error('STEP export produced empty or invalid output. Transfer returned DONE but no ISO-10303 header found.');
   }
 
