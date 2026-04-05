@@ -2,24 +2,24 @@
  * brepBuilder.js — B-rep topology assembly via opencascade.js + STEP export
  *
  * Pipeline per face group:
- *   1. Build group adjacency map (groups that share mesh edges)
- *   2. Phase 1 — build a large analytical patch for every face group.
- *        Each patch covers the mesh-vertex UV extent with generous margin.
- *        Any surface type is handled identically — no per-type enumeration.
- *   3. Phase 2 — compute shared interface edges between every adjacent pair
- *        using BRepAlgoAPI_Section.  One kernel call per adjacent pair; the
- *        kernel handles every surface-type combination (plane/cylinder,
- *        plane/tilted-plane, cylinder/sphere, partial-revolve/oblique-plane,
- *        …) without any JS-level geometry enumeration or special-casing.
- *        The returned edges carry PCurves on both surfaces and become the
- *        shared topological edges of the final solid.
- *   4. Phase 3 — build each trimmed face from its collected interface edges.
- *        The same shared TopoDS_Edge objects appear on both bordering faces,
- *        so the resulting shell is already topologically connected — no
- *        tolerance-based sewing is required to form a manifold solid.
- *   5. Assemble: BRepBuilderAPI_Sewing (for gap/overlap healing) →
- *        BRep_Builder shell (fallback) → TopoDS_Compound (last resort).
- *   6. Write STEP via STEPControl_Writer with the /tmp CWD strategy.
+ *   1. Build group adjacency map (groups that share mesh edges).
+ *   2. Build one face per surface group:
+ *        • Planar faces — compute exact corner points by intersecting every
+ *          triple (this plane, neighbour_j, neighbour_k) where j and k are
+ *          mutually adjacent.  Sort corners by angle in the local 2-D frame,
+ *          build a wire, then call MakeFace_16(gp_Pln, wire).  Adjacent
+ *          planar faces share the same corner coordinates (same 3-plane
+ *          intersection result on both sides), so sewing succeeds without
+ *          any tolerance relaxation.
+ *        • Curved faces (cylinder / cone / sphere) — build a UV-bounded
+ *          analytical patch from mesh vertex projections.  Full-revolution
+ *          surfaces use U = 0…2π; the V range comes from axial projections.
+ *        • Fallback — a large bounding-rectangle patch is used for planar
+ *          faces whose neighbours are not all planes (e.g. a cap adjacent
+ *          only to a cylinder) or whenever the analytical build fails.
+ *   3. Assemble: BRepBuilderAPI_Sewing → BRep_Builder shell (fallback) →
+ *        TopoDS_Compound (last resort).
+ *   4. Write STEP via STEPControl_Writer with the /tmp CWD strategy.
  *
  * opencascade.js is loaded lazily via dynamic import() when the user first
  * clicks "Export STEP" so the 35 MB WASM does not block page load.
@@ -28,7 +28,7 @@
 // ── Build version ─────────────────────────────────────────────────────────────
 
 /** Increment this string with each release to verify live-site deployments. */
-export const BUILD_VERSION = 'v0.5.0';
+export const BUILD_VERSION = 'v0.6.0';
 
 // ── OpenCASCADE lazy loader ───────────────────────────────────────────────────
 
@@ -192,6 +192,101 @@ function _x3(a, b)  {
 function _n3(v)     { return Math.sqrt(v[0]*v[0]+v[1]*v[1]+v[2]*v[2]); }
 function _u3(v)     { const n = _n3(v); return n > 1e-14 ? [v[0]/n, v[1]/n, v[2]/n] : v; }
 
+// ── Plane–plane intersection utilities ─────────────────────────────────────
+
+/**
+ * Find the common point of three planes, each given as (unit normal, origin).
+ * Uses the cross-product form of Cramer's rule:
+ *   x = (d1*(n2×n3) + d2*(n3×n1) + d3*(n1×n2)) / det,  det = n1·(n2×n3)
+ *
+ * Returns null when the planes are not in general position (parallel or
+ * forming a prismatic pencil rather than a single intersection point).
+ *
+ * @param {number[]} n1,n2,n3  unit normals
+ * @param {number[]} o1,o2,o3  reference points on each plane
+ * @returns {number[]|null}
+ */
+function _intersect3Planes(n1, o1, n2, o2, n3, o3) {
+  const d1  = _d3(n1, o1);
+  const d2  = _d3(n2, o2);
+  const d3  = _d3(n3, o3);
+  const c23 = _x3(n2, n3);
+  const det = _d3(n1, c23);
+  if (Math.abs(det) < 1e-12) return null;
+  const c31 = _x3(n3, n1);
+  const c12 = _x3(n1, n2);
+  return [
+    (d1 * c23[0] + d2 * c31[0] + d3 * c12[0]) / det,
+    (d1 * c23[1] + d2 * c31[1] + d3 * c12[1]) / det,
+    (d1 * c23[2] + d2 * c31[2] + d3 * c12[2]) / det,
+  ];
+}
+
+/**
+ * Compute the exact boundary polygon for a planar face group.
+ *
+ * For every pair of mutually-adjacent planar neighbours (j, k) of face gi,
+ * intersect the three planes (gi, j, k) to obtain a corner vertex.
+ * The corners are sorted CCW by angle in the face's local 2-D frame and
+ * returned as an ordered polygon loop.
+ *
+ * Returns null when fewer than 3 unique corners are found — the caller should
+ * fall back to a mesh-vertex bounding-rectangle patch in that case.
+ *
+ * @param {number}   gi
+ * @param {object[]} groups    with `.surface = { type, params }` set
+ * @param {Map}      adjacency  from buildGroupAdjacencyMap()
+ * @returns {Array<[number,number,number]>|null}
+ */
+function _analyticalPlaneBoundary(gi, groups, adjacency) {
+  const { params: pi } = groups[gi].surface;
+  const ni  = _u3(pi.normal);
+  const oi  = pi.origin;
+  const nbrs = [...(adjacency.get(gi) ?? [])];
+  const corners = [];
+
+  for (let a = 0; a < nbrs.length; a++) {
+    for (let b = a + 1; b < nbrs.length; b++) {
+      const j = nbrs[a], k = nbrs[b];
+      // Both j and k must also be adjacent to each other to form a corner.
+      if (!adjacency.get(j)?.has(k)) continue;
+
+      const gj = groups[j], gk = groups[k];
+      if (!gj?.surface || !gk?.surface) continue;
+      // Only plane–plane–plane triples yield a point corner.
+      if (gj.surface.type !== 'plane' || gk.surface.type !== 'plane') continue;
+
+      const nj = _u3(gj.surface.params.normal);
+      const nk = _u3(gk.surface.params.normal);
+      const pt = _intersect3Planes(ni, oi, nj, gj.surface.params.origin,
+                                             nk, gk.surface.params.origin);
+      if (!pt) continue;
+
+      // Deduplicate: same triple may appear from different orderings.
+      if (!corners.some(c =>
+        Math.abs(c[0] - pt[0]) < 1e-8 &&
+        Math.abs(c[1] - pt[1]) < 1e-8 &&
+        Math.abs(c[2] - pt[2]) < 1e-8,
+      )) corners.push(pt);
+    }
+  }
+
+  if (corners.length < 3) return null;
+
+  // Sort CCW around the face normal so they form a proper polygon.
+  const ref = Math.abs(ni[2]) < 0.9 ? [0, 0, 1] : [1, 0, 0];
+  const xA  = _u3(_x3(ni, ref));
+  const yA  = _x3(ni, xA);
+  corners.sort((a, b) => {
+    const au = (a[0]-oi[0])*xA[0] + (a[1]-oi[1])*xA[1] + (a[2]-oi[2])*xA[2];
+    const av = (a[0]-oi[0])*yA[0] + (a[1]-oi[1])*yA[1] + (a[2]-oi[2])*yA[2];
+    const bu = (b[0]-oi[0])*xA[0] + (b[1]-oi[1])*xA[1] + (b[2]-oi[2])*xA[2];
+    const bv = (b[0]-oi[0])*yA[0] + (b[1]-oi[1])*yA[1] + (b[2]-oi[2])*yA[2];
+    return Math.atan2(av, au) - Math.atan2(bv, bu);
+  });
+  return corners;
+}
+
 /**
  * Scan all triangle vertices in a group to find the axial V extent.
  * Projects vertices onto the surface axis to find the parameter range.
@@ -333,36 +428,11 @@ function buildWire(oc, loop, toDelete) {
 }
 
 // ── Face builder ─────────────────────────────────────────────────────────────
-//
-// Architecture: three-phase build (no surface-type-pair special-casing).
-//
-//  Phase 1 — _buildLargePatch(oc, group, geometry, toDelete)
-//    Every surface type is treated identically: project mesh vertices into
-//    the surface's natural UV space, compute a bounding extent with margin,
-//    and call BRepBuilderAPI_MakeFace_X(surface, umin, umax, vmin, vmax).
-//    For planes a rectangular wire face is used (same idea, different API).
-//
-//  Phase 2 — _buildInterfaceEdges(oc, adjacency, patches, out, toDelete)
-//    For every adjacent pair (i, j), call BRepAlgoAPI_Section(patch_i, patch_j).
-//    The kernel computes the exact intersection curve regardless of surface
-//    type: line, circle, ellipse, sinusoid on a cylinder, etc.  The returned
-//    TopoDS_Edge objects already carry PCurves on BOTH surfaces and are stored
-//    in `out` keyed by "${min(i,j)},${max(i,j)}".  Each edge object is shared —
-//    the same C++ TShape handle will appear in both bordering faces, so the
-//    final shell is topologically connected without any tolerance-based sewing.
-//
-//  Phase 3 — _buildTrimmedFace(oc, surface, edges, toDelete)
-//    For each face group, collect the interface edges that bound it and call
-//    BRepBuilderAPI_MakeFace_XX(surface, wire, true) with the appropriate XX
-//    for the surface type.  The Section edges carry PCurves so MakeFace_17/18/19
-//    (cylinder/cone/sphere + wire) work correctly — the crash documented for
-//    straight-wire edges does not occur here because these edges genuinely lie on
-//    the surface.  Falls back to the large patch on any failure.
 
 /**
  * Build a large analytical patch face for any surface type.
- * UV extents come from mesh vertices plus a generous margin — no intersection
- * computation, no adjacent-surface enumeration.
+ * UV extents come from mesh vertices plus a generous margin — used as the
+ * primary face shape for curved surfaces and as a fallback for planes.
  *
  * @param {object}   oc
  * @param {object}   group    { triangleIndices, surface: {type, params} }
@@ -469,159 +539,6 @@ function _buildLargePatch(oc, group, geometry, toDelete) {
   return null;
 }
 
-/**
- * Attempt to obtain the intersection edges between two faces using
- * BRepAlgoAPI_Section.  Tries several constructor-overload numberings to
- * cope with the opencascade.js binding layout.
- *
- * @returns {object[]}  TopoDS_Edge array (may be empty on failure)
- */
-function _getSectionEdges(oc, shape1, shape2, toDelete) {
-  // Overload ordering in opencascade.js@1.1.4 for BRepAlgoAPI_Section:
-  //   _1: ()
-  //   _2: (Sh1, Sh2, PaveFiller, bFWD)
-  //   _3: (Sh1, Sh2, bFWD)   ← target
-  //   _4: (Sh1, gp_Pln, bFWD)
-  const ctors = ['BRepAlgoAPI_Section_3', 'BRepAlgoAPI_Section_2', 'BRepAlgoAPI_Section_4'];
-  for (const ctorName of ctors) {
-    if (typeof oc[ctorName] !== 'function') continue;
-    try {
-      const section = new oc[ctorName](shape1, shape2, true);
-      toDelete.push(section);
-      if (!section.IsDone()) continue;
-
-      const result = section.Shape();
-      const edges  = [];
-      const EDGE_T  = oc.TopAbs_ShapeEnum?.TopAbs_EDGE  ?? 6;
-      const SHAPE_T = oc.TopAbs_ShapeEnum?.TopAbs_SHAPE ?? 8;
-      const exp = new oc.TopExp_Explorer_2(result, EDGE_T, SHAPE_T);
-      toDelete.push(exp);
-      while (exp.More()) {
-        const shape = exp.Current();
-        try {
-          edges.push(oc.TopoDS.Edge_1 ? oc.TopoDS.Edge_1(shape) : shape);
-        } catch { edges.push(shape); }
-        exp.Next();
-      }
-      return edges;
-    } catch (e) {
-      console.warn(`[brepBuilder] ${ctorName} failed:`, e?.message ?? e);
-    }
-  }
-  return [];
-}
-
-/**
- * Compute shared interface edges for every adjacent patch pair.
- *
- * One BRepAlgoAPI_Section call per pair handles any surface-type combination
- * (plane/cylinder, plane/tilted-plane, cylinder/sphere, partial-revolve, …)
- * without JS-level surface-type enumeration.  The returned edges carry PCurves
- * on BOTH surfaces; adding the same TopoDS_Edge to two face wires makes those
- * faces topologically connected in the final shell.
- *
- * @param {object}   oc
- * @param {Map}      adjacency   groupIdx → Set<groupIdx>
- * @param {Map}      patches     groupIdx → TopoDS_Face (large patch)
- * @param {Map}      out         filled: "${min},${max}" → TopoDS_Edge[]
- * @param {object[]} toDelete
- */
-function _buildInterfaceEdges(oc, adjacency, patches, out, toDelete) {
-  for (const [i, neighbors] of adjacency) {
-    for (const j of neighbors) {
-      if (j <= i) continue;             // process each (i,j) pair once
-      const key = `${i},${j}`;
-      if (out.has(key)) continue;
-      const pi = patches.get(i), pj = patches.get(j);
-      if (!pi || !pj) { out.set(key, []); continue; }
-      try {
-        const edges = _getSectionEdges(oc, pi, pj, toDelete);
-        out.set(key, edges);
-      } catch (e) {
-        console.warn(`[brepBuilder] Interface (${i},${j}):`, e?.message ?? e);
-        out.set(key, []);
-      }
-    }
-  }
-}
-
-/**
- * Build a trimmed face from a set of interface edges that bound the surface.
- *
- * The edges are the result of BRepAlgoAPI_Section against adjacent patches;
- * they carry PCurves on this surface so MakeFace_17/18/19 (curved+wire) work
- * correctly — unlike the straight-wire case that caused null PCurve crashes.
- *
- * Falls back to the large analytical patch on any construction failure.
- *
- * @param {object}   oc
- * @param {object}   surface   { type, params }
- * @param {object[]} edges     TopoDS_Edge[]  (interface / section edges)
- * @param {object}   patch     TopoDS_Face    (large-patch fallback)
- * @param {object[]} toDelete
- * @returns {object}  TopoDS_Face
- */
-function _buildTrimmedFace(oc, surface, edges, patch, toDelete) {
-  if (!edges || edges.length === 0) return patch;
-
-  // Assemble a wire from the interface edges.
-  const wireMaker = new oc.BRepBuilderAPI_MakeWire_1();
-  toDelete.push(wireMaker);
-  let edgeCount = 0;
-  for (const edge of edges) {
-    try { wireMaker.Add_1(edge); edgeCount++; } catch { /* skip bad edge */ }
-  }
-  if (edgeCount < 3 || !wireMaker.IsDone()) return patch;
-  const wire = wireMaker.Wire();
-
-  const { type, params } = surface;
-  try {
-    if (type === 'plane') {
-      const pln = new oc.gp_Pln_3(makePnt(oc, params.origin), makeDir(oc, _u3(params.normal)));
-      toDelete.push(pln);
-      const mf = new oc.BRepBuilderAPI_MakeFace_16(pln, wire, true);
-      toDelete.push(mf);
-      if (mf.IsDone()) return mf.Face();
-    }
-
-    if (type === 'cylinder') {
-      const ax3 = makeAx3(oc, params.axisPoint, params.axis);
-      toDelete.push(ax3);
-      const cyl = new oc.gp_Cylinder_2(ax3, params.radius);
-      toDelete.push(cyl);
-      // MakeFace_17 = gp_Cylinder + wire.  Section edges have PCurves on
-      // the cylinder, so this avoids the null-PCurve STEP-Transfer crash.
-      const mf = new oc.BRepBuilderAPI_MakeFace_17(cyl, wire, true);
-      toDelete.push(mf);
-      if (mf.IsDone()) return mf.Face();
-    }
-
-    if (type === 'cone') {
-      const ax3 = makeAx3(oc, params.apex, params.axis);
-      toDelete.push(ax3);
-      const cone = new oc.gp_Cone_2(ax3, params.halfAngle, 0.0);
-      toDelete.push(cone);
-      const mf = new oc.BRepBuilderAPI_MakeFace_18(cone, wire, true);
-      toDelete.push(mf);
-      if (mf.IsDone()) return mf.Face();
-    }
-
-    if (type === 'sphere') {
-      const ax3 = new oc.gp_Ax3_4(makePnt(oc, params.center), makeDir(oc, [0, 0, 1]));
-      toDelete.push(ax3);
-      const sph = new oc.gp_Sphere_2(ax3, params.radius);
-      toDelete.push(sph);
-      const mf = new oc.BRepBuilderAPI_MakeFace_19(sph, wire, true);
-      toDelete.push(mf);
-      if (mf.IsDone()) return mf.Face();
-    }
-  } catch (e) {
-    console.warn(`[brepBuilder] _buildTrimmedFace (${type}):`, e?.message ?? e);
-  }
-
-  return patch; // fall back to large patch
-}
-
 // ── Main export: build B-rep + STEP ─────────────────────────────────────────
 
 /**
@@ -643,72 +560,67 @@ export async function buildAndExportSTEP(groups, geometry, options = {}, onStatu
   const adjacency = buildGroupAdjacencyMap(groups, geometry);
   const toDelete  = [];
 
-  // ── Phase 1: build large analytical patches for every surface ────────────────
-  // Each patch covers the mesh vertex extent with generous margin.
-  // No intersection computation, no adjacency lookup, no type enumeration.
-  const patches = new Map(); // groupIdx → TopoDS_Face (large patch)
-  for (let i = 0; i < groups.length; i++) {
-    const g = groups[i];
-    if (!g.surface) continue;
-    try {
-      const patch = _buildLargePatch(oc, g, geometry, toDelete);
-      if (patch) patches.set(i, patch);
-    } catch (e) {
-      console.warn(`Patch ${i} (${g.surface?.type}) failed:`, e?.message ?? e);
-    }
-    if (i % 50 === 0) onStatus?.(`Building patches… ${i}/${groups.length}`, 20 + 15 * i / groups.length);
-  }
-
-  // ── Phase 2: compute shared interface edges between every adjacent pair ───────
-  // BRepAlgoAPI_Section handles any surface-type combination (plane/cylinder,
-  // plane/tilted-plane, cylinder/sphere, partial-revolve/oblique-plane, …)
-  // without any JS-level type enumeration.  The returned edges carry PCurves on
-  // BOTH surfaces; using the same TopoDS_Edge in two face wires makes the faces
-  // topologically connected in the final shell (no sewing required for that).
-  onStatus?.('Computing surface intersections…', 35);
-  const interfaceEdges = new Map(); // "${min(i,j)},${max(i,j)}" → TopoDS_Edge[]
-  _buildInterfaceEdges(oc, adjacency, patches, interfaceEdges, toDelete);
-
-  // ── Phase 3: build trimmed faces using shared interface edges ─────────────────
-  // Every surface type goes through the same pipeline:
-  //   • collect interface edges from every adjacent patch pair
-  //   • build a wire from those edges
-  //   • call MakeFace_16/17/18/19 (Pln/Cylinder/Cone/Sphere + wire)
-  // Falls back to the large patch when the wire is open or MakeFace fails.
+  // ── Build one face per surface group ─────────────────────────────────────────
+  //
+  // Planar faces: compute exact boundary corners from pairwise plane–plane–plane
+  // intersections.  Adjacent faces share the same corner coordinates (same
+  // 3-plane intersection result computed on both sides), so sewing succeeds.
+  // Falls back to the oversized large-patch rectangle when the analytical build
+  // fails (e.g. a flat cap whose only non-plane neighbour is a cylinder).
+  //
+  // Curved faces (cylinder / cone / sphere): build a UV-bounded patch from
+  // mesh vertex projections.  Full-revolution surfaces use U = 0…2π; the V
+  // range is derived from axial vertex projections.
   const faces = [];
   for (let i = 0; i < groups.length; i++) {
     const g = groups[i];
     if (!g.surface) continue;
-    const patch = patches.get(i);
-    if (!patch) continue;
+    if (i % 50 === 0) onStatus?.(`Building faces… ${i}/${groups.length}`, 20 + 20 * i / groups.length);
 
-    // Collect all interface edges that bound face i.
-    const boundaryEdges = [];
-    for (const j of (adjacency.get(i) ?? new Set())) {
-      const key = i < j ? `${i},${j}` : `${j},${i}`;
-      for (const e of (interfaceEdges.get(key) ?? [])) boundaryEdges.push(e);
+    let face = null;
+
+    // For planar faces, prefer the exact analytical boundary.
+    if (g.surface.type === 'plane') {
+      const loop = _analyticalPlaneBoundary(i, groups, adjacency);
+      if (loop) {
+        try {
+          const { origin, normal } = g.surface.params;
+          const nu  = _u3(normal);
+          const pln = new oc.gp_Pln_3(makePnt(oc, origin), makeDir(oc, nu));
+          toDelete.push(pln);
+          const wire = buildWire(oc, loop, toDelete);
+          if (wire) {
+            const mf = new oc.BRepBuilderAPI_MakeFace_16(pln, wire, true);
+            toDelete.push(mf);
+            if (mf.IsDone()) face = mf.Face();
+          }
+        } catch (e) {
+          console.warn(`Analytical planar face ${i}:`, e?.message ?? e);
+        }
+      }
     }
 
-    try {
-      faces.push(_buildTrimmedFace(oc, g.surface, boundaryEdges, patch, toDelete));
-    } catch (e) {
-      console.warn(`Face ${i} (${g.surface?.type}) failed:`, e?.message ?? e);
-      faces.push(patch);
+    // Fallback: large UV-bounded patch (primary path for curved surfaces).
+    if (!face) {
+      try {
+        face = _buildLargePatch(oc, g, geometry, toDelete);
+      } catch (e) {
+        console.warn(`Patch ${i} (${g.surface?.type}):`, e?.message ?? e);
+      }
     }
-    if (i % 50 === 0) onStatus?.(`Building faces… ${i}/${groups.length}`, 50 + 5 * i / groups.length);
+
+    if (face) faces.push(face);
   }
 
   if (faces.length === 0) throw new Error('No valid B-rep faces could be constructed.');
 
-  onStatus?.(`Sewing ${faces.length} faces into a solid…`, 55);
+  onStatus?.(`Sewing ${faces.length} faces into a solid…`, 40);
 
   // ── Build a watertight solid ────────────────────────────────────────────────
   //
-  // Because Phase 2/3 builds all trimmed faces from shared TopoDS_Edge objects
-  // (the Section interface edges), adjacent faces already reference the same
-  // underlying TShape handles — the shell is topologically connected without
-  // explicit sewing.  BRepBuilderAPI_Sewing is still attempted first because it
-  // can heal small gaps/overlaps in the large-patch fallback paths.
+  // Analytically-bounded planar faces share exact corner coordinates so
+  // BRepBuilderAPI_Sewing will merge their common edges and produce a true
+  // manifold shell for all-planar models (polyhedra, prismatic parts, …).
 
   const sewTol = options.sewTol ?? 1e-6;
   let topShape = null;
