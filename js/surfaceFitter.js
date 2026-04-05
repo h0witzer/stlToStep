@@ -339,14 +339,42 @@ export function classifyGroup(group, geometry) {
     try {
       const sphereFit = fitSphere(vertices);
       if (sphereFit && sphereFit.radius > 1e-6 && isFinite(sphereFit.rms)) {
-        candidates.push({ type: 'sphere', params: sphereFit, rms: sphereFit.rms });
+        // Reject sphere when the fitted radius is much larger than the group's own
+        // extent — this is the degenerate case where a near-flat patch is fit with a
+        // huge-radius sphere that effectively approximates a plane but scores a lower
+        // raw RMS because it has one extra free parameter.
+        const radiusOk = sphereFit.radius <= scale * 5;
+
+        // Reject sphere when the surface normals are nearly co-planar or co-linear.
+        // A genuine sphere has normals spread in all three directions equally; a flat
+        // or cylindrical face has normals concentrated in ≤ 2 directions.
+        // We reuse the normal covariance we already have from fitCylinder's axis calc:
+        // the eigenvalue ratio λ_min/λ_max of the normal cloud must exceed a threshold.
+        let normalSpreadOk = true;
+        const nn = normals.length / 3;
+        if (nn >= 3) {
+          let c00=0,c01=0,c02=0,c11=0,c12=0,c22=0;
+          for (let i=0;i<nn;i++){
+            const x=normals[i*3],y=normals[i*3+1],z=normals[i*3+2];
+            c00+=x*x;c01+=x*y;c02+=x*z;c11+=y*y;c12+=y*z;c22+=z*z;
+          }
+          const sc=1/nn;
+          const { values } = eigen3([c00*sc,c01*sc,c02*sc,c11*sc,c12*sc,c22*sc]);
+          const lambdaMin = values[0], lambdaMax = values[2];
+          // Require at least 15% of the dominant spread in the weakest direction
+          normalSpreadOk = lambdaMax > 1e-12 && (lambdaMin / lambdaMax) >= 0.15;
+        }
+
+        if (radiusOk && normalSpreadOk) {
+          candidates.push({ type: 'sphere', params: sphereFit, rms: sphereFit.rms });
+        }
       }
     } catch { /* skip */ }
   }
 
   // Choose best candidate: lowest rms relative to scale
-  // Apply a small bias against complex surfaces (prefer plane > cyl > sphere)
-  const bias = { plane: 1.0, cylinder: 1.05, sphere: 1.1, nurbs: 9999 };
+  // Apply a bias against complex surfaces (prefer plane > cyl > sphere)
+  const bias = { plane: 1.0, cylinder: 1.15, sphere: 1.5, nurbs: 9999 };
   candidates.sort((a, b) => (a.rms * bias[a.type]) - (b.rms * bias[b.type]));
 
   const best = candidates[0];

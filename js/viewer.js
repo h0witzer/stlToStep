@@ -12,6 +12,11 @@ let wireframeLines = null;   // LineSegments overlay, or null when hidden
 let wireframeVisible = false;
 let exclusionMesh = null;    // flat orange overlay for user-excluded faces
 let hoverMesh = null;        // semi-transparent yellow bucket-fill preview
+let groupHighlightMesh = null; // white highlight overlay for hovered surface-list row
+
+// Callback invoked when the canvas pointer hovers over a different face group.
+// Signature: (groupIndex: number) => void   (-1 = no group under cursor)
+let _onGroupHoverCallback = null;
 
 // Build a labelled coordinate axes indicator scaled to `size`.
 // X = red, Y = green, Z = blue (up).
@@ -359,6 +364,38 @@ export function initViewer(canvas) {
   const resizeObserver = new ResizeObserver(() => onResize());
   resizeObserver.observe(canvas.parentElement);
   onResize();
+
+  // ── Canvas hover: raycast to find which face group is under the cursor ──────
+  // A separate raycaster; throttled so it only fires when the pointer moves.
+  const _groupRaycaster = new THREE.Raycaster();
+  let _lastHoveredGroup = -1;
+  let _groupHoverThrottle = null;
+
+  renderer.domElement.addEventListener('pointermove', (e) => {
+    if (_groupHoverThrottle) return;
+    _groupHoverThrottle = setTimeout(() => { _groupHoverThrottle = null; }, 30);
+
+    if (!currentMesh || !_onGroupHoverCallback) return;
+    const rect = renderer.domElement.getBoundingClientRect();
+    const ndc = new THREE.Vector2(
+      ((e.clientX - rect.left) / rect.width)  *  2 - 1,
+      ((e.clientY - rect.top)  / rect.height) * -2 + 1,
+    );
+    _groupRaycaster.setFromCamera(ndc, camera);
+    const hits = _groupRaycaster.intersectObject(currentMesh);
+    const triIdx = hits.length > 0 ? hits[0].faceIndex : -1;
+    if (triIdx !== _lastHoveredGroup) {
+      _lastHoveredGroup = triIdx;
+      _onGroupHoverCallback(triIdx);
+    }
+  });
+
+  renderer.domElement.addEventListener('pointerleave', () => {
+    if (_lastHoveredGroup !== -1) {
+      _lastHoveredGroup = -1;
+      _onGroupHoverCallback?.(-1);
+    }
+  });
 
   // Render loop
   (function animate() {
@@ -721,4 +758,67 @@ function _buildWireframe(geometry) {
   wireframeLines.renderOrder = 3;  // draw after base mesh (0), overlays (1-2)
   // Add to meshGroup so it's automatically removed when a new model is loaded
   meshGroup.add(wireframeLines);
+}
+
+// ── Group highlight overlay ───────────────────────────────────────────────────
+
+/**
+ * Show a bright highlight overlay for a specific face group's triangles.
+ * Pass null/undefined to clear the highlight.
+ *
+ * @param {Set<number>|null} triangleIndices  triangle indices belonging to the group
+ * @param {THREE.BufferGeometry|null} geometry  source geometry
+ */
+export function setGroupHighlight(triangleIndices, geometry) {
+  if (groupHighlightMesh) {
+    scene.remove(groupHighlightMesh);
+    groupHighlightMesh.geometry.dispose();
+    groupHighlightMesh.material.dispose();
+    groupHighlightMesh = null;
+  }
+  if (!triangleIndices || !geometry || triangleIndices.size === 0) return;
+
+  const posAttr = geometry.attributes.position;
+  const positions = new Float32Array(triangleIndices.size * 9);
+  let i = 0;
+  for (const t of triangleIndices) {
+    for (let v = 0; v < 3; v++) {
+      const idx = t * 3 + v;
+      positions[i++] = posAttr.getX(idx);
+      positions[i++] = posAttr.getY(idx);
+      positions[i++] = posAttr.getZ(idx);
+    }
+  }
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+
+  groupHighlightMesh = new THREE.Mesh(
+    geo,
+    new THREE.MeshBasicMaterial({
+      color: 0xffffff,
+      side: THREE.DoubleSide,
+      transparent: true,
+      opacity: 0.40,
+      depthTest: true,
+      polygonOffset: true,
+      polygonOffsetFactor: -3,
+      polygonOffsetUnits: -3,
+    }),
+  );
+  groupHighlightMesh.renderOrder = 4;
+  scene.add(groupHighlightMesh);
+}
+
+/**
+ * Register a callback that fires when the pointer moves over a different triangle
+ * on the mesh surface.  The callback receives the raw triangle index (faceIndex
+ * from Raycaster), or -1 when the cursor leaves the mesh.
+ *
+ * main.js uses this to map triangle → group index and update the sidebar.
+ *
+ * @param {function(number):void} cb
+ */
+export function setGroupHoverCallback(cb) {
+  _onGroupHoverCallback = cb;
 }

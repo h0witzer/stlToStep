@@ -1246,6 +1246,20 @@ input[type="number"].val:focus { outline: none; border-color: var(--accent); }
   background: var(--surface2);
   border: 1px solid var(--border);
   font-size: 11px;
+  cursor: default;
+  transition: background 0.1s, border-color 0.1s;
+}
+/* Hover from the sidebar (mouse over row) */
+.surface-row:hover,
+.surface-row.sidebar-hover {
+  background: color-mix(in srgb, var(--accent) 18%, var(--surface2));
+  border-color: var(--accent);
+}
+/* Hover from the viewport (mouse over mesh) */
+.surface-row.viewport-hover {
+  background: color-mix(in srgb, var(--accent) 28%, var(--surface2));
+  border-color: var(--accent-hover);
+  outline: 1px solid var(--accent-hover);
 }
 .surface-dot {
   width: 8px;

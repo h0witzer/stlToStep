@@ -12,6 +12,7 @@ import * as THREE from 'three';
 import {
   initViewer, loadGeometry, setMeshMaterial, setWireframe,
   getCamera, getCurrentMesh, showFaceGroupColors, setViewerTheme,
+  setGroupHighlight, setGroupHoverCallback,
 } from './viewer.js';
 import { loadModelFile, computeBounds, getTriangleCount } from './stlLoader.js';
 import { t, initLang, setLang, getLang, applyTranslations } from './i18n.js';
@@ -25,6 +26,11 @@ let currentGeometry = null;
 let currentStlName  = 'model';
 let currentGroups   = null;   // array of { triangleIndices, surface? }
 let isBusy          = false;
+
+// Reverse map: triangleIndex → groupIndex (rebuilt after each Detect Groups run)
+let _triangleToGroup = null;
+// The currently highlighted group index (-1 = none)
+let _highlightedGroup = -1;
 
 // ── DOM refs ─────────────────────────────────────────────────────────────────
 
@@ -57,6 +63,29 @@ const exportProgLbl  = document.getElementById('export-progress-label');
 // ── Init ──────────────────────────────────────────────────────────────────────
 
 initViewer(canvas);
+
+// Wire up the canvas hover callback: maps triangle index → group index → highlight
+setGroupHoverCallback((triangleIdx) => {
+  if (!_triangleToGroup || !currentGroups) return;
+  const groupIdx = triangleIdx >= 0 ? _triangleToGroup[triangleIdx] : -1;
+  if (groupIdx === _highlightedGroup) return;
+  _highlightedGroup = groupIdx;
+  // Update viewport overlay
+  if (groupIdx >= 0 && currentGroups[groupIdx]) {
+    setGroupHighlight(currentGroups[groupIdx].triangleIndices, currentGeometry);
+  } else {
+    setGroupHighlight(null, null);
+  }
+  // Sync the sidebar row highlight
+  document.querySelectorAll('.surface-row').forEach((row, i) => {
+    row.classList.toggle('viewport-hover', i === groupIdx);
+  });
+  // Scroll the highlighted row into view if it's offscreen
+  if (groupIdx >= 0) {
+    const rows = document.querySelectorAll('.surface-row');
+    if (rows[groupIdx]) rows[groupIdx].scrollIntoView({ block: 'nearest' });
+  }
+});
 
 // Apply saved theme
 setViewerTheme(document.documentElement.getAttribute('data-theme') === 'light');
@@ -125,6 +154,21 @@ function resetPanels() {
   exportProgress.classList.add('hidden');
   fitBtn.disabled = true;
   exportBtn.disabled = true;
+  // Clear any lingering hover state
+  setGroupHighlight(null, null);
+  _triangleToGroup = null;
+  _highlightedGroup = -1;
+}
+
+// Build a fast reverse-lookup array: triangleIndex → groupIndex.
+// Called after groupFaces() so the canvas hover can identify the hovered group.
+function _buildTriangleGroupMap() {
+  if (!currentGeometry || !currentGroups) return;
+  const triCount = currentGeometry.attributes.position.count / 3;
+  _triangleToGroup = new Int32Array(triCount).fill(-1);
+  currentGroups.forEach((g, gi) => {
+    for (const t of g.triangleIndices) _triangleToGroup[t] = gi;
+  });
 }
 
 // ── Face detection ────────────────────────────────────────────────────────────
@@ -138,6 +182,7 @@ async function handleDetect() {
 
   try {
     currentGroups = groupFaces(currentGeometry, creaseAngle);
+    _buildTriangleGroupMap();
     showFaceGroupColors(currentGeometry, currentGroups);
     groupCount.textContent = `${currentGroups.length} group${currentGroups.length !== 1 ? 's' : ''} detected`;
     fitBtn.disabled = false;
@@ -242,6 +287,19 @@ function renderSurfaceList() {
     g._autoSurface = g._autoSurface ?? g.surface;
 
     row.append(dot, name, rmsEl, sel);
+
+    // Sidebar → viewport hover: highlight this group in the 3D viewer
+    row.addEventListener('mouseenter', () => {
+      setGroupHighlight(g.triangleIndices, currentGeometry);
+      _highlightedGroup = i;
+      row.classList.add('sidebar-hover');
+    });
+    row.addEventListener('mouseleave', () => {
+      setGroupHighlight(null, null);
+      _highlightedGroup = -1;
+      row.classList.remove('sidebar-hover');
+    });
+
     surfaceList.appendChild(row);
   });
 

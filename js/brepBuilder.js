@@ -18,7 +18,7 @@ import { extractBoundaryLoop } from './faceGrouper.js';
 
 // ── OpenCASCADE lazy loader ───────────────────────────────────────────────────
 
-const OC_CDN = 'https://cdn.jsdelivr.net/npm/opencascade.js@2.0.0-pre.4/dist/';
+const OC_CDN = 'https://unpkg.com/opencascade.js@1.1.4/dist/';
 
 let _oc = null;
 let _ocPromise = null;
