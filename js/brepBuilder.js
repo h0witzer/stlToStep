@@ -18,7 +18,8 @@ import { extractBoundaryLoop } from './faceGrouper.js';
 
 // ── OpenCASCADE lazy loader ───────────────────────────────────────────────────
 
-const OC_CDN = 'https://cdn.jsdelivr.net/npm/opencascade.js@1.1.4/dist/';
+// jsdelivr returns HTTP 403 for the .wasm binary; unpkg serves all file types.
+const OC_CDN = 'https://unpkg.com/opencascade.js@1.1.4/dist/';
 
 let _oc = null;
 let _ocPromise = null;
@@ -44,7 +45,7 @@ export async function initOC(onStatus) {
     if (typeof factory !== 'function') {
       throw new Error(
         'Could not find the opencascade factory in the loaded module. ' +
-        'Check that cdn.jsdelivr.net is reachable and the correct version is being loaded.'
+        'Check that unpkg.com is reachable and the correct version is being loaded.'
       );
     }
 
