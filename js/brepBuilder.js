@@ -300,23 +300,34 @@ export async function buildAndExportSTEP(groups, geometry, options = {}, onStatu
   const writer = new oc.STEPControl_Writer_1();
   toDelete.push(writer);
 
+  // IFSelect_RetDone = 1 in all OCCT versions; also accept the enum object form.
+  const DONE = oc.IFSelect_ReturnStatus?.IFSelect_RetDone ?? 1;
+
   const transferResult = writer.Transfer(
     compound,
-    oc.STEPControl_StepModelType.STEPControl_AsIs,
+    oc.STEPControl_StepModelType?.STEPControl_AsIs ?? 0,
     true,
   );
 
-  if (transferResult !== oc.IFSelect_ReturnStatus.IFSelect_RetDone) {
+  if (transferResult !== DONE) {
     throw new Error(`STEPControl_Writer.Transfer failed (status ${transferResult}).`);
   }
 
-  const stepPath = '/brep_export.stp';
-  const writeResult = writer.Write(stepPath);
-  if (writeResult !== oc.IFSelect_ReturnStatus.IFSelect_RetDone) {
+  // All confirmed working opencascade.js examples pass a bare filename (no leading
+  // slash) to writer.Write — OSD_Path under Emscripten mis-handles absolute paths.
+  // The Emscripten MEMFS CWD is '/', so 'brep_export.stp' resolves to '/brep_export.stp'.
+  const stepFile = 'brep_export.stp';
+  const stepPath = '/' + stepFile;
+
+  const writeResult = writer.Write(stepFile);
+  if (writeResult !== DONE) {
     throw new Error(`STEPControl_Writer.Write failed (status ${writeResult}).`);
   }
 
   const stepContent = oc.FS.readFile(stepPath, { encoding: 'utf8' });
+  if (!stepContent || !stepContent.startsWith('ISO-10303')) {
+    throw new Error('STEP export produced empty or invalid output. Transfer returned DONE but no ISO-10303 header found.');
+  }
   try { oc.FS.unlink(stepPath); } catch { /* ignore */ }
 
   onStatus?.('Cleaning up…', 95);
