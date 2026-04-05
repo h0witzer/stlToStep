@@ -553,7 +553,7 @@ function buildFace(oc, group, geometry, toDelete, groupIdx, allGroups, adjacency
   } else if (type === 'sphere') {
     return _buildSphereFace(oc, params, dedupLoop, toDelete);
   } else {
-    return _buildFallbackFace(oc, dedupLoop, toDelete);
+    return null; // NURBS and unknown types: no analytical face
   }
 }
 
@@ -568,10 +568,10 @@ function _buildPlaneFace(oc, params, loop, toDelete) {
   try {
     const mf = new oc.BRepBuilderAPI_MakeFace_16(pln, wire, true);
     toDelete.push(mf);
-    if (!mf.IsDone()) return _buildFallbackFace(oc, loop, toDelete);
+    if (!mf.IsDone()) return null;
     return mf.Face();
   } catch {
-    return _buildFallbackFace(oc, loop, toDelete);
+    return null;
   }
 }
 
@@ -601,7 +601,7 @@ function _buildCylinderFace(oc, params, loop, toDelete, neighborVRange) {
       }
     }
     if (!isFinite(vmin) || !isFinite(vmax) || vmax - vmin < 1e-10) {
-      return _buildFallbackFace(oc, loop, toDelete);
+      return null;
     }
 
     const ax3 = makeAx3(oc, axisPoint, axis);
@@ -616,10 +616,10 @@ function _buildCylinderFace(oc, params, loop, toDelete, neighborVRange) {
       cyl, 0.0, 2 * Math.PI, vmin - pad, vmax + pad,
     );
     toDelete.push(mf);
-    if (!mf.IsDone()) return _buildFallbackFace(oc, loop, toDelete);
+    if (!mf.IsDone()) return null;
     return mf.Face();
   } catch {
-    return _buildFallbackFace(oc, loop, toDelete);
+    return null;
   }
 }
 
@@ -646,8 +646,8 @@ function _buildConeFace(oc, params, loop, toDelete, neighborVRange) {
       }
     }
     if (!isFinite(vmin) || !isFinite(vmax) || vmax - vmin < 1e-10 || vmin < -1e-6) {
-      // Degenerate extent or apex behind origin — use planar fallback
-      return _buildFallbackFace(oc, loop, toDelete);
+      // Degenerate extent or apex behind origin — skip face
+      return null;
     }
 
     const ax3 = makeAx3(oc, apex, axis);
@@ -661,10 +661,10 @@ function _buildConeFace(oc, params, loop, toDelete, neighborVRange) {
       cone, 0.0, 2 * Math.PI, vmin - pad, vmax + pad,
     );
     toDelete.push(mf);
-    if (!mf.IsDone()) return _buildFallbackFace(oc, loop, toDelete);
+    if (!mf.IsDone()) return null;
     return mf.Face();
   } catch {
-    return _buildFallbackFace(oc, loop, toDelete);
+    return null;
   }
 }
 
@@ -685,7 +685,7 @@ function _buildSphereFace(oc, params, loop, toDelete) {
       if (lat < vmin) vmin = lat;
       if (lat > vmax) vmax = lat;
     }
-    if (vmax - vmin < 1e-10) return _buildFallbackFace(oc, loop, toDelete);
+    if (vmax - vmin < 1e-10) return null;
 
     // Place the sphere centre at `center` with default Z-up orientation
     const ax3 = new oc.gp_Ax3_4(makePnt(oc, center), makeDir(oc, [0, 0, 1]));
@@ -698,24 +698,8 @@ function _buildSphereFace(oc, params, loop, toDelete) {
       sph, 0.0, 2 * Math.PI, vmin - pad, vmax + pad,
     );
     toDelete.push(mf);
-    if (!mf.IsDone()) return _buildFallbackFace(oc, loop, toDelete);
+    if (!mf.IsDone()) return null;
     return mf.Face();
-  } catch {
-    return _buildFallbackFace(oc, loop, toDelete);
-  }
-}
-
-/**
- * Fallback: build a best-fit planar face from the wire boundary alone.
- * OCCT automatically computes the best-fit plane from the wire's vertices.
- */
-function _buildFallbackFace(oc, loop, toDelete) {
-  const wire = buildWire(oc, loop, toDelete);
-  if (!wire) return null;
-  try {
-    const mf = new oc.BRepBuilderAPI_MakeFace_15(wire, false);
-    toDelete.push(mf);
-    return mf.IsDone() ? mf.Face() : null;
   } catch {
     return null;
   }
