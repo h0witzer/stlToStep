@@ -3,23 +3,24 @@
  *
  * Pipeline per face group:
  *   1. Build group adjacency map (groups that share mesh edges).
- *   2. Build one face per surface group:
- *        • Planar faces — compute exact corner points by intersecting every
- *          triple (this plane, neighbour_j, neighbour_k) where j and k are
- *          mutually adjacent.  Sort corners by angle in the local 2-D frame,
- *          build a wire, then call MakeFace_16(gp_Pln, wire).  Adjacent
- *          planar faces share the same corner coordinates (same 3-plane
- *          intersection result on both sides), so sewing succeeds without
- *          any tolerance relaxation.
- *        • Curved faces (cylinder / cone / sphere) — build a UV-bounded
- *          analytical patch from mesh vertex projections.  Full-revolution
- *          surfaces use U = 0…2π; the V range comes from axial projections.
- *        • Fallback — a large bounding-rectangle patch is used for planar
- *          faces whose neighbours are not all planes (e.g. a cap adjacent
- *          only to a cylinder) or whenever the analytical build fails.
- *   3. Assemble: BRepBuilderAPI_Sewing → BRep_Builder shell (fallback) →
- *        TopoDS_Compound (last resort).
- *   4. Write STEP via STEPControl_Writer with the /tmp CWD strategy.
+ *   2. Build global boundary-edge map: a single O(n) pass over all triangles
+ *        to identify, for each group, the mesh edges it shares with other groups.
+ *        These edges define the exact face boundary regardless of what surface
+ *        types are involved — plane/plane, plane/cylinder, cylinder/cone, etc.
+ *   3. Build one face per surface group:
+ *        • Planar faces — walk the mesh boundary edges into an ordered polygon,
+ *          project every vertex onto the analytical plane (eliminating mesh-noise
+ *          offset), then call MakeFace_16(gp_Pln, wire).  Works for any mix of
+ *          neighbouring surface types.
+ *        • Curved faces (cylinder / cone / sphere) — build a UV-bounded patch
+ *          from mesh vertex projections with a tiny safety margin (0.1 % + 1e-6).
+ *        • Fallback — a mesh-vertex bounding-rectangle large patch for planes
+ *          whose boundary-edge walk fails, or any surface that throws.
+ *   4. Sew with an adaptive tolerance = 5 e-3 × model bounding-box diagonal.
+ *        This covers the chord–arc deviation at cylinder/cone end-caps while
+ *        staying below feature separation distances for typical CAD models.
+ *   5. Shell → MakeSolid → TopoDS_Compound (fallbacks).
+ *   6. Write STEP via STEPControl_Writer with the /tmp CWD strategy.
  *
  * opencascade.js is loaded lazily via dynamic import() when the user first
  * clicks "Export STEP" so the 35 MB WASM does not block page load.
@@ -192,99 +193,109 @@ function _x3(a, b)  {
 function _n3(v)     { return Math.sqrt(v[0]*v[0]+v[1]*v[1]+v[2]*v[2]); }
 function _u3(v)     { const n = _n3(v); return n > 1e-14 ? [v[0]/n, v[1]/n, v[2]/n] : v; }
 
-// ── Plane–plane intersection utilities ─────────────────────────────────────
+// ── Mesh boundary extraction ─────────────────────────────────────────────────
 
 /**
- * Find the common point of three planes, each given as (unit normal, origin).
- * Uses the cross-product form of Cramer's rule:
- *   x = (d1*(n2×n3) + d2*(n3×n1) + d3*(n1×n2)) / det,  det = n1·(n2×n3)
+ * Single-pass extraction of per-group boundary edge pairs from the mesh.
  *
- * Returns null when the planes are not in general position (parallel or
- * forming a prismatic pencil rather than a single intersection point).
+ * An edge is a "boundary edge" for group i when it is shared by exactly one
+ * triangle from group i and exactly one triangle from a different group.
+ * (Outer mesh edges — shared by only one triangle across the whole mesh —
+ * are not boundary edges between groups and are ignored.)
  *
- * @param {number[]} n1,n2,n3  unit normals
- * @param {number[]} o1,o2,o3  reference points on each plane
- * @returns {number[]|null}
+ * Runs in O(total triangles) time — one pass over all groups, no per-group
+ * inner loops.
+ *
+ * @param {object[]} groups    with `.triangleIndices`
+ * @param {THREE.BufferGeometry} geometry
+ * @returns {Map<number, Array<[number,number]>>}
+ *   groupIdx → array of [a_idx, b_idx] flat position-buffer index pairs
  */
-function _intersect3Planes(n1, o1, n2, o2, n3, o3) {
-  const d1  = _d3(n1, o1);
-  const d2  = _d3(n2, o2);
-  const d3  = _d3(n3, o3);
-  const c23 = _x3(n2, n3);
-  const det = _d3(n1, c23);
-  if (Math.abs(det) < 1e-12) return null;
-  const c31 = _x3(n3, n1);
-  const c12 = _x3(n1, n2);
-  return [
-    (d1 * c23[0] + d2 * c31[0] + d3 * c12[0]) / det,
-    (d1 * c23[1] + d2 * c31[1] + d3 * c12[1]) / det,
-    (d1 * c23[2] + d2 * c31[2] + d3 * c12[2]) / det,
-  ];
-}
+function _buildBoundaryEdgeMap(groups, geometry) {
+  const pos   = geometry.attributes.position;
+  const QUANT = 1e4;
+  const qk    = (i) => {
+    const x = pos.getX(i), y = pos.getY(i), z = pos.getZ(i);
+    return `${Math.round(x * QUANT)}_${Math.round(y * QUANT)}_${Math.round(z * QUANT)}`;
+  };
 
-/**
- * Compute the exact boundary polygon for a planar face group.
- *
- * For every pair of mutually-adjacent planar neighbours (j, k) of face gi,
- * intersect the three planes (gi, j, k) to obtain a corner vertex.
- * The corners are sorted CCW by angle in the face's local 2-D frame and
- * returned as an ordered polygon loop.
- *
- * Returns null when fewer than 3 unique corners are found — the caller should
- * fall back to a mesh-vertex bounding-rectangle patch in that case.
- *
- * @param {number}   gi
- * @param {object[]} groups    with `.surface = { type, params }` set
- * @param {Map}      adjacency  from buildGroupAdjacencyMap()
- * @returns {Array<[number,number,number]>|null}
- */
-function _analyticalPlaneBoundary(gi, groups, adjacency) {
-  const { params: pi } = groups[gi].surface;
-  const ni  = _u3(pi.normal);
-  const oi  = pi.origin;
-  const nbrs = [...(adjacency.get(gi) ?? [])];
-  const corners = [];
-
-  for (let a = 0; a < nbrs.length; a++) {
-    for (let b = a + 1; b < nbrs.length; b++) {
-      const j = nbrs[a], k = nbrs[b];
-      // Both j and k must also be adjacent to each other to form a corner.
-      if (!adjacency.get(j)?.has(k)) continue;
-
-      const gj = groups[j], gk = groups[k];
-      if (!gj?.surface || !gk?.surface) continue;
-      // Only plane–plane–plane triples yield a point corner.
-      if (gj.surface.type !== 'plane' || gk.surface.type !== 'plane') continue;
-
-      const nj = _u3(gj.surface.params.normal);
-      const nk = _u3(gk.surface.params.normal);
-      const pt = _intersect3Planes(ni, oi, nj, gj.surface.params.origin,
-                                             nk, gk.surface.params.origin);
-      if (!pt) continue;
-
-      // Deduplicate: same triple may appear from different orderings.
-      if (!corners.some(c =>
-        Math.abs(c[0] - pt[0]) < 1e-8 &&
-        Math.abs(c[1] - pt[1]) < 1e-8 &&
-        Math.abs(c[2] - pt[2]) < 1e-8,
-      )) corners.push(pt);
+  // Record every directed half-edge: undirected key → [{gi, a, b}]
+  const edgeData = new Map();
+  for (let gi = 0; gi < groups.length; gi++) {
+    for (const t of groups[gi].triangleIndices) {
+      for (let e = 0; e < 3; e++) {
+        const a  = t * 3 + e;
+        const b  = t * 3 + (e + 1) % 3;
+        const ka = qk(a), kb = qk(b);
+        const key = ka < kb ? `${ka}|${kb}` : `${kb}|${ka}`;
+        if (!edgeData.has(key)) edgeData.set(key, []);
+        edgeData.get(key).push({ gi, a, b });
+      }
     }
   }
 
-  if (corners.length < 3) return null;
+  // An edge shared by exactly two different groups is a boundary edge.
+  const result = new Map();
+  for (let gi = 0; gi < groups.length; gi++) result.set(gi, []);
+  for (const entries of edgeData.values()) {
+    if (entries.length !== 2) continue;
+    const [e0, e1] = entries;
+    if (e0.gi === e1.gi) continue;
+    result.get(e0.gi).push([e0.a, e0.b]);
+    result.get(e1.gi).push([e1.a, e1.b]);
+  }
+  return result;
+}
 
-  // Sort CCW around the face normal so they form a proper polygon.
-  const ref = Math.abs(ni[2]) < 0.9 ? [0, 0, 1] : [1, 0, 0];
-  const xA  = _u3(_x3(ni, ref));
-  const yA  = _x3(ni, xA);
-  corners.sort((a, b) => {
-    const au = (a[0]-oi[0])*xA[0] + (a[1]-oi[1])*xA[1] + (a[2]-oi[2])*xA[2];
-    const av = (a[0]-oi[0])*yA[0] + (a[1]-oi[1])*yA[1] + (a[2]-oi[2])*yA[2];
-    const bu = (b[0]-oi[0])*xA[0] + (b[1]-oi[1])*xA[1] + (b[2]-oi[2])*xA[2];
-    const bv = (b[0]-oi[0])*yA[0] + (b[1]-oi[1])*yA[1] + (b[2]-oi[2])*yA[2];
-    return Math.atan2(av, au) - Math.atan2(bv, bu);
-  });
-  return corners;
+/**
+ * Walk an unordered set of boundary edge vertex-index pairs into a single
+ * ordered polygon loop by following the adjacency graph.
+ *
+ * @param {Array<[number,number]>} edgePairs  [a_idx, b_idx] position indices
+ * @param {THREE.BufferAttribute}  posAttr
+ * @returns {Array<[number,number,number]>|null}  ordered [x,y,z] points, or null
+ */
+function _orderBoundaryLoop(edgePairs, posAttr) {
+  if (edgePairs.length < 3) return null;
+
+  const QUANT = 1e4;
+  const qk  = (i) => {
+    const x = posAttr.getX(i), y = posAttr.getY(i), z = posAttr.getZ(i);
+    return `${Math.round(x * QUANT)}_${Math.round(y * QUANT)}_${Math.round(z * QUANT)}`;
+  };
+  const vtx = (i) => [posAttr.getX(i), posAttr.getY(i), posAttr.getZ(i)];
+
+  // Build adjacency: vertexKey → [{nextKey, nextIdx}]
+  const adj  = new Map();
+  const vidx = new Map(); // vertexKey → a representative buffer index
+  for (const [a, b] of edgePairs) {
+    const ka = qk(a), kb = qk(b);
+    if (!adj.has(ka))  { adj.set(ka, []);  vidx.set(ka, a); }
+    if (!adj.has(kb))  { adj.set(kb, []);  vidx.set(kb, b); }
+    adj.get(ka).push({ key: kb, idx: b });
+    adj.get(kb).push({ key: ka, idx: a });
+  }
+
+  // Walk from an arbitrary starting vertex.
+  const startKey = [...adj.keys()][0];
+  const loop    = [];
+  const visited = new Set();
+  let curKey = startKey;
+  let curIdx = vidx.get(startKey);
+
+  while (!visited.has(curKey)) {
+    visited.add(curKey);
+    loop.push(vtx(curIdx));
+    let nextKey = null, nextIdx = null;
+    for (const { key, idx } of (adj.get(curKey) ?? [])) {
+      if (!visited.has(key)) { nextKey = key; nextIdx = idx; break; }
+    }
+    if (nextKey === null) break;
+    curKey = nextKey;
+    curIdx = nextIdx;
+  }
+
+  return loop.length >= 3 ? loop : null;
 }
 
 /**
@@ -495,7 +506,7 @@ function _buildLargePatch(oc, group, geometry, toDelete) {
       toDelete.push(ax3);
       const cyl = new oc.gp_Cylinder_2(ax3, radius);
       toDelete.push(cyl);
-      const pad = (vr.vmax - vr.vmin) * 0.25 + 1e-2;
+      const pad = (vr.vmax - vr.vmin) * 1e-3 + 1e-6;
       const mf = new oc.BRepBuilderAPI_MakeFace_10(cyl, 0.0, 2*Math.PI, vr.vmin - pad, vr.vmax + pad);
       toDelete.push(mf);
       return mf.IsDone() ? mf.Face() : null;
@@ -509,7 +520,7 @@ function _buildLargePatch(oc, group, geometry, toDelete) {
       toDelete.push(ax3);
       const cone = new oc.gp_Cone_2(ax3, halfAngle, 0.0);
       toDelete.push(cone);
-      const pad = (vr.vmax - vr.vmin) * 0.25 + 1e-2;
+      const pad = (vr.vmax - vr.vmin) * 1e-3 + 1e-6;
       const mf = new oc.BRepBuilderAPI_MakeFace_11(cone, 0.0, 2*Math.PI, Math.max(0, vr.vmin - pad), vr.vmax + pad);
       toDelete.push(mf);
       return mf.IsDone() ? mf.Face() : null;
@@ -523,7 +534,7 @@ function _buildLargePatch(oc, group, geometry, toDelete) {
       toDelete.push(ax3);
       const sph = new oc.gp_Sphere_2(ax3, radius);
       toDelete.push(sph);
-      const pad = Math.max((vr.vmax - vr.vmin) * 0.25 + 1e-2, 0);
+      const pad = Math.max((vr.vmax - vr.vmin) * 1e-3 + 1e-6, 0);
       const mf = new oc.BRepBuilderAPI_MakeFace_12(
         sph, 0.0, 2*Math.PI,
         Math.max(-Math.PI/2, vr.vmin - pad),
@@ -557,20 +568,49 @@ export async function buildAndExportSTEP(groups, geometry, options = {}, onStatu
 
   onStatus?.('Building B-rep faces…', 20);
 
-  const adjacency = buildGroupAdjacencyMap(groups, geometry);
-  const toDelete  = [];
+  const bdyEdgeMap = _buildBoundaryEdgeMap(groups, geometry);
+  const toDelete   = [];
+
+  // ── Compute adaptive sewing tolerance ────────────────────────────────────────
+  // For all-planar models the mesh boundary vertices coincide exactly on shared
+  // edges, so a tiny tolerance (1e-6) is sufficient.  For curved surfaces
+  // (cylinder, cone, sphere) the flat-cap boundary is a polygon approximation
+  // of a circular arc; the sewing tolerance must cover the chord–arc deviation
+  //   δ = r · (1 − cos(π/n))
+  // For n ≥ 32 segments this is ≤ 0.5 % of r, so 0.5 % of the model's
+  // bounding-box diagonal gives a safe universal default.
+  let sewTol = options.sewTol ?? 0;
+  if (sewTol <= 0) {
+    const posAttr = geometry.attributes.position;
+    let xmin =  Infinity, ymin =  Infinity, zmin =  Infinity;
+    let xmax = -Infinity, ymax = -Infinity, zmax = -Infinity;
+    for (let i = 0; i < posAttr.count; i++) {
+      const x = posAttr.getX(i), y = posAttr.getY(i), z = posAttr.getZ(i);
+      if (x < xmin) xmin = x; if (x > xmax) xmax = x;
+      if (y < ymin) ymin = y; if (y > ymax) ymax = y;
+      if (z < zmin) zmin = z; if (z > zmax) zmax = z;
+    }
+    const diag = Math.sqrt((xmax-xmin)**2 + (ymax-ymin)**2 + (zmax-zmin)**2);
+    sewTol = Math.max(1e-6, diag * 5e-3);
+  }
 
   // ── Build one face per surface group ─────────────────────────────────────────
   //
-  // Planar faces: compute exact boundary corners from pairwise plane–plane–plane
-  // intersections.  Adjacent faces share the same corner coordinates (same
-  // 3-plane intersection result computed on both sides), so sewing succeeds.
-  // Falls back to the oversized large-patch rectangle when the analytical build
-  // fails (e.g. a flat cap whose only non-plane neighbour is a cylinder).
+  // For PLANAR faces: walk the mesh boundary edges of this group into an ordered
+  // polygon loop, project every vertex onto the analytical plane (eliminating any
+  // mesh-normal offset noise), then call MakeFace_16(gp_Pln, wire).
   //
-  // Curved faces (cylinder / cone / sphere): build a UV-bounded patch from
-  // mesh vertex projections.  Full-revolution surfaces use U = 0…2π; the V
-  // range is derived from axial vertex projections.
+  // This works for every surface-type combination:
+  //   plane ↔ plane   → shared boundary edges are exactly coincident after projection
+  //   plane ↔ cylinder → the polygon approximates the circular arc; sewing bridges
+  //                       the chord–arc gap using the adaptive tolerance computed above
+  //   plane ↔ cone / sphere → same argument
+  //
+  // For CURVED faces (cylinder / cone / sphere): build a UV-bounded analytical
+  // patch from mesh vertex projections.  The V range uses only a tiny safety
+  // margin (0.1 % + 1e-6) so the cylinder end-circles lie essentially at the
+  // same axial position as the flat-cap vertices that reference them.
+
   const faces = [];
   for (let i = 0; i < groups.length; i++) {
     const g = groups[i];
@@ -579,28 +619,32 @@ export async function buildAndExportSTEP(groups, geometry, options = {}, onStatu
 
     let face = null;
 
-    // For planar faces, prefer the exact analytical boundary.
     if (g.surface.type === 'plane') {
-      const loop = _analyticalPlaneBoundary(i, groups, adjacency);
+      const loop = _orderBoundaryLoop(
+        bdyEdgeMap.get(i) ?? [], geometry.attributes.position,
+      );
       if (loop) {
         try {
           const { origin, normal } = g.surface.params;
           const nu  = _u3(normal);
-          const pln = new oc.gp_Pln_3(makePnt(oc, origin), makeDir(oc, nu));
+          // Project every vertex onto the analytical plane to cancel any
+          // sub-micron mesh-normal offset noise.
+          const projected = loop.map(p => snapToPlane(p, origin, normal));
+          const pln  = new oc.gp_Pln_3(makePnt(oc, origin), makeDir(oc, nu));
           toDelete.push(pln);
-          const wire = buildWire(oc, loop, toDelete);
+          const wire = buildWire(oc, projected, toDelete);
           if (wire) {
             const mf = new oc.BRepBuilderAPI_MakeFace_16(pln, wire, true);
             toDelete.push(mf);
             if (mf.IsDone()) face = mf.Face();
           }
         } catch (e) {
-          console.warn(`Analytical planar face ${i}:`, e?.message ?? e);
+          console.warn(`Planar face ${i} boundary wire:`, e?.message ?? e);
         }
       }
     }
 
-    // Fallback: large UV-bounded patch (primary path for curved surfaces).
+    // Curved surfaces and plane fallback: UV-bounded analytical patch.
     if (!face) {
       try {
         face = _buildLargePatch(oc, g, geometry, toDelete);
@@ -617,12 +661,6 @@ export async function buildAndExportSTEP(groups, geometry, options = {}, onStatu
   onStatus?.(`Sewing ${faces.length} faces into a solid…`, 40);
 
   // ── Build a watertight solid ────────────────────────────────────────────────
-  //
-  // Analytically-bounded planar faces share exact corner coordinates so
-  // BRepBuilderAPI_Sewing will merge their common edges and produce a true
-  // manifold shell for all-planar models (polyhedra, prismatic parts, …).
-
-  const sewTol = options.sewTol ?? 1e-6;
   let topShape = null;
 
   // ── Strategy 1: BRepBuilderAPI_Sewing ──────────────────────────────────────
