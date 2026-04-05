@@ -487,45 +487,17 @@ function buildWire(oc, loop, toDelete) {
 function buildFace(oc, group, geometry, toDelete, groupIdx, allGroups, adjacency) {
   const { type, params } = group.surface;
 
-  // ── Analytical boundary for planar faces ────────────────────────────────
-  // 1. If a planar face is adjacent to a cylinder or cone, its boundary on
-  //    that side is a true circle (or ellipse for oblique cuts — treated as
-  //    a circle here since we only handle axis-aligned cuts). Build an
-  //    analytic circular wire so the face boundary is represented by a
-  //    gp_Circ edge rather than dozens of polygon line-segments.
+  // ── Analytical cap boundary via IntAna_QuadQuadGeo ──────────────────────
+  // When a planar face is adjacent to a curved surface (cylinder, cone, sphere)
+  // the shared boundary is not a polygon but an analytic curve (circle, ellipse,
+  // etc.).  IntAna_QuadQuadGeo computes that curve exactly from the two surface
+  // definitions — no manual intersection math required.
   if (type === 'plane' && allGroups && adjacency) {
     for (const j of adjacency.get(groupIdx) ?? []) {
       const s = allGroups[j]?.surface;
-      if (!s) continue;
-      if (s.type === 'cylinder') {
-        const { axisPoint, axis, radius } = s.params;
-        // Project the cylinder axis point onto this plane to find circle centre.
-        const circCenter = snapToPlane(axisPoint, params.origin, params.normal);
-        const face = _buildCircularPlaneFace(oc, params, circCenter, radius, toDelete);
-        if (face) return face;
-      }
-      if (s.type === 'cone') {
-        const { apex, axis, halfAngle } = s.params;
-        // The cut of a cone by a plane perpendicular to its axis is a circle.
-        // Radius at axial distance t from apex = t * tan(halfAngle).
-        // Project apex onto this plane to find the cut centre, then derive t.
-        const apex3 = apex;
-        const plN = _u3(params.normal);
-        // Signed distance from apex to the plane along the plane normal
-        const t = (params.origin[0]-apex3[0])*plN[0]
-                + (params.origin[1]-apex3[1])*plN[1]
-                + (params.origin[2]-apex3[2])*plN[2];
-        // Only valid for a cut perpendicular to the cone axis.
-        // Check that the cone axis is (approximately) parallel to the plane normal.
-        const axN = _u3(axis);
-        const cosA = Math.abs(plN[0]*axN[0] + plN[1]*axN[1] + plN[2]*axN[2]);
-        if (cosA > 0.99 && t > 1e-10) {
-          const r = t * Math.tan(halfAngle);
-          const circCenter = snapToPlane(apex3, params.origin, params.normal);
-          const face = _buildCircularPlaneFace(oc, params, circCenter, r, toDelete);
-          if (face) return face;
-        }
-      }
+      if (!s || !['cylinder', 'cone', 'sphere'].includes(s.type)) continue;
+      const face = _buildAnalyticalCapFace(oc, params, s, toDelete);
+      if (face) return face;
     }
   }
 
@@ -672,7 +644,121 @@ function _buildCircularPlaneFace(oc, planeParams, circCenter, radius, toDelete) 
   }
 }
 
-function _buildCylinderFace(oc, params, loop, toDelete, neighborVRange) {
+/**
+ * Build a planar cap face whose boundary is the exact analytical intersection
+ * curve between the plane and an adjacent curved surface, computed by
+ * IntAna_QuadQuadGeo — OCCT's purpose-built quadric surface intersection package.
+ *
+ * Supported adjacent surface types:
+ *   cylinder → IntAna_QuadQuadGeo_4(gp_Pln, gp_Cylinder, tolAng, tol)
+ *   cone     → IntAna_QuadQuadGeo_5(gp_Pln, gp_Cone,     tolAng, tol)
+ *   sphere   → IntAna_QuadQuadGeo_3(gp_Pln, gp_Sphere)
+ *
+ * IntAna returns the intersection as a gp_Circ (circle) or gp_Elips (ellipse),
+ * which we turn into a single analytic edge → wire → face.
+ * Falls back to _buildCircularPlaneFace if IntAna returns no solution.
+ *
+ * @param {object}   oc
+ * @param {object}   planeParams  { origin, normal }
+ * @param {object}   adjSurface   { type, params }  — the adjacent curved surface
+ * @param {object[]} toDelete
+ * @returns {object|null}  TopoDS_Face or null
+ */
+function _buildAnalyticalCapFace(oc, planeParams, adjSurface, toDelete) {
+  const { origin, normal } = planeParams;
+  const n = _u3(normal);
+
+  try {
+    const pln = new oc.gp_Pln_3(makePnt(oc, origin), makeDir(oc, n));
+    toDelete.push(pln);
+
+    // ── Build the IntAna intersection object for the relevant surface pair ──
+    let inter = null;
+
+    if (adjSurface.type === 'cylinder') {
+      const { axisPoint, axis, radius } = adjSurface.params;
+      const ax3 = makeAx3(oc, axisPoint, axis);
+      toDelete.push(ax3);
+      const cyl = new oc.gp_Cylinder_2(ax3, radius);
+      toDelete.push(cyl);
+      // IntAna_QuadQuadGeo_4: (gp_Pln, gp_Cylinder, tolAng, tol)
+      inter = new oc.IntAna_QuadQuadGeo_4(pln, cyl, 1e-7, 1e-7);
+      toDelete.push(inter);
+
+    } else if (adjSurface.type === 'cone') {
+      const { apex, axis, halfAngle } = adjSurface.params;
+      const ax3 = makeAx3(oc, apex, axis);
+      toDelete.push(ax3);
+      // gp_Cone_2(gp_Ax3, halfAngle, radiusAtOrigin=0): apex at ax3.Location()
+      const cone = new oc.gp_Cone_2(ax3, halfAngle, 0.0);
+      toDelete.push(cone);
+      // IntAna_QuadQuadGeo_5: (gp_Pln, gp_Cone, tolAng, tol)
+      inter = new oc.IntAna_QuadQuadGeo_5(pln, cone, 1e-7, 1e-7);
+      toDelete.push(inter);
+
+    } else if (adjSurface.type === 'sphere') {
+      const { center, radius } = adjSurface.params;
+      // Sphere Ax3: origin at centre, Z = [0,0,1] (arbitrary — sphere is isotropic)
+      const ax3 = makeAx3(oc, center, [0, 0, 1]);
+      toDelete.push(ax3);
+      const sph = new oc.gp_Sphere_2(ax3, radius);
+      toDelete.push(sph);
+      // IntAna_QuadQuadGeo_3: (gp_Pln, gp_Sphere)
+      inter = new oc.IntAna_QuadQuadGeo_3(pln, sph);
+      toDelete.push(inter);
+    }
+
+    if (!inter || !inter.IsDone() || inter.NbSolutions() < 1) return null;
+
+    // IntAna_ResultType enum: IntAna_Circle=4, IntAna_Ellipse=5
+    const T_CIRCLE  = oc.IntAna_ResultType?.IntAna_Circle  ?? 4;
+    const T_ELLIPSE = oc.IntAna_ResultType?.IntAna_Ellipse ?? 5;
+    const typeInter = inter.TypeInter();
+
+    let edgeMaker;
+    if (typeInter === T_CIRCLE) {
+      // BRepBuilderAPI_MakeEdge_8(gp_Circ) → full circle edge
+      const circ = inter.Circle(1);
+      toDelete.push(circ);
+      edgeMaker = new oc.BRepBuilderAPI_MakeEdge_8(circ);
+    } else if (typeInter === T_ELLIPSE) {
+      // BRepBuilderAPI_MakeEdge_12(gp_Elips) → full ellipse edge
+      const elips = inter.Ellipse(1);
+      toDelete.push(elips);
+      edgeMaker = new oc.BRepBuilderAPI_MakeEdge_12(elips);
+    } else {
+      // Parabola / hyperbola / other: not a closed cap — skip
+      console.warn('[brepBuilder] IntAna cap: unexpected intersection type', typeInter);
+      return null;
+    }
+
+    toDelete.push(edgeMaker);
+    if (!edgeMaker.IsDone()) {
+      console.warn('[brepBuilder] IntAna cap: MakeEdge !IsDone(), typeInter=', typeInter);
+      return null;
+    }
+
+    // BRepBuilderAPI_MakeWire_2(TopoDS_Edge) → single-edge closed wire
+    const wireMaker = new oc.BRepBuilderAPI_MakeWire_2(edgeMaker.Edge());
+    toDelete.push(wireMaker);
+    if (!wireMaker.IsDone()) {
+      console.warn('[brepBuilder] IntAna cap: MakeWire_2 !IsDone()');
+      return null;
+    }
+
+    const mf = new oc.BRepBuilderAPI_MakeFace_16(pln, wireMaker.Wire(), true);
+    toDelete.push(mf);
+    if (!mf.IsDone()) {
+      console.warn('[brepBuilder] IntAna cap: MakeFace_16 !IsDone()');
+      return null;
+    }
+    return mf.Face();
+
+  } catch (e) {
+    console.warn('[brepBuilder] IntAna cap: exception in _buildAnalyticalCapFace', e);
+    return null;
+  }
+}(oc, params, loop, toDelete, neighborVRange) {
   // Build an analytical cylindrical face using UV parameter bounds.
   // BRepBuilderAPI_MakeFace_10(gp_Cylinder, UMin, UMax, VMin, VMax) creates a
   // proper Geom_CylindricalSurface face without requiring PCurves, avoiding the
