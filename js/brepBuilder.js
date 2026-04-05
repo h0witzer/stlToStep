@@ -10,7 +10,7 @@
  *   5. Sew all faces into a shell; attempt ShapeFix_Solid promotion
  *   6. Write STEP via STEPControl_Writer
  *
- * opencascade.js is loaded lazily via <script> injection when the user first
+ * opencascade.js is loaded lazily via dynamic import() when the user first
  * clicks "Export STEP" so the 35 MB WASM does not block page load.
  */
 
@@ -37,26 +37,19 @@ export async function initOC(onStatus) {
   _ocPromise = (async () => {
     onStatus?.('Downloading OpenCASCADE geometry engine (~25 MB, first load only)…');
 
-    // Only inject the script if the global hasn't been set yet.
-    // This handles both first-load and the edge case where a previous attempt
-    // left the <script> tag in the DOM but window.opencascade was never set.
-    if (typeof window.opencascade !== 'function') {
-      await _injectScript(OC_CDN + 'opencascade.wasm.js');
-    }
-
-    // Validate the global — the script may have loaded (HTTP 200) but thrown
-    // during execution, leaving window.opencascade undefined.
-    if (typeof window.opencascade !== 'function') {
+    // opencascade.js@1.1.4 ships as an ES module, so dynamic import() is the
+    // correct loader. The module's default export is the factory function.
+    const ocMod = await import(/* @vite-ignore */ OC_CDN + 'opencascade.wasm.js');
+    const factory = ocMod.default ?? ocMod.opencascade;
+    if (typeof factory !== 'function') {
       throw new Error(
-        'opencascade.js loaded but window.opencascade is not a function. ' +
-        'The CDN script may have thrown a silent error. ' +
-        'Check the browser DevTools console and Network tab to verify that ' +
-        'cdn.jsdelivr.net is reachable and the script executed without errors.'
+        'Could not find the opencascade factory in the loaded module. ' +
+        'Check that cdn.jsdelivr.net is reachable and the correct version is being loaded.'
       );
     }
 
     onStatus?.('Initialising OpenCASCADE…');
-    _oc = await window.opencascade({
+    _oc = await factory({
       locateFile: (file) => OC_CDN + file,
       print:    () => {},
       printErr: () => {},
@@ -67,20 +60,6 @@ export async function initOC(onStatus) {
   _ocPromise.catch(() => { _ocPromise = null; });
 
   return _ocPromise;
-}
-
-function _injectScript(src) {
-  return new Promise((resolve, reject) => {
-    if (document.querySelector(`script[src="${src}"]`)) { resolve(); return; }
-    const s = document.createElement('script');
-    s.src = src;
-    s.crossOrigin = 'anonymous'; // surfaces real errors instead of opaque "Script error."
-    s.onload  = resolve;
-    s.onerror = () => reject(new Error(
-      `Failed to load ${src} — check your internet connection and that cdn.jsdelivr.net is reachable.`
-    ));
-    document.head.appendChild(s);
-  });
 }
 
 // ── Geometry helpers ─────────────────────────────────────────────────────────
