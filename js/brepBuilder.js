@@ -1,26 +1,18 @@
 /**
  * brepBuilder.js — B-rep topology assembly via opencascade.js + STEP export
  *
- * Pipeline per face group:
- *   1. Build group adjacency map (groups that share mesh edges).
- *   2. Build global boundary-edge map: a single O(n) pass over all triangles
- *        to identify, for each group, the mesh edges it shares with other groups.
- *        These edges define the exact face boundary regardless of what surface
- *        types are involved — plane/plane, plane/cylinder, cylinder/cone, etc.
- *   3. Build one face per surface group:
- *        • Planar faces — walk the mesh boundary edges into an ordered polygon,
- *          project every vertex onto the analytical plane (eliminating mesh-noise
- *          offset), then call MakeFace_16(gp_Pln, wire).  Works for any mix of
- *          neighbouring surface types.
- *        • Curved faces (cylinder / cone / sphere) — build a UV-bounded patch
- *          from mesh vertex projections with a tiny safety margin (0.1 % + 1e-6).
- *        • Fallback — a mesh-vertex bounding-rectangle large patch for planes
- *          whose boundary-edge walk fails, or any surface that throws.
- *   4. Sew with an adaptive tolerance = 5 e-3 × model bounding-box diagonal.
- *        This covers the chord–arc deviation at cylinder/cone end-caps while
- *        staying below feature separation distances for typical CAD models.
- *   5. Shell → MakeSolid → TopoDS_Compound (fallbacks).
- *   6. Write STEP via STEPControl_Writer with the /tmp CWD strategy.
+ * Pipeline:
+ *   1. Build one oversized analytical patch per fitted surface group.
+ *      All surface types (plane, cylinder, cone, sphere) go through the same
+ *      code path — _buildLargePatch() — with generous model-scale margins so
+ *      adjacent patches clearly overlap one another.
+ *   2. Feed every patch into BOPAlgo_MakerVolume, OCCT's general-purpose
+ *      Boolean volume builder.  It computes all surface–surface intersection
+ *      curves, trims every face along those curves, and assembles the result
+ *      into a watertight solid — with no mesh-based boundaries, no per-type
+ *      heuristics, and no externally supplied trim geometry.
+ *   3. Fallback: BRepBuilderAPI_Sewing → Shell → MakeSolid → Compound.
+ *   4. Write STEP via STEPControl_Writer with the /tmp CWD strategy.
  *
  * opencascade.js is loaded lazily via dynamic import() when the user first
  * clicks "Export STEP" so the 35 MB WASM does not block page load.
@@ -29,7 +21,7 @@
 // ── Build version ─────────────────────────────────────────────────────────────
 
 /** Increment this string with each release to verify live-site deployments. */
-export const BUILD_VERSION = 'v0.6.0';
+export const BUILD_VERSION = 'v0.7.0';
 
 // ── OpenCASCADE lazy loader ───────────────────────────────────────────────────
 
@@ -449,9 +441,10 @@ function buildWire(oc, loop, toDelete) {
  * @param {object}   group    { triangleIndices, surface: {type, params} }
  * @param {object}   geometry THREE.BufferGeometry
  * @param {object[]} toDelete
+ * @param {number}   [modelDiag]  bounding-box diagonal for model-scale margins
  * @returns {object|null}  TopoDS_Face or null
  */
-function _buildLargePatch(oc, group, geometry, toDelete) {
+function _buildLargePatch(oc, group, geometry, toDelete, modelDiag) {
   const { type, params } = group.surface;
 
   try {
@@ -482,7 +475,7 @@ function _buildLargePatch(oc, group, geometry, toDelete) {
         }
       }
       if (!isFinite(umin)) return null;
-      const m = Math.max(umax - umin, vmax - vmin) * 0.25 + 1e-2;
+      const m = Math.max(Math.max(umax - umin, vmax - vmin) * 0.25, (modelDiag || 0) * 0.02) + 1e-2;
       umin -= m; umax += m; vmin -= m; vmax += m;
 
       const corners = [
@@ -506,7 +499,7 @@ function _buildLargePatch(oc, group, geometry, toDelete) {
       toDelete.push(ax3);
       const cyl = new oc.gp_Cylinder_2(ax3, radius);
       toDelete.push(cyl);
-      const pad = (vr.vmax - vr.vmin) * 1e-3 + 1e-6;
+      const pad = Math.max((vr.vmax - vr.vmin) * 0.15, (modelDiag || 0) * 0.05);
       const mf = new oc.BRepBuilderAPI_MakeFace_10(cyl, 0.0, 2*Math.PI, vr.vmin - pad, vr.vmax + pad);
       toDelete.push(mf);
       return mf.IsDone() ? mf.Face() : null;
@@ -520,7 +513,7 @@ function _buildLargePatch(oc, group, geometry, toDelete) {
       toDelete.push(ax3);
       const cone = new oc.gp_Cone_2(ax3, halfAngle, 0.0);
       toDelete.push(cone);
-      const pad = (vr.vmax - vr.vmin) * 1e-3 + 1e-6;
+      const pad = Math.max((vr.vmax - vr.vmin) * 0.15, (modelDiag || 0) * 0.05);
       const mf = new oc.BRepBuilderAPI_MakeFace_11(cone, 0.0, 2*Math.PI, Math.max(0, vr.vmin - pad), vr.vmax + pad);
       toDelete.push(mf);
       return mf.IsDone() ? mf.Face() : null;
@@ -534,7 +527,7 @@ function _buildLargePatch(oc, group, geometry, toDelete) {
       toDelete.push(ax3);
       const sph = new oc.gp_Sphere_2(ax3, radius);
       toDelete.push(sph);
-      const pad = Math.max((vr.vmax - vr.vmin) * 1e-3 + 1e-6, 0);
+      const pad = Math.max((vr.vmax - vr.vmin) * 0.15, (modelDiag || 0) * 0.02);
       const mf = new oc.BRepBuilderAPI_MakeFace_12(
         sph, 0.0, 2*Math.PI,
         Math.max(-Math.PI/2, vr.vmin - pad),
@@ -548,6 +541,76 @@ function _buildLargePatch(oc, group, geometry, toDelete) {
     console.warn('[brepBuilder] _buildLargePatch:', group.surface.type, e?.message ?? e);
   }
   return null;
+}
+
+// ── BOPAlgo_MakerVolume: general surface-surface trimming ────────────────────
+
+/**
+ * Use OCCT's Boolean volume builder to trim oversized analytical patches
+ * against one another and assemble them into a watertight solid.
+ *
+ * BOPAlgo_MakerVolume is the general-purpose OCCT algorithm for this task:
+ * it computes all pairwise surface–surface intersection curves, splits every
+ * face along those curves, identifies the enclosed volume(s), and returns
+ * a properly trimmed solid — no external trim geometry, no per-type
+ * heuristics, and no mesh data required.
+ *
+ * @param {object}   oc        opencascade.js module
+ * @param {object[]} faces     oversized TopoDS_Face patches
+ * @param {number}   fuzzyTol  fuzzy tolerance for intersection computation
+ * @param {object[]} toDelete  C++ garbage-collection list
+ * @returns {object|null}  TopoDS_Shape (solid) or null on failure
+ */
+function _buildSolidViaMakerVolume(oc, faces, fuzzyTol, toDelete) {
+  try {
+    const maker = new oc.BOPAlgo_MakerVolume_1();
+    toDelete.push(maker);
+
+    // Build argument list and hand it to the algorithm.
+    const argList = new oc.TopTools_ListOfShape_1();
+    toDelete.push(argList);
+    for (const f of faces) argList.Append_1(f);
+    maker.SetArguments(argList);
+
+    // Compute surface–surface intersections between all input faces.
+    maker.SetIntersect(true);
+
+    // Skip internal (non-boundary) faces inside the solid.
+    if (typeof maker.SetAvoidInternalShapes === 'function') {
+      maker.SetAvoidInternalShapes(true);
+    }
+
+    // Apply the same adaptive tolerance used for sewing so that the
+    // intersection engine bridges small numerical mismatches.
+    if (typeof maker.SetFuzzyValue === 'function' && fuzzyTol > 0) {
+      maker.SetFuzzyValue(fuzzyTol);
+    }
+
+    // Emscripten is single-threaded.
+    if (typeof maker.SetRunParallel === 'function') {
+      maker.SetRunParallel(false);
+    }
+
+    maker.Perform();
+
+    // Check for algorithmic errors.
+    if (typeof maker.HasErrors === 'function' && maker.HasErrors()) {
+      console.warn('BOPAlgo_MakerVolume reported errors.');
+      return null;
+    }
+
+    const result = maker.Shape();
+    if (!result || (typeof result.IsNull === 'function' && result.IsNull())) {
+      console.warn('BOPAlgo_MakerVolume produced a null shape.');
+      return null;
+    }
+
+    console.info('BOPAlgo_MakerVolume succeeded — solid built from trimmed analytical surfaces.');
+    return result;
+  } catch (e) {
+    console.warn('BOPAlgo_MakerVolume unavailable or failed:', e?.message ?? e);
+    return null;
+  }
 }
 
 // ── Main export: build B-rep + STEP ─────────────────────────────────────────
@@ -568,48 +631,31 @@ export async function buildAndExportSTEP(groups, geometry, options = {}, onStatu
 
   onStatus?.('Building B-rep faces…', 20);
 
-  const bdyEdgeMap = _buildBoundaryEdgeMap(groups, geometry);
   const toDelete   = [];
 
-  // ── Compute adaptive sewing tolerance ────────────────────────────────────────
-  // For all-planar models the mesh boundary vertices coincide exactly on shared
-  // edges, so a tiny tolerance (1e-6) is sufficient.  For curved surfaces
-  // (cylinder, cone, sphere) the flat-cap boundary is a polygon approximation
-  // of a circular arc; the sewing tolerance must cover the chord–arc deviation
-  //   δ = r · (1 − cos(π/n))
-  // For n ≥ 32 segments this is ≤ 0.5 % of r, so 0.5 % of the model's
-  // bounding-box diagonal gives a safe universal default.
-  let sewTol = options.sewTol ?? 0;
-  if (sewTol <= 0) {
-    const posAttr = geometry.attributes.position;
-    let xmin =  Infinity, ymin =  Infinity, zmin =  Infinity;
-    let xmax = -Infinity, ymax = -Infinity, zmax = -Infinity;
-    for (let i = 0; i < posAttr.count; i++) {
-      const x = posAttr.getX(i), y = posAttr.getY(i), z = posAttr.getZ(i);
-      if (x < xmin) xmin = x; if (x > xmax) xmax = x;
-      if (y < ymin) ymin = y; if (y > ymax) ymax = y;
-      if (z < zmin) zmin = z; if (z > zmax) zmax = z;
-    }
-    const diag = Math.sqrt((xmax-xmin)**2 + (ymax-ymin)**2 + (zmax-zmin)**2);
-    sewTol = Math.max(1e-6, diag * 5e-3);
+  // ── Compute model bounding-box diagonal ─────────────────────────────────────
+  // Used both for adaptive sewing tolerance (fallback strategy) and for sizing
+  // the oversized analytical patches in _buildLargePatch().
+  const posAttr = geometry.attributes.position;
+  let xmin =  Infinity, ymin =  Infinity, zmin =  Infinity;
+  let xmax = -Infinity, ymax = -Infinity, zmax = -Infinity;
+  for (let i = 0; i < posAttr.count; i++) {
+    const x = posAttr.getX(i), y = posAttr.getY(i), z = posAttr.getZ(i);
+    if (x < xmin) xmin = x; if (x > xmax) xmax = x;
+    if (y < ymin) ymin = y; if (y > ymax) ymax = y;
+    if (z < zmin) zmin = z; if (z > zmax) zmax = z;
   }
+  const modelDiag = Math.sqrt((xmax-xmin)**2 + (ymax-ymin)**2 + (zmax-zmin)**2);
 
-  // ── Build one face per surface group ─────────────────────────────────────────
+  let sewTol = options.sewTol ?? 0;
+  if (sewTol <= 0) sewTol = Math.max(1e-6, modelDiag * 5e-3);
+
+  // ── Build oversized analytical patches for every surface group ──────────────
   //
-  // For PLANAR faces: walk the mesh boundary edges of this group into an ordered
-  // polygon loop, project every vertex onto the analytical plane (eliminating any
-  // mesh-normal offset noise), then call MakeFace_16(gp_Pln, wire).
-  //
-  // This works for every surface-type combination:
-  //   plane ↔ plane   → shared boundary edges are exactly coincident after projection
-  //   plane ↔ cylinder → the polygon approximates the circular arc; sewing bridges
-  //                       the chord–arc gap using the adaptive tolerance computed above
-  //   plane ↔ cone / sphere → same argument
-  //
-  // For CURVED faces (cylinder / cone / sphere): build a UV-bounded analytical
-  // patch from mesh vertex projections.  The V range uses only a tiny safety
-  // margin (0.1 % + 1e-6) so the cylinder end-circles lie essentially at the
-  // same axial position as the flat-cap vertices that reference them.
+  // ALL surface types (plane, cylinder, cone, sphere) go through the same code
+  // path — _buildLargePatch() — with model-scale margins so that adjacent
+  // patches clearly overlap.  No mesh-boundary edges or per-type intersection
+  // heuristics are used; trimming is delegated to BOPAlgo_MakerVolume below.
 
   const faces = [];
   for (let i = 0; i < groups.length; i++) {
@@ -617,111 +663,90 @@ export async function buildAndExportSTEP(groups, geometry, options = {}, onStatu
     if (!g.surface) continue;
     if (i % 50 === 0) onStatus?.(`Building faces… ${i}/${groups.length}`, 20 + 20 * i / groups.length);
 
-    let face = null;
-
-    if (g.surface.type === 'plane') {
-      const loop = _orderBoundaryLoop(
-        bdyEdgeMap.get(i) ?? [], geometry.attributes.position,
-      );
-      if (loop) {
-        try {
-          const { origin, normal } = g.surface.params;
-          const nu  = _u3(normal);
-          // Project every vertex onto the analytical plane to cancel any
-          // sub-micron mesh-normal offset noise.
-          const projected = loop.map(p => snapToPlane(p, origin, normal));
-          const pln  = new oc.gp_Pln_3(makePnt(oc, origin), makeDir(oc, nu));
-          toDelete.push(pln);
-          const wire = buildWire(oc, projected, toDelete);
-          if (wire) {
-            const mf = new oc.BRepBuilderAPI_MakeFace_16(pln, wire, true);
-            toDelete.push(mf);
-            if (mf.IsDone()) face = mf.Face();
-          }
-        } catch (e) {
-          console.warn(`Planar face ${i} boundary wire:`, e?.message ?? e);
-        }
-      }
+    try {
+      const face = _buildLargePatch(oc, g, geometry, toDelete, modelDiag);
+      if (face) faces.push(face);
+    } catch (e) {
+      console.warn(`Patch ${i} (${g.surface?.type}):`, e?.message ?? e);
     }
-
-    // Curved surfaces and plane fallback: UV-bounded analytical patch.
-    if (!face) {
-      try {
-        face = _buildLargePatch(oc, g, geometry, toDelete);
-      } catch (e) {
-        console.warn(`Patch ${i} (${g.surface?.type}):`, e?.message ?? e);
-      }
-    }
-
-    if (face) faces.push(face);
   }
 
   if (faces.length === 0) throw new Error('No valid B-rep faces could be constructed.');
 
-  onStatus?.(`Sewing ${faces.length} faces into a solid…`, 40);
+  onStatus?.(`Trimming ${faces.length} faces and building solid…`, 40);
 
   // ── Build a watertight solid ────────────────────────────────────────────────
   let topShape = null;
 
-  // ── Strategy 1: BRepBuilderAPI_Sewing ──────────────────────────────────────
-  try {
-    // BRepBuilderAPI_Sewing constructor: _1() default tol, _2(tol, opts…).
-    // Use typeof guard to avoid accidentally calling an undefined constructor.
-    const SewCtor = typeof oc.BRepBuilderAPI_Sewing_2 === 'function'
-      ? oc.BRepBuilderAPI_Sewing_2
-      : typeof oc.BRepBuilderAPI_Sewing_1 === 'function'
-        ? oc.BRepBuilderAPI_Sewing_1
-        : oc.BRepBuilderAPI_Sewing;
-    const sewing = new SewCtor(sewTol);
-    toDelete.push(sewing);
+  // ── Strategy 0: BOPAlgo_MakerVolume — general surface trimming ─────────────
+  // OCCT's Boolean volume builder accepts a set of oversized faces, computes
+  // every pairwise surface–surface intersection curve, trims each face back,
+  // and assembles the result into a closed solid.  No per-type heuristics, no
+  // mesh data, and no externally supplied trim geometry.
+  topShape = _buildSolidViaMakerVolume(oc, faces, sewTol, toDelete);
 
-    for (const f of faces) sewing.Add(f);
+  // ── Strategy 1: BRepBuilderAPI_Sewing (fallback) ──────────────────────────
+  if (!topShape) {
+    onStatus?.(`Sewing ${faces.length} faces…`, 50);
+    try {
+      // BRepBuilderAPI_Sewing constructor: _1() default tol, _2(tol, opts…).
+      // Use typeof guard to avoid accidentally calling an undefined constructor.
+      const SewCtor = typeof oc.BRepBuilderAPI_Sewing_2 === 'function'
+        ? oc.BRepBuilderAPI_Sewing_2
+        : typeof oc.BRepBuilderAPI_Sewing_1 === 'function'
+          ? oc.BRepBuilderAPI_Sewing_1
+          : oc.BRepBuilderAPI_Sewing;
+      const sewing = new SewCtor(sewTol);
+      toDelete.push(sewing);
 
-    // Perform() has an optional Handle<Message_ProgressIndicator> default arg.
-    // Some Emscripten builds handle the no-arg call; others throw — we catch.
-    sewing.Perform();
+      for (const f of faces) sewing.Add(f);
 
-    const sewn = sewing.SewedShape();
+      // Perform() has an optional Handle<Message_ProgressIndicator> default arg.
+      // Some Emscripten builds handle the no-arg call; others throw — we catch.
+      sewing.Perform();
 
-    // SewedShape() may return a Shell, Solid, or Compound.
-    const shapeType = sewn.ShapeType?.() ?? -1;
-    const SOLID_T   = oc.TopAbs_ShapeEnum?.TopAbs_SOLID   ?? 3;
-    const SHELL_T   = oc.TopAbs_ShapeEnum?.TopAbs_SHELL   ?? 4;
-    const COMP_T    = oc.TopAbs_ShapeEnum?.TopAbs_COMPOUND ?? 0;
+      const sewn = sewing.SewedShape();
 
-    if (shapeType === SOLID_T) {
-      topShape = sewn;
-    } else if (shapeType === SHELL_T) {
-      const mkSolid = new oc.BRepBuilderAPI_MakeSolid_3(sewn);
-      toDelete.push(mkSolid);
-      if (mkSolid.IsDone()) topShape = mkSolid.Solid();
-    } else if (shapeType === COMP_T) {
-      // Sewing produced a compound (multiple disconnected shells).
-      // Try to find the largest shell inside it and wrap that.
-      try {
-        const expShell = new oc.TopExp_Explorer_2(
-          sewn,
-          oc.TopAbs_ShapeEnum?.TopAbs_SHELL ?? 4,
-          oc.TopAbs_ShapeEnum?.TopAbs_SHAPE ?? 0,
-        );
-        toDelete.push(expShell);
-        let bestShell = null;
-        while (expShell.More()) {
-          const s = expShell.Current();
-          if (!bestShell) bestShell = s;
-          expShell.Next();
-        }
-        if (bestShell) {
-          const mkSolid = new oc.BRepBuilderAPI_MakeSolid_3(bestShell);
-          toDelete.push(mkSolid);
-          if (mkSolid.IsDone()) topShape = mkSolid.Solid();
-        }
-      } catch { /* fall through to strategy 2 */ }
+      // SewedShape() may return a Shell, Solid, or Compound.
+      const shapeType = sewn.ShapeType?.() ?? -1;
+      const SOLID_T   = oc.TopAbs_ShapeEnum?.TopAbs_SOLID   ?? 3;
+      const SHELL_T   = oc.TopAbs_ShapeEnum?.TopAbs_SHELL   ?? 4;
+      const COMP_T    = oc.TopAbs_ShapeEnum?.TopAbs_COMPOUND ?? 0;
+
+      if (shapeType === SOLID_T) {
+        topShape = sewn;
+      } else if (shapeType === SHELL_T) {
+        const mkSolid = new oc.BRepBuilderAPI_MakeSolid_3(sewn);
+        toDelete.push(mkSolid);
+        if (mkSolid.IsDone()) topShape = mkSolid.Solid();
+      } else if (shapeType === COMP_T) {
+        // Sewing produced a compound (multiple disconnected shells).
+        // Try to find the largest shell inside it and wrap that.
+        try {
+          const expShell = new oc.TopExp_Explorer_2(
+            sewn,
+            oc.TopAbs_ShapeEnum?.TopAbs_SHELL ?? 4,
+            oc.TopAbs_ShapeEnum?.TopAbs_SHAPE ?? 0,
+          );
+          toDelete.push(expShell);
+          let bestShell = null;
+          while (expShell.More()) {
+            const s = expShell.Current();
+            if (!bestShell) bestShell = s;
+            expShell.Next();
+          }
+          if (bestShell) {
+            const mkSolid = new oc.BRepBuilderAPI_MakeSolid_3(bestShell);
+            toDelete.push(mkSolid);
+            if (mkSolid.IsDone()) topShape = mkSolid.Solid();
+          }
+        } catch { /* fall through to strategy 2 */ }
+      }
+
+      if (topShape) console.info(`Sewing succeeded — solid built from sewn shape (type ${shapeType}).`);
+    } catch (sewErr) {
+      console.warn('BRepBuilderAPI_Sewing unavailable or failed:', sewErr?.message ?? sewErr);
     }
-
-    if (topShape) console.info(`Sewing succeeded — solid built from sewn shape (type ${shapeType}).`);
-  } catch (sewErr) {
-    console.warn('BRepBuilderAPI_Sewing unavailable or failed:', sewErr?.message ?? sewErr);
   }
 
   // ── Strategy 2: manual shell → solid (no sewing) ───────────────────────────
