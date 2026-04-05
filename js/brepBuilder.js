@@ -373,6 +373,16 @@ export async function buildAndExportSTEP(groups, geometry, options = {}, onStatu
     throw new Error(`STEPControl_Writer.Write failed (status ${writeResult}).`);
   }
 
+  // STEPControl_Writer::Write() uses buffered C FILE* I/O internally.  The
+  // write buffer is only flushed to Emscripten MEMFS when fclose() is called,
+  // which happens inside the C++ destructor.  Explicitly delete the writer
+  // object HERE — before reading the file — so that the destructor runs and
+  // all buffered bytes are committed to the in-memory filesystem before we
+  // attempt to read them back.
+  const writerIdx = toDelete.indexOf(writer);
+  if (writerIdx !== -1) toDelete.splice(writerIdx, 1);
+  try { writer.delete(); } catch { /* ignore */ }
+
   let stepContent;
   try {
     const raw = oc.FS.readFile(stepPath);

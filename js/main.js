@@ -238,27 +238,33 @@ async function handleFit() {
 const TYPE_LABELS = { plane: 'Plane', cylinder: 'Cylinder', cone: 'Cone', sphere: 'Sphere', nurbs: 'NURBS' };
 const TYPE_COLORS = { plane: '#4a9eff', cylinder: '#ff9a3c', cone: '#f97316', sphere: '#7dd67d', nurbs: '#c084fc' };
 
-function renderSurfaceList() {
-  surfaceList.innerHTML = '';
-
-  // Tally surface types
+/** Re-render just the summary chips at the top of the surface list. */
+function updateChips() {
+  const container = surfaceList?.querySelector('.surface-chips');
+  if (!container) return;
   const tally = {};
   for (const g of currentGroups) {
     const type = g.surface?.type ?? 'unknown';
     tally[type] = (tally[type] || 0) + 1;
   }
-
-  // Summary chips
-  const chips = document.createElement('div');
-  chips.className = 'surface-chips';
+  container.innerHTML = '';
   for (const [type, count] of Object.entries(tally)) {
     const chip = document.createElement('span');
     chip.className = 'surface-chip';
     chip.style.setProperty('--chip-color', TYPE_COLORS[type] ?? '#aaa');
     chip.textContent = `${count} × ${TYPE_LABELS[type] ?? type}`;
-    chips.appendChild(chip);
+    container.appendChild(chip);
   }
+}
+
+function renderSurfaceList() {
+  surfaceList.innerHTML = '';
+
+  // Summary chips (rendered via shared helper so updateChips() can refresh them)
+  const chips = document.createElement('div');
+  chips.className = 'surface-chips';
   surfaceList.appendChild(chips);
+  updateChips();
 
   // Per-group rows (cap at 200 to avoid DOM overload)
   const MAX_ROWS = 200;
@@ -303,18 +309,22 @@ function renderSurfaceList() {
       } else {
         g._autoSurface = g._autoSurface ?? g.surface;
         g._override    = val;
-        g.surface      = classifyGroupAs(val, g, currentGeometry);
-        g.surface.type = val; // ensure type label matches selection even if fit fell back
+        // classifyGroupAs always returns the forced type with appropriate params
+        // (or plane-derived fallback params when the analytic fit is degenerate).
+        g.surface = classifyGroupAs(val, g, currentGeometry);
       }
       // Refresh the row's RMS display
       const newRms = g.surface?.rms ?? 0;
       rmsEl.textContent = isFinite(newRms) && newRms > 0
         ? `RMS ${newRms < 0.001 ? newRms.toExponential(2) : newRms.toFixed(4)}`
         : '';
-      // Update the colour dot
+      // Update the colour dot and label for this row
       const newColor = TYPE_COLORS[g.surface?.type] ?? '#aaa';
       dot.style.background = newColor;
       name.textContent = `Group ${i + 1} — ${TYPE_LABELS[g.surface?.type] ?? g.surface?.type}`;
+      // Re-render the tally chips at the top of the surface list to reflect
+      // the updated type counts across all groups.
+      updateChips();
       // Rebuild the B-rep overlay to reflect the new surface type
       const overlay = buildBrepOverlay(currentGroups, currentGeometry, TYPE_COLORS);
       setBrepOverlay(overlay);

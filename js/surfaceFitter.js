@@ -576,6 +576,40 @@ export function classifyGroupAs(forcedType, group, geometry) {
     return { type: 'nurbs', params: { vertices, normals }, rms: Infinity };
   }
 
-  // Forced fit was degenerate — return auto classification
+  // Forced fit was degenerate or didn't satisfy quality thresholds.
+  // Rather than silently switching to the auto type (which would give the
+  // visualizer params that don't match the declared type and cause a crash),
+  // derive plausible fallback params for the forced type from a plane fit.
+  // rms: Infinity signals to the caller that the fit was degenerate.
+  const pf = fitPlane(vertices);
+  const nn2 = normals.length / 3;
+  let mx2 = 0, my2 = 0, mz2 = 0;
+  for (let i = 0; i < nn2; i++) { mx2 += normals[i*3]; my2 += normals[i*3+1]; mz2 += normals[i*3+2]; }
+  if (pf.normal[0]*mx2 + pf.normal[1]*my2 + pf.normal[2]*mz2 < 0) {
+    pf.normal = [-pf.normal[0], -pf.normal[1], -pf.normal[2]];
+  }
+  let ext = 0;
+  for (let i = 0; i < n; i++) {
+    const dx = vertices[i*3] - pf.origin[0], dy = vertices[i*3+1] - pf.origin[1], dz = vertices[i*3+2] - pf.origin[2];
+    ext = Math.max(ext, Math.sqrt(dx*dx + dy*dy + dz*dz));
+  }
+  const scale = ext > 1e-9 ? ext : 1;
+
+  if (forcedType === 'cylinder') {
+    return { type: 'cylinder', params: { axis: pf.normal, axisPoint: pf.origin, radius: scale * 0.5 }, rms: Infinity };
+  }
+  if (forcedType === 'cone') {
+    const apexOffset = scale;
+    return { type: 'cone', params: {
+      axis: pf.normal,
+      apex: [pf.origin[0] + pf.normal[0]*apexOffset, pf.origin[1] + pf.normal[1]*apexOffset, pf.origin[2] + pf.normal[2]*apexOffset],
+      halfAngle: Math.PI / 6,  // 30° placeholder
+    }, rms: Infinity };
+  }
+  if (forcedType === 'sphere') {
+    return { type: 'sphere', params: { center: pf.origin, radius: scale }, rms: Infinity };
+  }
+
+  // Last resort: return auto classification
   return classifyGroup(group, geometry);
 }
