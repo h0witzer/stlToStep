@@ -338,7 +338,7 @@ async function handleExport() {
     const stepContent = await buildAndExportSTEP(
       currentGroups,
       currentGeometry,
-      { schema, sewTol },
+      { schema, sewTol: sewTol || 1e-5 },
       (msg, pct) => setProgress(msg, pct),
     );
 

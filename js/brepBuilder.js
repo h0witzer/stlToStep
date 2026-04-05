@@ -8,8 +8,8 @@
  *   4. Build an OCCT face: plane uses analytic gp_Pln;
  *      cylinder/cone/sphere/NURBS fall back to BRepBuilderAPI_MakeFace (wire-only)
  *   5. Assemble all faces into a TopoDS_Compound
- *   6. Write STEP via STEPControl_Writer; read back using oc.FS.cwd() to resolve the
- *      actual MEMFS path where OSD_Path places the output file
+ *   6. Write STEP via STEPControl_Writer; chdir('/') first so the bare filename
+ *      is always resolved to '/', then pre-create the inode for O_WRONLY safety
  *
  * opencascade.js is loaded lazily via dynamic import() when the user first
  * clicks "Export STEP" so the 35 MB WASM does not block page load.
@@ -20,7 +20,7 @@ import { extractBoundaryLoop } from './faceGrouper.js';
 // ── Build version ─────────────────────────────────────────────────────────────
 
 /** Increment this string with each release to verify live-site deployments. */
-export const BUILD_VERSION = 'v0.4.1';
+export const BUILD_VERSION = 'v0.4.2';
 
 // ── OpenCASCADE lazy loader ───────────────────────────────────────────────────
 
@@ -349,46 +349,49 @@ export async function buildAndExportSTEP(groups, geometry, options = {}, onStatu
     throw new Error(`STEPControl_Writer.Transfer failed (status ${transferResult}).`);
   }
 
-  // OCCT's OSD_Path resolves bare filenames relative to the process CWD (not necessarily '/').
-  // We use oc.FS.cwd() to find the actual CWD so we can read back what Write created.
+  // Pin the process CWD to '/' so bare filenames resolve predictably.
+  // In some OCCT/Emscripten builds the CWD is initialised to a non-root path
+  // (e.g. '/home/web_user') which causes Write to produce a file that is
+  // invisible from a '/' lookup.
   const stepFile = 'brep_export.stp';
-  const cwd = typeof oc.FS.cwd === 'function' ? oc.FS.cwd() : '/';
-  const cwdPrefix = cwd.endsWith('/') ? cwd : cwd + '/';
-  const stepPath = cwdPrefix + stepFile;  // where OCCT will write
-  const stepPathRoot = '/' + stepFile;   // fallback in case CWD === '/'
+  const stepPath = '/' + stepFile;
+  const savedCwd = typeof oc.FS.cwd === 'function' ? oc.FS.cwd() : '/';
+  try { oc.FS.chdir('/'); } catch { /* not fatal — best effort */ }
 
-  // Clean up any leftovers from a previous failed export
+  // Clean up any leftover from a previous failed export, then pre-create the
+  // inode so that OSD_File can open it with O_WRONLY even if OCCT's libc open()
+  // omits O_CREAT in the Emscripten build.
   try { oc.FS.unlink(stepPath); } catch { /* ignore */ }
-  if (stepPath !== stepPathRoot) {
-    try { oc.FS.unlink(stepPathRoot); } catch { /* ignore */ }
-  }
+  oc.FS.writeFile(stepPath, '');
 
   const writeResult = writer.Write(stepFile);
+
+  // Restore the CWD regardless of outcome
+  try { if (savedCwd !== '/') oc.FS.chdir(savedCwd); } catch { /* ignore */ }
+
   if (writeResult !== DONE) {
     throw new Error(`STEPControl_Writer.Write failed (status ${writeResult}).`);
   }
 
-  // Try CWD-relative path first, then '/' as a fallback
   let stepContent;
-  for (const p of [stepPath, stepPathRoot]) {
-    try {
-      const raw = oc.FS.readFile(p);
-      // raw may be a Uint8Array (Emscripten default) or a string
-      const text = typeof raw === 'string' ? raw : new TextDecoder().decode(raw);
-      if (text && text.startsWith('ISO-10303')) {
-        stepContent = text;
-        try { oc.FS.unlink(p); } catch { /* ignore */ }
-        break;
-      }
-    } catch { /* try next candidate */ }
-  }
+  try {
+    const raw = oc.FS.readFile(stepPath);
+    // readFile returns a Uint8Array by default in Emscripten; decode it.
+    const text = typeof raw === 'string' ? raw : new TextDecoder().decode(raw);
+    // Allow for a leading BOM (U+FEFF) or stray whitespace before the header.
+    if (text && text.includes('ISO-10303')) {
+      stepContent = text;
+    }
+  } catch { /* fall through to error below */ }
+
+  try { oc.FS.unlink(stepPath); } catch { /* ignore */ }
 
   if (!stepContent) {
     // Diagnostic: log MEMFS state so developers can pinpoint the issue
     try {
+      const cwd = typeof oc.FS.cwd === 'function' ? oc.FS.cwd() : '?';
       console.error('STEP Write diagnostics — CWD:', cwd,
-        '/ contents:', oc.FS.readdir('/'),
-        ...(cwd !== '/' ? ['CWD contents:', oc.FS.readdir(cwd)] : []));
+        '/ contents:', oc.FS.readdir('/'));
     } catch { /* ignore */ }
     throw new Error('STEP export produced empty or invalid output. Transfer returned DONE but no ISO-10303 header found.');
   }
