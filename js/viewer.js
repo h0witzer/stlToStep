@@ -12,6 +12,13 @@ let wireframeLines = null;   // LineSegments overlay, or null when hidden
 let wireframeVisible = false;
 let exclusionMesh = null;    // flat orange overlay for user-excluded faces
 let hoverMesh = null;        // semi-transparent yellow bucket-fill preview
+let groupHighlightMesh = null; // white highlight overlay for hovered surface-list row
+let brepOverlayGroup = null;   // analytic surface wireframe indicators
+let brepFacesGroup   = null;   // analytical face-mesh preview (semi-transparent)
+
+// Callback invoked when the canvas pointer hovers over a different face group.
+// Signature: (groupIndex: number) => void   (-1 = no group under cursor)
+let _onGroupHoverCallback = null;
 
 // Build a labelled coordinate axes indicator scaled to `size`.
 // X = red, Y = green, Z = blue (up).
@@ -360,6 +367,38 @@ export function initViewer(canvas) {
   resizeObserver.observe(canvas.parentElement);
   onResize();
 
+  // ── Canvas hover: raycast to find which face group is under the cursor ──────
+  // A separate raycaster; throttled so it only fires when the pointer moves.
+  const _groupRaycaster = new THREE.Raycaster();
+  let _lastHoveredGroup = -1;
+  let _groupHoverThrottle = null;
+
+  renderer.domElement.addEventListener('pointermove', (e) => {
+    if (_groupHoverThrottle) return;
+    _groupHoverThrottle = setTimeout(() => { _groupHoverThrottle = null; }, 30);
+
+    if (!currentMesh || !_onGroupHoverCallback) return;
+    const rect = renderer.domElement.getBoundingClientRect();
+    const ndc = new THREE.Vector2(
+      ((e.clientX - rect.left) / rect.width)  *  2 - 1,
+      ((e.clientY - rect.top)  / rect.height) * -2 + 1,
+    );
+    _groupRaycaster.setFromCamera(ndc, camera);
+    const hits = _groupRaycaster.intersectObject(currentMesh);
+    const triIdx = hits.length > 0 ? hits[0].faceIndex : -1;
+    if (triIdx !== _lastHoveredGroup) {
+      _lastHoveredGroup = triIdx;
+      _onGroupHoverCallback(triIdx);
+    }
+  });
+
+  renderer.domElement.addEventListener('pointerleave', () => {
+    if (_lastHoveredGroup !== -1) {
+      _lastHoveredGroup = -1;
+      _onGroupHoverCallback?.(-1);
+    }
+  });
+
   // Render loop
   (function animate() {
     requestAnimationFrame(animate);
@@ -421,6 +460,10 @@ export function loadGeometry(geometry, material) {
   // (old overlay is already gone because meshGroup was cleared above)
   wireframeLines = null;
   if (wireframeVisible) _buildWireframe(geometry);
+
+  // Clear both B-rep overlays — they're stale for the new model
+  setBrepOverlay(null);
+  setBrepFacesOverlay(null);
 
   // Position grid at mesh bottom (Z-up: move grid along Z)
   geometry.computeBoundingBox();
@@ -544,6 +587,70 @@ export function setViewerTheme(isLight) {
 }
 
 /**
+ * Apply distinct vertex colours to the current mesh to visualise face groups.
+ * Each group receives a hue derived from the golden-angle sequence so adjacent
+ * groups are always visually distinct.
+ *
+ * Calling with an empty array (or null) restores the default grey material.
+ *
+ * @param {THREE.BufferGeometry} geometry   non-indexed source geometry
+ * @param {Array<{triangleIndices:Set<number>}>} groups
+ */
+
+// Multiplier that distributes hues using the golden angle (≈137.508°)
+const GOLDEN_ANGLE_DEG = 137.508;
+// HSL parameters for face-group colours — saturated and mid-lightness
+const GROUP_COLOR_SATURATION = 0.72;
+const GROUP_COLOR_LIGHTNESS  = 0.52;
+
+export function showFaceGroupColors(geometry, groups) {
+  if (!currentMesh) return;
+
+  if (!groups || groups.length === 0) {
+    // Restore default material and always ensure vertex normals are present
+    if (currentMesh.material) currentMesh.material.dispose();
+    currentMesh.material = new THREE.MeshStandardMaterial({
+      color: 0xaaaacc, roughness: 0.6, metalness: 0.1, side: THREE.DoubleSide,
+    });
+    if (currentMesh.geometry !== geometry) {
+      currentMesh.geometry = geometry;
+    }
+    if (!currentMesh.geometry.attributes.normal) {
+      currentMesh.geometry.computeVertexNormals();
+    }
+    return;
+  }
+
+  const count = geometry.attributes.position.count;
+  const colors = new Float32Array(count * 3);
+
+  groups.forEach((group, idx) => {
+    const hue = (idx * GOLDEN_ANGLE_DEG) % 360;
+    const c = new THREE.Color().setHSL(hue / 360, GROUP_COLOR_SATURATION, GROUP_COLOR_LIGHTNESS);
+    for (const triIdx of group.triangleIndices) {
+      for (let v = 0; v < 3; v++) {
+        const vi = triIdx * 3 + v;
+        colors[vi * 3]     = c.r;
+        colors[vi * 3 + 1] = c.g;
+        colors[vi * 3 + 2] = c.b;
+      }
+    }
+  });
+
+  // Swap to a fresh geometry with the colour attribute
+  const colorGeo = geometry.clone();
+  colorGeo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+  if (!colorGeo.attributes.normal) colorGeo.computeVertexNormals();
+
+  if (currentMesh.material) currentMesh.material.dispose();
+  currentMesh.material = new THREE.MeshLambertMaterial({
+    vertexColors: true,
+    side: THREE.DoubleSide,
+  });
+  currentMesh.geometry = colorGeo;
+}
+
+/**
  * Replace (or clear) the flat orange exclusion overlay mesh.
  * overlayGeo must be a non-indexed BufferGeometry with a 'position' attribute,
  * or null / an empty geometry to clear the overlay.
@@ -657,4 +764,127 @@ function _buildWireframe(geometry) {
   wireframeLines.renderOrder = 3;  // draw after base mesh (0), overlays (1-2)
   // Add to meshGroup so it's automatically removed when a new model is loaded
   meshGroup.add(wireframeLines);
+}
+
+// ── Group highlight overlay ───────────────────────────────────────────────────
+
+/**
+ * Show a bright highlight overlay for a specific face group's triangles.
+ * Pass null/undefined to clear the highlight.
+ *
+ * @param {Set<number>|null} triangleIndices  triangle indices belonging to the group
+ * @param {THREE.BufferGeometry|null} geometry  source geometry
+ */
+export function setGroupHighlight(triangleIndices, geometry) {
+  if (groupHighlightMesh) {
+    scene.remove(groupHighlightMesh);
+    groupHighlightMesh.geometry.dispose();
+    groupHighlightMesh.material.dispose();
+    groupHighlightMesh = null;
+  }
+  if (!triangleIndices || !geometry || triangleIndices.size === 0) return;
+
+  const posAttr = geometry.attributes.position;
+  const positions = new Float32Array(triangleIndices.size * 9);
+  let i = 0;
+  for (const t of triangleIndices) {
+    for (let v = 0; v < 3; v++) {
+      const idx = t * 3 + v;
+      positions[i++] = posAttr.getX(idx);
+      positions[i++] = posAttr.getY(idx);
+      positions[i++] = posAttr.getZ(idx);
+    }
+  }
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+
+  groupHighlightMesh = new THREE.Mesh(
+    geo,
+    new THREE.MeshBasicMaterial({
+      color: 0xffffff,
+      side: THREE.DoubleSide,
+      transparent: true,
+      opacity: 0.40,
+      depthTest: true,
+      polygonOffset: true,
+      polygonOffsetFactor: -3,
+      polygonOffsetUnits: -3,
+    }),
+  );
+  groupHighlightMesh.renderOrder = 4;
+  scene.add(groupHighlightMesh);
+}
+
+/**
+ * Register a callback that fires when the pointer moves over a different triangle
+ * on the mesh surface.  The callback receives the raw triangle index (faceIndex
+ * from Raycaster), or -1 when the cursor leaves the mesh.
+ *
+ * main.js uses this to map triangle → group index and update the sidebar.
+ *
+ * @param {function(number):void} cb
+ */
+export function setGroupHoverCallback(cb) {
+  _onGroupHoverCallback = cb;
+}
+
+/**
+ * Replace the current B-rep analytic-surface overlay with a new Three.js group.
+ * Pass null to remove any existing overlay without adding a new one.
+ *
+ * The overlay is added directly to the scene (not meshGroup) so it survives
+ * face-group re-detection; it is explicitly cleared in loadGeometry().
+ *
+ * @param {THREE.Group|null} group
+ */
+export function setBrepOverlay(group) {
+  if (brepOverlayGroup) {
+    scene.remove(brepOverlayGroup);
+    brepOverlayGroup.traverse(obj => {
+      if (obj.geometry) obj.geometry.dispose();
+      if (obj.material) obj.material.dispose();
+    });
+    brepOverlayGroup = null;
+  }
+  if (group) {
+    brepOverlayGroup = group;
+    scene.add(brepOverlayGroup);
+  }
+}
+
+/**
+ * Show or hide the B-rep overlay without destroying it.
+ * @param {boolean} visible
+ */
+export function setBrepOverlayVisible(visible) {
+  if (brepOverlayGroup) brepOverlayGroup.visible = visible;
+}
+
+/**
+ * Replace the analytical face-mesh overlay (semi-transparent face shapes).
+ * Pass null/undefined to remove the current overlay without adding a new one.
+ * @param {THREE.Group|null} group
+ */
+export function setBrepFacesOverlay(group) {
+  if (brepFacesGroup) {
+    scene.remove(brepFacesGroup);
+    brepFacesGroup.traverse(obj => {
+      if (obj.geometry) obj.geometry.dispose();
+      if (obj.material) obj.material.dispose();
+    });
+    brepFacesGroup = null;
+  }
+  if (group) {
+    brepFacesGroup = group;
+    scene.add(brepFacesGroup);
+  }
+}
+
+/**
+ * Show or hide the analytical face-mesh overlay without destroying it.
+ * @param {boolean} visible
+ */
+export function setBrepFacesVisible(visible) {
+  if (brepFacesGroup) brepFacesGroup.visible = visible;
 }
