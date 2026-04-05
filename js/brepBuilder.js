@@ -309,9 +309,10 @@ export async function buildAndExportSTEP(groups, geometry, options = {}, onStatu
   onStatus?.(`Sewing ${faces.length} faces…`, 55);
 
   // Sew all faces into a shell
-  const sewing = new oc.BRepBuilderAPI_Sewing_1(sewTol);
+  // BRepBuilderAPI_Sewing has a single constructor (no _N suffix); all 5 params required.
+  const sewing = new oc.BRepBuilderAPI_Sewing(sewTol, true, true, true, false);
   toDelete.push(sewing);
-  for (const f of faces) sewing.Add_1(f);
+  for (const f of faces) sewing.Add(f);
   sewing.Perform();
   const sewedShape = sewing.SewedShape();
 
@@ -320,7 +321,8 @@ export async function buildAndExportSTEP(groups, geometry, options = {}, onStatu
   // Try to promote closed shell to solid
   let finalShape = sewedShape;
   try {
-    const fixer = new oc.ShapeFix_Shape_1(sewedShape);
+    // ShapeFix_Shape has 2 constructors: _1=no-arg, _2=takes shape.
+    const fixer = new oc.ShapeFix_Shape_2(sewedShape);
     toDelete.push(fixer);
     fixer.Perform();
     const fixed = fixer.Shape();
@@ -335,7 +337,7 @@ export async function buildAndExportSTEP(groups, geometry, options = {}, onStatu
     if (shapeType === SHELL) {
       const shell = oc.TopoDS.Shell_1(sewedShape);
       const solidResult = solidMaker.SolidFromShell(shell);
-      if (solidResult && !solidResult.IsNull_1()) finalShape = solidResult;
+      if (solidResult && !solidResult.IsNull()) finalShape = solidResult;
     } else {
       finalShape = fixed;
     }
@@ -356,7 +358,7 @@ export async function buildAndExportSTEP(groups, geometry, options = {}, onStatu
   const writer = new oc.STEPControl_Writer_1();
   toDelete.push(writer);
 
-  const transferResult = writer.Transfer_1(
+  const transferResult = writer.Transfer(
     finalShape,
     oc.STEPControl_StepModelType.STEPControl_AsIs,
     true,
@@ -364,7 +366,7 @@ export async function buildAndExportSTEP(groups, geometry, options = {}, onStatu
 
   if (transferResult !== oc.IFSelect_ReturnStatus.IFSelect_RetDone) {
     // Try with the raw sewed shape as fallback
-    writer.Transfer_1(sewedShape, oc.STEPControl_StepModelType.STEPControl_AsIs, true);
+    writer.Transfer(sewedShape, oc.STEPControl_StepModelType.STEPControl_AsIs, true);
   }
 
   const stepPath = '/brep_export.stp';
