@@ -14,6 +14,7 @@ let exclusionMesh = null;    // flat orange overlay for user-excluded faces
 let hoverMesh = null;        // semi-transparent yellow bucket-fill preview
 let groupHighlightMesh = null; // white highlight overlay for hovered surface-list row
 let brepOverlayGroup = null;   // analytic surface wireframe indicators
+let brepFacesGroup   = null;   // analytical face-mesh preview (semi-transparent)
 
 // Callback invoked when the canvas pointer hovers over a different face group.
 // Signature: (groupIndex: number) => void   (-1 = no group under cursor)
@@ -460,8 +461,9 @@ export function loadGeometry(geometry, material) {
   wireframeLines = null;
   if (wireframeVisible) _buildWireframe(geometry);
 
-  // Clear the B-rep surface overlay — it's stale for the new model
+  // Clear both B-rep overlays — they're stale for the new model
   setBrepOverlay(null);
+  setBrepFacesOverlay(null);
 
   // Position grid at mesh bottom (Z-up: move grid along Z)
   geometry.computeBoundingBox();
@@ -857,4 +859,32 @@ export function setBrepOverlay(group) {
  */
 export function setBrepOverlayVisible(visible) {
   if (brepOverlayGroup) brepOverlayGroup.visible = visible;
+}
+
+/**
+ * Replace the analytical face-mesh overlay (semi-transparent face shapes).
+ * Pass null/undefined to remove the current overlay without adding a new one.
+ * @param {THREE.Group|null} group
+ */
+export function setBrepFacesOverlay(group) {
+  if (brepFacesGroup) {
+    scene.remove(brepFacesGroup);
+    brepFacesGroup.traverse(obj => {
+      if (obj.geometry) obj.geometry.dispose();
+      if (obj.material) obj.material.dispose();
+    });
+    brepFacesGroup = null;
+  }
+  if (group) {
+    brepFacesGroup = group;
+    scene.add(brepFacesGroup);
+  }
+}
+
+/**
+ * Show or hide the analytical face-mesh overlay without destroying it.
+ * @param {boolean} visible
+ */
+export function setBrepFacesVisible(visible) {
+  if (brepFacesGroup) brepFacesGroup.visible = visible;
 }

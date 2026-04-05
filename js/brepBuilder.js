@@ -24,7 +24,7 @@ import { extractBoundaryLoop } from './faceGrouper.js';
 // ── Build version ─────────────────────────────────────────────────────────────
 
 /** Increment this string with each release to verify live-site deployments. */
-export const BUILD_VERSION = 'v0.4.6';
+export const BUILD_VERSION = 'v0.4.7';
 
 // ── OpenCASCADE lazy loader ───────────────────────────────────────────────────
 
@@ -145,7 +145,7 @@ function snapToCone(p, apex, axis, halfAngle) {
  * @param {THREE.BufferGeometry} geometry
  * @returns {Map<number, Set<number>>}  groupIdx → set of adjacent groupIdxs
  */
-function buildGroupAdjacencyMap(groups, geometry) {
+export function buildGroupAdjacencyMap(groups, geometry) {
   const posAttr = geometry.attributes.position;
   const QUANT = 1e4;
   const qk = (x, y, z) =>
@@ -284,7 +284,105 @@ function _analyticalPlaneBoundary(gi, groups, adjacency) {
   return corners;
 }
 
-// ── Loop simplification ──────────────────────────────────────────────────────
+// ── Analytical cylinder boundary helpers ─────────────────────────────────────
+
+/**
+ * Compute the cylinder's axial V extents analytically by projecting each
+ * adjacent planar group's origin onto the cylinder axis.
+ *
+ * This replaces mesh-topology V computation so that the cylinder face ends
+ * exactly where neighbouring flat faces lie — making BRepBuilderAPI_Sewing
+ * able to stitch the cylinder to those planes.
+ *
+ * @param {number}   gi         group index of the cylinder
+ * @param {object[]} groups     all groups
+ * @param {Map}      adjacency
+ * @param {number[]} axisPoint  [x,y,z] point on the cylinder axis
+ * @param {number[]} axis       unit vector along the axis
+ * @returns {{ vmin: number, vmax: number } | null}
+ */
+function _cylinderVExtentsFromNeighbors(gi, groups, adjacency, axisPoint, axis) {
+  const ax = _u3(axis);
+  const vs = [];
+  for (const j of adjacency.get(gi) ?? []) {
+    const s = groups[j]?.surface;
+    if (!s) continue;
+    // Flat-end neighbours: project their origin / apex / center onto the axis
+    let refPt = null;
+    if (s.type === 'plane')    refPt = s.params.origin;
+    else if (s.type === 'cylinder') refPt = s.params.axisPoint;
+    if (!refPt) continue;
+    vs.push(
+      (refPt[0] - axisPoint[0]) * ax[0] +
+      (refPt[1] - axisPoint[1]) * ax[1] +
+      (refPt[2] - axisPoint[2]) * ax[2],
+    );
+  }
+  if (vs.length < 1) return null;
+  return { vmin: Math.min(...vs), vmax: Math.max(...vs) };
+}
+
+// ── Public pure-JS boundary computation (no OCCT) ────────────────────────────
+
+/**
+ * Compute analytical boundary data for every fitted group without loading
+ * OpenCASCADE.  The result can be used for viewport face-shape preview and
+ * to pre-compute V extents for the STEP builder.
+ *
+ * @param {object[]} groups   groups with `.surface` already set by fitAllGroups()
+ * @param {THREE.BufferGeometry} geometry
+ * @returns {{ adjacency: Map, boundaries: Map<number, object> }}
+ *   `boundaries` maps groupIdx → { type, loop? (plane corners),
+ *                                   vmin?, vmax? (cylinder/cone) }
+ */
+export function computeAnalyticalBoundaries(groups, geometry) {
+  const adjacency = buildGroupAdjacencyMap(groups, geometry);
+  const boundaries = new Map();
+
+  for (let gi = 0; gi < groups.length; gi++) {
+    const g = groups[gi];
+    if (!g.surface) continue;
+    const { type, params } = g.surface;
+
+    if (type === 'plane') {
+      const loop = _analyticalPlaneBoundary(gi, groups, adjacency);
+      if (loop) boundaries.set(gi, { type: 'plane', loop });
+    } else if (type === 'cylinder') {
+      const vr = _cylinderVExtentsFromNeighbors(gi, groups, adjacency,
+        params.axisPoint, params.axis);
+      boundaries.set(gi, {
+        type: 'cylinder',
+        vmin: vr?.vmin ?? null,
+        vmax: vr?.vmax ?? null,
+      });
+    } else if (type === 'cone') {
+      const { apex, axis } = params;
+      const ax = _u3(axis);
+      let vmin = Infinity, vmax = -Infinity;
+      for (const j of adjacency.get(gi) ?? []) {
+        const s = groups[j]?.surface;
+        if (!s) continue;
+        let refPt = null;
+        if (s.type === 'plane') refPt = s.params.origin;
+        if (!refPt) continue;
+        const v = (refPt[0]-apex[0])*ax[0] + (refPt[1]-apex[1])*ax[1] + (refPt[2]-apex[2])*ax[2];
+        if (v < vmin) vmin = v;
+        if (v > vmax) vmax = v;
+      }
+      boundaries.set(gi, {
+        type: 'cone',
+        vmin: isFinite(vmin) ? vmin : null,
+        vmax: isFinite(vmax) ? vmax : null,
+      });
+    } else if (type === 'sphere') {
+      boundaries.set(gi, { type: 'sphere' });
+    }
+  }
+
+  return { adjacency, boundaries };
+}
+
+
 
 /**
  * Remove collinear intermediate vertices from a closed 3-D polygon loop.
@@ -401,6 +499,16 @@ function buildFace(oc, group, geometry, toDelete, groupIdx, allGroups, adjacency
     // Not enough planar neighbours → fall through to mesh-topology boundary
   }
 
+  // ── Analytical V extents for cylinder / cone faces ───────────────────────
+  // Compute the axial extent by projecting adjacent planar surface origins
+  // onto the axis, so the cylinder/cone ends exactly where flat neighbours lie.
+  let neighborVRange = null;
+  if ((type === 'cylinder' || type === 'cone') && allGroups && adjacency) {
+    const refPt  = type === 'cylinder' ? params.axisPoint : params.apex;
+    const refAx  = type === 'cylinder' ? params.axis : params.axis;
+    neighborVRange = _cylinderVExtentsFromNeighbors(groupIdx, allGroups, adjacency, refPt, refAx);
+  }
+
   // ── Mesh-topology boundary fallback ────────────────────────────────────
   // Extract boundary loop from mesh edges (faceGrouper.js)
   const rawLoop = extractBoundaryLoop(geometry, group.triangleIndices);
@@ -439,9 +547,9 @@ function buildFace(oc, group, geometry, toDelete, groupIdx, allGroups, adjacency
     const simplified = simplifyLoop(dedupLoop);
     return _buildPlaneFace(oc, params, simplified, toDelete);
   } else if (type === 'cylinder') {
-    return _buildCylinderFace(oc, params, dedupLoop, toDelete);
+    return _buildCylinderFace(oc, params, dedupLoop, toDelete, neighborVRange);
   } else if (type === 'cone') {
-    return _buildConeFace(oc, params, dedupLoop, toDelete);
+    return _buildConeFace(oc, params, dedupLoop, toDelete, neighborVRange);
   } else if (type === 'sphere') {
     return _buildSphereFace(oc, params, dedupLoop, toDelete);
   } else {
@@ -467,7 +575,7 @@ function _buildPlaneFace(oc, params, loop, toDelete) {
   }
 }
 
-function _buildCylinderFace(oc, params, loop, toDelete) {
+function _buildCylinderFace(oc, params, loop, toDelete, neighborVRange) {
   // Build an analytical cylindrical face using UV parameter bounds.
   // BRepBuilderAPI_MakeFace_11(gp_Cylinder, UMin, UMax, VMin, VMax) creates a
   // proper Geom_CylindricalSurface face without requiring PCurves, avoiding the
@@ -475,16 +583,26 @@ function _buildCylinderFace(oc, params, loop, toDelete) {
   // STEPControl_Writer when the wire edges are straight 3-D line segments.
   const { axisPoint, axis, radius } = params;
   try {
-    // V (axial) extent: project every boundary vertex onto the cylinder axis
-    let vmin = Infinity, vmax = -Infinity;
-    for (const p of loop) {
-      const v = (p[0]-axisPoint[0])*axis[0] +
-                (p[1]-axisPoint[1])*axis[1] +
-                (p[2]-axisPoint[2])*axis[2];
-      if (v < vmin) vmin = v;
-      if (v > vmax) vmax = v;
+    // V (axial) extent: prefer analytically-derived extents from neighbouring
+    // planes (so the cylinder ends exactly where flat faces lie), falling back
+    // to projecting the mesh boundary loop onto the axis.
+    let vmin, vmax;
+    if (neighborVRange && neighborVRange.vmax - neighborVRange.vmin > 1e-10) {
+      vmin = neighborVRange.vmin;
+      vmax = neighborVRange.vmax;
+    } else {
+      vmin = Infinity; vmax = -Infinity;
+      for (const p of loop) {
+        const v = (p[0]-axisPoint[0])*axis[0] +
+                  (p[1]-axisPoint[1])*axis[1] +
+                  (p[2]-axisPoint[2])*axis[2];
+        if (v < vmin) vmin = v;
+        if (v > vmax) vmax = v;
+      }
     }
-    if (vmax - vmin < 1e-10) return _buildFallbackFace(oc, loop, toDelete);
+    if (!isFinite(vmin) || !isFinite(vmax) || vmax - vmin < 1e-10) {
+      return _buildFallbackFace(oc, loop, toDelete);
+    }
 
     const ax3 = makeAx3(oc, axisPoint, axis);
     toDelete.push(ax3);
@@ -505,22 +623,29 @@ function _buildCylinderFace(oc, params, loop, toDelete) {
   }
 }
 
-function _buildConeFace(oc, params, loop, toDelete) {
+function _buildConeFace(oc, params, loop, toDelete, neighborVRange) {
   // Build an analytical conical face using UV parameter bounds.
   // BRepBuilderAPI_MakeFace_12(gp_Cone, UMin, UMax, VMin, VMax) avoids the
   // null-PCurve crash that occurs when using a wire of straight 3-D edges.
   const { apex, axis, halfAngle } = params;
   try {
     // V is the signed axial distance from the apex along the cone axis.
-    let vmin = Infinity, vmax = -Infinity;
-    for (const p of loop) {
-      const v = (p[0]-apex[0])*axis[0] +
-                (p[1]-apex[1])*axis[1] +
-                (p[2]-apex[2])*axis[2];
-      if (v < vmin) vmin = v;
-      if (v > vmax) vmax = v;
+    // Prefer analytically-derived extents from neighbours over mesh loop.
+    let vmin, vmax;
+    if (neighborVRange && neighborVRange.vmax - neighborVRange.vmin > 1e-10) {
+      vmin = neighborVRange.vmin;
+      vmax = neighborVRange.vmax;
+    } else {
+      vmin = Infinity; vmax = -Infinity;
+      for (const p of loop) {
+        const v = (p[0]-apex[0])*axis[0] +
+                  (p[1]-apex[1])*axis[1] +
+                  (p[2]-apex[2])*axis[2];
+        if (v < vmin) vmin = v;
+        if (v > vmax) vmax = v;
+      }
     }
-    if (vmax - vmin < 1e-10 || vmin < -1e-6) {
+    if (!isFinite(vmin) || !isFinite(vmax) || vmax - vmin < 1e-10 || vmin < -1e-6) {
       // Degenerate extent or apex behind origin — use planar fallback
       return _buildFallbackFace(oc, loop, toDelete);
     }

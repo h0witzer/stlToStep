@@ -14,13 +14,15 @@ import {
   getCamera, getCurrentMesh, showFaceGroupColors, setViewerTheme,
   setGroupHighlight, setGroupHoverCallback,
   setBrepOverlay, setBrepOverlayVisible,
+  setBrepFacesOverlay, setBrepFacesVisible,
 } from './viewer.js';
 import { loadModelFile, computeBounds, getTriangleCount } from './stlLoader.js';
 import { t, initLang, setLang, getLang, applyTranslations } from './i18n.js';
 import { groupFaces } from './faceGrouper.js';
 import { fitAllGroups, classifyGroupAs } from './surfaceFitter.js';
-import { initOC, buildAndExportSTEP, downloadSTEP, BUILD_VERSION } from './brepBuilder.js';
-import { buildBrepOverlay } from './brepVisualizer.js';
+import { initOC, buildAndExportSTEP, downloadSTEP, BUILD_VERSION,
+         buildGroupAdjacencyMap, computeAnalyticalBoundaries } from './brepBuilder.js';
+import { buildBrepOverlay, buildAnalyticalFacesMesh } from './brepVisualizer.js';
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
@@ -43,6 +45,7 @@ const stlFileInput  = document.getElementById('stl-file-input');
 const meshInfo      = document.getElementById('mesh-info');
 const wireframeToggle    = document.getElementById('wireframe-toggle');
 const brepOverlayToggle  = document.getElementById('brep-overlay-toggle');
+const brepFacesToggle    = document.getElementById('brep-faces-toggle');
 
 // Face detection panel
 const creaseSlider  = document.getElementById('crease-angle');
@@ -197,8 +200,9 @@ async function handleDetect() {
     fitBtn.disabled = false;
     exportBtn.disabled = true;
     surfaceList.innerHTML = '';
-    // Clear any stale B-rep overlay from a previous Fit Surfaces run
+    // Clear any stale B-rep overlays from a previous Fit Surfaces run
     setBrepOverlay(null);
+    setBrepFacesOverlay(null);
     if (brepOverlayToggle) brepOverlayToggle.checked = false;
   } catch (err) {
     console.error('Face detection failed:', err);
@@ -220,13 +224,24 @@ async function handleFit() {
     fitAllGroups(currentGroups, currentGeometry);
     renderSurfaceList();
     exportBtn.disabled = false;
-    // Build and display the B-rep surface overlay automatically after fitting
+
+    // Compute analytical boundaries (pure JS — no OCCT needed)
+    const { boundaries } = computeAnalyticalBoundaries(currentGroups, currentGeometry);
+
+    // Wireframe shape indicator overlay (always built first)
     const overlay = buildBrepOverlay(currentGroups, currentGeometry, TYPE_COLORS);
     setBrepOverlay(overlay);
     if (brepOverlayToggle) {
       brepOverlayToggle.checked = true;
       setBrepOverlayVisible(true);
     }
+
+    // Analytical face-mesh preview (semi-transparent solid shapes)
+    const facesOverlay = buildAnalyticalFacesMesh(
+      currentGroups, currentGeometry, boundaries, TYPE_COLORS,
+    );
+    setBrepFacesOverlay(facesOverlay);
+    setBrepFacesVisible(true);
   } catch (err) {
     console.error('Surface fitting failed:', err);
     alert(`Surface fitting failed: ${err.message}`);
@@ -325,10 +340,17 @@ function renderSurfaceList() {
       // Re-render the tally chips at the top of the surface list to reflect
       // the updated type counts across all groups.
       updateChips();
-      // Rebuild the B-rep overlay to reflect the new surface type
+      // Rebuild both B-rep overlays to reflect the new surface type
       const overlay = buildBrepOverlay(currentGroups, currentGeometry, TYPE_COLORS);
       setBrepOverlay(overlay);
       if (brepOverlayToggle?.checked) setBrepOverlayVisible(true);
+      // Rebuild face-mesh preview
+      const { boundaries } = computeAnalyticalBoundaries(currentGroups, currentGeometry);
+      const facesOverlay = buildAnalyticalFacesMesh(
+        currentGroups, currentGeometry, boundaries, TYPE_COLORS,
+      );
+      setBrepFacesOverlay(facesOverlay);
+      setBrepFacesVisible(true);
     });
     // Remember the auto classification
     g._autoSurface = g._autoSurface ?? g.surface;
@@ -460,9 +482,14 @@ function wireEvents() {
   // Wireframe
   wireframeToggle.addEventListener('change', () => setWireframe(wireframeToggle.checked));
 
-  // B-rep overlay
+  // B-rep wireframe overlay
   if (brepOverlayToggle) {
     brepOverlayToggle.addEventListener('change', () => setBrepOverlayVisible(brepOverlayToggle.checked));
+  }
+
+  // Analytical face-mesh preview toggle
+  if (brepFacesToggle) {
+    brepFacesToggle.addEventListener('change', () => setBrepFacesVisible(brepFacesToggle.checked));
   }
 
   // License overlay
