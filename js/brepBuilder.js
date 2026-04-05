@@ -8,7 +8,7 @@
  *   4. Build an OCCT face: plane uses analytic gp_Pln + simplified wire;
  *      cylinder/cone/sphere use MakeFace_11/12/13 (UV-bounds only, no PCurves);
  *      NURBS falls back to BRepBuilderAPI_MakeFace (wire-only)
- *   5. Assemble all faces into a TopoDS_Compound
+ *   5. Sew all faces into a TopoDS_Shell → TopoDS_Solid (MANIFOLD_SOLID_BREP)
  *   6. Write STEP via STEPControl_Writer; chdir('/') first so the bare filename
  *      is always resolved to '/', then pre-create the inode for O_WRONLY safety
  *
@@ -21,7 +21,7 @@ import { extractBoundaryLoop } from './faceGrouper.js';
 // ── Build version ─────────────────────────────────────────────────────────────
 
 /** Increment this string with each release to verify live-site deployments. */
-export const BUILD_VERSION = 'v0.4.4';
+export const BUILD_VERSION = 'v0.4.5';
 
 // ── OpenCASCADE lazy loader ───────────────────────────────────────────────────
 
@@ -453,16 +453,117 @@ export async function buildAndExportSTEP(groups, geometry, options = {}, onStatu
 
   if (faces.length === 0) throw new Error('No valid B-rep faces could be constructed.');
 
-  onStatus?.(`Assembling ${faces.length} faces…`, 55);
+  onStatus?.(`Sewing ${faces.length} faces into a solid…`, 55);
 
-  // Assemble all faces into a compound. All faces are built with MakeFace_15 (wire-only
-  // best-fit plane) or MakeFace_16 (analytic plane), so they have valid PCurves and can
-  // be transferred to STEP in a single call without triggering OCCT null-pointer traps.
-  const builder = new oc.BRep_Builder();
-  const compound = new oc.TopoDS_Compound();
-  toDelete.push(compound);
-  builder.MakeCompound(compound);
-  for (const f of faces) builder.Add(compound, f);
+  // ── Build a watertight solid ────────────────────────────────────────────────
+  //
+  // Goal: produce a MANIFOLD_SOLID_BREP STEP entity so that Onshape and other
+  // CAD importers recognise the result as a solid body rather than an assembly
+  // of disconnected surfaces (which is what TopoDS_Compound would produce).
+  //
+  // Strategy:
+  //  1. Try BRepBuilderAPI_Sewing — it walks the faces and identifies shared
+  //     edges, producing a fully-connected TopoDS_Shell.  Wrap that shell in a
+  //     TopoDS_Solid via BRepBuilderAPI_MakeSolid_3.
+  //  2. If Sewing.Perform() throws (the Emscripten binding may not support the
+  //     optional Handle<Message_ProgressIndicator> arg), fall back to manually
+  //     inserting all faces into a TopoDS_Shell and wrapping it in a Solid.
+  //     The faces will not share edge references but OCCT will still write a
+  //     MANIFOLD_SOLID_BREP, which is enough for most importers to understand
+  //     the intent and attempt their own healing.
+
+  const sewTol = options.sewTol ?? 1e-6;
+  let topShape = null;
+
+  // ── Strategy 1: BRepBuilderAPI_Sewing ──────────────────────────────────────
+  try {
+    const sewing = new oc.BRepBuilderAPI_Sewing_1
+      ? new oc.BRepBuilderAPI_Sewing_1()
+      : new oc.BRepBuilderAPI_Sewing(sewTol);
+    toDelete.push(sewing);
+
+    for (const f of faces) sewing.Add(f);
+
+    // Perform() has an optional Handle<Message_ProgressIndicator> default arg.
+    // Some Emscripten builds expose this as a no-arg call; others don't register
+    // the Handle type and throw.  We catch and fall through.
+    sewing.Perform();
+
+    const sewn = sewing.SewedShape();
+
+    // SewedShape() may return a Shell, Solid, or Compound depending on what was
+    // sewn.  Determine the shape type and wrap in a Solid if needed.
+    const shapeType = sewn.ShapeType?.() ?? -1;
+    // TopAbs_SHELL = 4, TopAbs_SOLID = 3, TopAbs_COMPOUND = 0
+    const SOLID_T   = oc.TopAbs_ShapeEnum?.TopAbs_SOLID   ?? 3;
+    const SHELL_T   = oc.TopAbs_ShapeEnum?.TopAbs_SHELL   ?? 4;
+    const COMP_T    = oc.TopAbs_ShapeEnum?.TopAbs_COMPOUND ?? 0;
+
+    if (shapeType === SOLID_T) {
+      topShape = sewn;
+    } else if (shapeType === SHELL_T) {
+      const mkSolid = new oc.BRepBuilderAPI_MakeSolid_3(sewn);
+      toDelete.push(mkSolid);
+      if (mkSolid.IsDone()) topShape = mkSolid.Solid();
+    } else if (shapeType === COMP_T) {
+      // Sewing produced a compound (multiple disconnected shells).
+      // Try to find the largest shell inside it and wrap that.
+      try {
+        const expShell = new oc.TopExp_Explorer_2(
+          sewn,
+          oc.TopAbs_ShapeEnum?.TopAbs_SHELL ?? 4,
+          oc.TopAbs_ShapeEnum?.TopAbs_SHAPE ?? 0,
+        );
+        toDelete.push(expShell);
+        let bestShell = null;
+        while (expShell.More()) {
+          const s = expShell.Current();
+          if (!bestShell) bestShell = s;
+          expShell.Next();
+        }
+        if (bestShell) {
+          const mkSolid = new oc.BRepBuilderAPI_MakeSolid_3(bestShell);
+          toDelete.push(mkSolid);
+          if (mkSolid.IsDone()) topShape = mkSolid.Solid();
+        }
+      } catch { /* fall through to strategy 2 */ }
+    }
+
+    if (topShape) console.info(`Sewing succeeded — solid built from sewn shape (type ${shapeType}).`);
+  } catch (sewErr) {
+    console.warn('BRepBuilderAPI_Sewing unavailable or failed:', sewErr?.message ?? sewErr);
+  }
+
+  // ── Strategy 2: manual shell → solid (no sewing) ───────────────────────────
+  if (!topShape) {
+    try {
+      const brepBuilder = new oc.BRep_Builder();
+      const shell = new oc.TopoDS_Shell();
+      toDelete.push(shell);
+      brepBuilder.MakeShell(shell);
+      for (const f of faces) brepBuilder.Add(shell, f);
+
+      const mkSolid = new oc.BRepBuilderAPI_MakeSolid_3(shell);
+      toDelete.push(mkSolid);
+      if (mkSolid.IsDone()) {
+        topShape = mkSolid.Solid();
+        console.info('Using unsewn shell→solid fallback.');
+      }
+    } catch (shErr) {
+      console.warn('Shell→Solid failed:', shErr?.message ?? shErr);
+    }
+  }
+
+  // ── Strategy 3: bare compound (last resort, still imports as surfaces) ──────
+  if (!topShape) {
+    console.warn('All solid strategies failed — falling back to TopoDS_Compound.');
+    const brepBuilder = new oc.BRep_Builder();
+    const compound = new oc.TopoDS_Compound();
+    toDelete.push(compound);
+    brepBuilder.MakeCompound(compound);
+    for (const f of faces) brepBuilder.Add(compound, f);
+    topShape = compound;
+  }
 
   onStatus?.('Writing STEP file…', 80);
 
@@ -481,7 +582,7 @@ export async function buildAndExportSTEP(groups, geometry, options = {}, onStatu
   const DONE = oc.IFSelect_ReturnStatus?.IFSelect_RetDone ?? 1;
 
   const transferResult = writer.Transfer(
-    compound,
+    topShape,
     oc.STEPControl_StepModelType?.STEPControl_AsIs ?? 0,
     true,
   );
