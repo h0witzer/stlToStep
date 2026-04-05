@@ -544,6 +544,61 @@ export function setViewerTheme(isLight) {
 }
 
 /**
+ * Apply distinct vertex colours to the current mesh to visualise face groups.
+ * Each group receives a hue derived from the golden-angle sequence so adjacent
+ * groups are always visually distinct.
+ *
+ * Calling with an empty array (or null) restores the default grey material.
+ *
+ * @param {THREE.BufferGeometry} geometry   non-indexed source geometry
+ * @param {Array<{triangleIndices:Set<number>}>} groups
+ */
+export function showFaceGroupColors(geometry, groups) {
+  if (!currentMesh) return;
+
+  if (!groups || groups.length === 0) {
+    // Restore default material
+    if (currentMesh.material) currentMesh.material.dispose();
+    currentMesh.material = new THREE.MeshStandardMaterial({
+      color: 0xaaaacc, roughness: 0.6, metalness: 0.1, side: THREE.DoubleSide,
+    });
+    if (currentMesh.geometry !== geometry) {
+      currentMesh.geometry = geometry;
+      if (!currentMesh.geometry.attributes.normal) currentMesh.geometry.computeVertexNormals();
+    }
+    return;
+  }
+
+  const count = geometry.attributes.position.count;
+  const colors = new Float32Array(count * 3);
+
+  groups.forEach((group, idx) => {
+    const hue = (idx * 137.508) % 360; // golden-angle hue spacing
+    const c = new THREE.Color().setHSL(hue / 360, 0.72, 0.52);
+    for (const triIdx of group.triangleIndices) {
+      for (let v = 0; v < 3; v++) {
+        const vi = triIdx * 3 + v;
+        colors[vi * 3]     = c.r;
+        colors[vi * 3 + 1] = c.g;
+        colors[vi * 3 + 2] = c.b;
+      }
+    }
+  });
+
+  // Swap to a fresh geometry with the colour attribute
+  const colorGeo = geometry.clone();
+  colorGeo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+  if (!colorGeo.attributes.normal) colorGeo.computeVertexNormals();
+
+  if (currentMesh.material) currentMesh.material.dispose();
+  currentMesh.material = new THREE.MeshLambertMaterial({
+    vertexColors: true,
+    side: THREE.DoubleSide,
+  });
+  currentMesh.geometry = colorGeo;
+}
+
+/**
  * Replace (or clear) the flat orange exclusion overlay mesh.
  * overlayGeo must be a non-indexed BufferGeometry with a 'position' attribute,
  * or null / an empty geometry to clear the overlay.

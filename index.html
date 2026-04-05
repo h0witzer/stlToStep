@@ -3,19 +3,17 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>BumpMesh by CNC Kitchen</title>
+  <title>STL → STEP B-rep Converter</title>
   <link rel="icon" type="image/png" href="logo.png" />
   <link rel="stylesheet" href="style.css" />
   <script>
-    // Apply saved theme before first paint to avoid flash
+    // Apply saved theme before first paint
     (function() {
       const t = localStorage.getItem('stlt-theme');
-      // If user never picked a theme, respect their OS preference
-      const prefersDark = t ? t === 'dark'
-                            : window.matchMedia('(prefers-color-scheme: dark)').matches;
+      const prefersDark = t ? t === 'dark' : window.matchMedia('(prefers-color-scheme: dark)').matches;
       if (!prefersDark) document.documentElement.setAttribute('data-theme', 'light');
     })();
-    // Apply saved language before first paint to avoid flash
+    // Apply saved language before first paint
     (function() {
       const l = localStorage.getItem('stlt-lang');
       if (l === 'de' || l === 'en') {
@@ -40,390 +38,165 @@
 <body>
   <header>
     <div class="logo">
-      <img src="logo.png" alt="BumpMesh" width="24" height="24" />
-      <span>BumpMesh <small style="opacity:.6;font-weight:400">by CNC Kitchen</small></span>
+      <img src="logo.png" alt="STL to STEP" width="24" height="24" />
+      <span>STL→STEP <small style="opacity:.6;font-weight:400">B-rep Converter</small></span>
     </div>
     <div class="header-actions">
       <div class="lang-seg">
         <button class="lang-btn active" data-lang-code="en">EN</button>
-        <button class="lang-btn" data-lang-code="de">DE</button>
+        <button class="lang-btn"        data-lang-code="de">DE</button>
       </div>
       <button id="theme-toggle" class="theme-toggle"
-        data-i18n-title="theme.toggleTitle"
-        data-i18n-aria-label="theme.toggleAriaLabel"
         title="Toggle light / dark mode" aria-label="Toggle light/dark mode">
-        <span class="icon-moon" data-i18n="theme.dark">Dark Theme</span>
-        <span class="icon-sun" data-i18n="theme.light">Light Theme</span>
+        <span class="icon-moon">Dark</span>
+        <span class="icon-sun">Light</span>
       </button>
     </div>
   </header>
 
   <main>
-    <!-- ─── 3-D Viewport ─────────────────────────────────────────── -->
+    <!-- ─── 3-D Viewport ────────────────────────────────────────────── -->
     <section id="viewport-section">
       <div id="drop-zone" class="drop-zone">
         <div id="drop-hint" class="drop-hint">
-          <svg width="48" height="48" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <svg width="48" height="48" viewBox="0 0 24 24" fill="none">
             <path d="M12 2L2 7L12 12L22 7L12 2Z" stroke="#555" stroke-width="1.2" stroke-linejoin="round"/>
             <path d="M2 17L12 22L22 17" stroke="#555" stroke-width="1.2" stroke-linejoin="round"/>
             <path d="M2 12L12 17L22 12" stroke="#555" stroke-width="1.2" stroke-linejoin="round"/>
           </svg>
-          <p data-i18n-html="dropHint.text">Drop an <strong>.stl</strong>, <strong>.obj</strong> or <strong>.3mf</strong> file here<br/>or <label for="stl-file-input" class="link-label">click to browse</label></p>
+          <p>Drop an <strong>.stl</strong>, <strong>.obj</strong> or <strong>.3mf</strong> file here<br/>
+             or <label for="stl-file-input" class="link-label">click to browse</label></p>
           <input type="file" id="stl-file-input" accept=".stl,.obj,.3mf" hidden />
         </div>
         <canvas id="viewport"></canvas>
-        <div id="brush-cursor"></div>
-        <div id="store-cta-wrapper">
-          <span id="store-cta">
-            <span data-i18n-html="cta.store">Support this tool? Shop at <a href="https://geni.us/CNCStoreTexture" target="_blank" rel="noopener noreferrer">CNCKitchen.STORE</a> or donate on <a href="https://www.paypal.me/CNCKitchen" target="_blank" rel="noopener noreferrer">PayPal</a></span><button id="store-cta-dismiss" aria-label="Dismiss">&times;</button>
-          </span>
-        </div>
       </div>
       <div id="viewport-footer">
         <span id="mesh-info" class="mesh-info"></span>
         <label class="wireframe-toggle">
           <input type="checkbox" id="wireframe-toggle" />
-          <span data-i18n="ui.wireframe">Wireframe</span>
+          <span>Wireframe</span>
         </label>
-
-        <div class="viewport-controls-hint" data-i18n="ui.controlsHint">Left drag: orbit &nbsp;·&nbsp; Right drag: pan &nbsp;·&nbsp; Scroll: zoom</div>
+        <div class="viewport-controls-hint">Left drag: orbit &nbsp;·&nbsp; Right drag: pan &nbsp;·&nbsp; Scroll: zoom</div>
       </div>
     </section>
 
-    <!-- ─── Settings Panel ───────────────────────────────────────── -->
+    <!-- ─── Settings Panel ──────────────────────────────────────────── -->
     <aside id="settings-panel">
 
-      <!-- Load STL -->
+      <!-- 1. Load Model -->
       <section class="panel-section">
         <div class="load-stl-row">
           <label class="upload-btn" for="stl-file-input" style="flex:1;justify-content:center;">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none"><path d="M12 2L2 7l10 5 10-5-10-5Z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M2 17l10 5 10-5M2 12l10 5 10-5" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
-            <span data-i18n="ui.loadStl">Load Model…</span>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+              <path d="M12 2L2 7l10 5 10-5-10-5Z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
+              <path d="M2 17l10 5 10-5M2 12l10 5 10-5" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
+            </svg>
+            <span>Load Model…</span>
           </label>
-          <button id="place-on-face-btn" class="place-on-face-btn" data-i18n-title="ui.placeOnFaceTitle" title="Click a face to orient it downward onto the print bed">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none"><path d="M12 3v14m0 0l-5-5m5 5l5-5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M4 21h16" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
-            <span data-i18n="ui.placeOnFace">Place on Face</span>
-          </button>
         </div>
       </section>
 
-      <!-- Displacement Map -->
+      <!-- 2. Face Detection -->
       <section class="panel-section">
-        <h2 data-i18n="sections.displacementMap">Displacement Map</h2>
+        <h2>Face Detection</h2>
+        <p class="section-hint">Triangles within the crease angle are merged into one face group.</p>
 
-        <!-- Preset grid -->
-        <div id="preset-grid" class="preset-grid">
-          <!-- filled by js/presetTextures.js -->
-        </div>
-
-        <!-- Custom upload -->
-        <label class="upload-btn" for="texture-file-input">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none"><path d="M12 5v14M5 12l7-7 7 7" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
-          <span data-i18n="ui.uploadCustomMap">Upload custom map</span>
-        </label>
-        <input type="file" id="texture-file-input" accept="image/*" hidden />
-        <div id="active-map-name" class="active-map-name" data-i18n="ui.noMapSelected">No map selected</div>
         <div class="form-row slider-row">
-          <label for="texture-smoothing" data-i18n="labels.textureSmoothing" data-i18n-title="tooltips.textureSmoothing" title="Applies a Gaussian blur to the displacement map. Higher values produce softer, more gradual surface detail. 0 = off.">Texture Smoothing ⓘ</label>
-          <input type="range" id="texture-smoothing" min="0" max="20" step="any" value="0" />
-          <input type="number" class="val" id="texture-smoothing-val" value="0" min="0" max="20" step="any" />
+          <label for="crease-angle"
+            title="Maximum dihedral angle between adjacent triangles to be considered the same surface">
+            Crease Angle ⓘ
+          </label>
+          <input type="range" id="crease-angle" min="0" max="90" step="1" value="30" />
+          <input type="number" class="val" id="crease-angle-val" value="30" min="0" max="90" step="1" />
         </div>
+
+        <button id="detect-btn" class="action-btn" disabled>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/>
+          </svg>
+          Detect Groups
+        </button>
+        <div id="group-count" class="status-line"></div>
       </section>
 
-      <!-- Projection -->
+      <!-- 3. Surface Fitting -->
       <section class="panel-section">
-        <h2 data-i18n="sections.projection">Projection</h2>
+        <h2>Surface Fitting</h2>
+        <p class="section-hint">Classifies each group as Plane, Cylinder, Sphere, or NURBS.</p>
+
+        <button id="fit-btn" class="action-btn" disabled>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M12 2a7 7 0 1 0 0 14A7 7 0 0 0 12 2z"/>
+            <path d="M12 8v4l3 3"/>
+          </svg>
+          Fit Surfaces
+        </button>
+
+        <div id="surface-list" class="surface-list"></div>
+      </section>
+
+      <!-- 4. Export -->
+      <section class="panel-section">
+        <h2>Export STEP</h2>
+
         <div class="form-row">
-          <label for="mapping-mode" data-i18n="labels.mode">Mode</label>
-          <select id="mapping-mode">
-            <option value="5" selected data-i18n-opt="projection.triplanar">Triplanar</option>
-            <option value="6" data-i18n-opt="projection.cubic">Cubic (Box)</option>
-            <option value="3" data-i18n-opt="projection.cylindrical">Cylindrical</option>
-            <option value="4" data-i18n-opt="projection.spherical">Spherical</option>
-            <option value="0" data-i18n-opt="projection.planarXY">Planar XY</option>
-            <option value="1" data-i18n-opt="projection.planarXZ">Planar XZ</option>
-            <option value="2" data-i18n-opt="projection.planarYZ">Planar YZ</option>
+          <label for="step-schema">Schema</label>
+          <select id="step-schema">
+            <option value="AP214" selected>AP214 (recommended)</option>
+            <option value="AP203">AP203 (compatible)</option>
           </select>
         </div>
-        <div class="form-row slider-row" style="display:none">
-          <label for="seam-blend" data-i18n="labels.seamBlend" data-i18n-title="tooltips.seamBlend" title="Softens the hard seam where projection faces meet. Effective for Cubic and Cylindrical modes.">Seam Blend ⓘ</label>
-          <input type="range" id="seam-blend" min="0" max="1" step="0.01" value="1" />
-          <input type="number" class="val" id="seam-blend-val" value="1" min="0" max="1" step="0.01" />
-        </div>
-        <div class="form-row slider-row">
-          <label for="seam-band-width" data-i18n="labels.transitionSmoothing" data-i18n-title="tooltips.transitionSmoothing" title="Width of the blending zone near seam edges. Lower values keep transitions tight to the seam; higher values blend a wider band.">Transition Smoothing ⓘ</label>
-          <input type="range" id="seam-band-width" min="0" max="1" step="0.01" value="0.5" />
-          <input type="number" class="val" id="seam-band-width-val" value="0.5" min="0" max="1" step="0.01" />
-        </div>
-        <div class="form-row slider-row" id="cap-angle-row" style="display:none">
-          <label for="cap-angle" data-i18n="labels.capAngle" data-i18n-title="tooltips.capAngle" title="Angle (in degrees) from vertical at which the top/bottom cap projection kicks in. Smaller values limit cap projection to nearly flat faces.">Cap Angle ⓘ</label>
-          <input type="range" id="cap-angle" min="1" max="89" step="1" value="20" />
-          <input type="number" class="val" id="cap-angle-val" value="20" min="1" max="89" step="1" />
-        </div>
-      </section>
 
-      <!-- Displacement -->
-      <section class="panel-section">
-        <h2 data-i18n="sections.displacement">Displacement</h2>
         <div class="form-row slider-row">
-          <label for="amplitude" data-i18n="labels.amplitude">Amplitude</label>
-          <input type="range" id="amplitude" min="-2" max="2" step="0.01" value="0.5" />
-          <input type="number" class="val" id="amplitude-val" value="0.5" min="-100" max="100" step="0.01" />
-        </div>
-        <div id="amplitude-warning" class="amplitude-warning hidden" data-i18n="warnings.amplitudeOverlap">
-          ⚠ Amplitude exceeds 10% of the smallest model dimension — geometry overlaps may occur in the exported STL.
-        </div>
-        <div class="form-row">
-          <label class="checkbox-label" for="symmetric-displacement"
-            data-i18n-title="tooltips.symmetricDisplacement"
-            title="When on, 50% grey = no displacement; white pushes out, black pushes in. Keeps part volume roughly constant.">
-            <input type="checkbox" id="symmetric-displacement" />
-            <span data-i18n="labels.symmetricDisplacement">Symmetric displacement ⓘ</span>
+          <label for="sew-tolerance"
+            title="Sewing tolerance — how far apart two boundary edges may be and still be considered coincident">
+            Sew Tolerance ⓘ
           </label>
-        </div>
-        <div class="form-row">
-          <label class="checkbox-label" for="displacement-preview"
-            data-i18n-title="tooltips.displacementPreview"
-            title="Subdivides the mesh and displaces vertices in real-time so you can judge the actual depth. GPU-intensive on complex models.">
-            <input type="checkbox" id="displacement-preview" />
-            <span data-i18n="labels.displacementPreview">3D Preview ⓘ</span>
-          </label>
-        </div>
-      </section>
-
-      <!-- Transform -->
-      <section class="panel-section">
-        <h2 data-i18n="sections.transform">Transform</h2>
-
-        <div class="form-row slider-row">
-          <label for="scale-u" data-i18n="labels.scaleU">Scale U</label>
-          <input type="range" id="scale-u" min="0" max="1000" step="1" value="435" />
-          <input type="number" class="val" id="scale-u-val" value="0.50" min="0.05" max="10" step="0.05" />
-        </div>
-        <div class="lock-row">
-          <div class="lock-line"></div>
-          <button id="lock-scale" class="lock-btn active" data-i18n-title="tooltips.proportionalScaling" data-i18n-aria-label="tooltips.proportionalScalingAria" title="Proportional scaling (U = V)" aria-pressed="true">
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none">
-              <rect x="3" y="11" width="18" height="11" rx="2" stroke="currentColor" stroke-width="2"/>
-              <path d="M7 11V7a5 5 0 0 1 10 0v4" stroke="currentColor" stroke-width="2"/>
-            </svg>
-          </button>
-          <div class="lock-line"></div>
-        </div>
-
-        <div class="form-row slider-row">
-          <label for="scale-v" data-i18n="labels.scaleV">Scale V</label>
-          <input type="range" id="scale-v" min="0" max="1000" step="1" value="435" />
-          <input type="number" class="val" id="scale-v-val" value="0.50" min="0.05" max="10" step="0.05" />
-        </div>
-        <div class="form-row slider-row">
-          <label for="offset-u" data-i18n="labels.offsetU">Offset U</label>
-          <input type="range" id="offset-u" min="-1" max="1" step="0.01" value="0" />
-          <input type="number" class="val" id="offset-u-val" value="0" min="-1" max="1" step="0.01" />
-        </div>
-        <div class="form-row slider-row">
-          <label for="offset-v" data-i18n="labels.offsetV">Offset V</label>
-          <input type="range" id="offset-v" min="-1" max="1" step="0.01" value="0" />
-          <input type="number" class="val" id="offset-v-val" value="0" min="-1" max="1" step="0.01" />
-        </div>
-        <div class="form-row slider-row">
-          <label for="rotation" data-i18n="labels.rotation">Rotation</label>
-          <input type="range" id="rotation" min="0" max="360" step="1" value="0" />
-          <input type="number" class="val" id="rotation-val" value="0" min="0" max="360" step="1" />
-        </div>
-      </section>
-
-      <!-- Mask Angles -->
-      <section class="panel-section">
-        <h2 data-i18n="sections.maskAngles" data-i18n-title="tooltips.maskAngles" title="0° = no masking. Surfaces within this angle of horizontal will not be textured.">Mask Angles ⓘ</h2>
-        <div class="form-row slider-row">
-          <label for="bottom-angle-limit" data-i18n="labels.bottomFaces" data-i18n-title="tooltips.bottomFaces" title="Suppress texture on downward-facing surfaces within this angle of horizontal">Bottom faces</label>
-          <input type="range" id="bottom-angle-limit" min="0" max="90" step="1" value="5" />
-          <input type="number" class="val" id="bottom-angle-limit-val" value="5" min="0" max="90" step="1" />
-        </div>
-        <div class="form-row slider-row">
-          <label for="top-angle-limit" data-i18n="labels.topFaces" data-i18n-title="tooltips.topFaces" title="Suppress texture on upward-facing surfaces within this angle of horizontal">Top faces</label>
-          <input type="range" id="top-angle-limit" min="0" max="90" step="1" value="0" />
-          <input type="number" class="val" id="top-angle-limit-val" value="0" min="0" max="90" step="1" />
-        </div>
-      </section>
-
-      <!-- Surface Exclusions -->
-      <section class="panel-section">
-        <h2 id="excl-section-heading" data-i18n="sections.surfaceMasking" data-i18n-title="tooltips.surfaceMasking" title="Mask surfaces to control which areas receive displacement.">Surface Masking ⓘ</h2>
-        <p id="excl-hint" class="excl-hint" style="display:none"></p>
-
-        <!-- Mode toggle: Exclude / Include Only -->
-        <div class="excl-mode-row">
-          <div class="excl-seg">
-            <button id="excl-mode-exclude" class="excl-seg-btn active" aria-pressed="true"
-              data-i18n="excl.modeExclude" data-i18n-title="excl.modeExcludeTitle"
-              title="Exclude mode: painted surfaces will not receive texture displacement">Exclude</button>
-            <button id="excl-mode-include" class="excl-seg-btn" aria-pressed="false"
-              data-i18n="excl.modeIncludeOnly" data-i18n-title="excl.modeIncludeOnlyTitle"
-              title="Include Only mode: only painted surfaces will receive texture displacement">Include Only</button>
-          </div>
-        </div>
-
-        <!-- Tool buttons -->
-        <div class="excl-tools">
-          <button id="excl-brush-btn" class="excl-tool-btn" aria-pressed="false"
-            data-i18n-title="excl.toolBrushTitle"
-            title="Brush: paint triangles to exclude">
-            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M3 21c3 0 7-1 7-8V5c0-1.25-.756-2.017-2-2H4c-1.25 0-2 .75-2 1.972V11c0 1.25.75 2 2 2h2c1 0 1 0 1 1v1c0 1-1 2-2 2s-1 .008-1 1.031V20c0 1 0 1 1 1z"/>
-              <path d="M15 21c3 0 7-1 7-8V5c0-1.25-.757-2.017-2-2h-4c-1.25 0-2 .75-2 1.972V11c0 1.25.75 2 2 2h2c1 0 1 0 1 1v1c0 1-1 2-2 2s-1 .008-1 1.031V20c0 1 0 1 1 1z"/>
-            </svg>
-            <span data-i18n="excl.toolBrush">Brush</span>
-          </button>
-          <button id="excl-bucket-btn" class="excl-tool-btn" aria-pressed="false"
-            data-i18n-title="excl.toolFillTitle"
-            title="Bucket fill: flood-fill surface up to a threshold angle">
-            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M19 11V4a2 2 0 0 0-2-2H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2h9"/>
-              <path d="M13 17h8m-4-4 4 4-4 4"/>
-            </svg>
-            <span data-i18n="excl.toolFill">Fill</span>
-          </button>
-        </div>
-
-        <!-- Precision masking toggle -->
-        <div id="precision-masking-row" class="form-row precision-masking-row hidden">
-          <label class="precision-label">
-            <input type="checkbox" id="precision-masking-toggle" />
-            <span data-i18n="precision.label" data-i18n-title="precision.labelTitle"
-              title="Subdivide mesh in the background so the brush selects at finer granularity">Precision ⓘ</span>
-          </label>
-          <span id="precision-status" class="precision-status"></span>
-          <span id="precision-outdated" class="precision-outdated hidden"
-            data-i18n="precision.outdated">⚠ Outdated</span>
-          <button id="precision-refresh-btn" class="precision-refresh-btn hidden"
-            data-i18n-title="precision.refreshTitle"
-            title="Re-subdivide mesh to match current brush size">⟳</button>
-        </div>
-        <div id="precision-warning" class="precision-warning hidden"></div>
-
-        <!-- Brush type switcher (shown only when Brush is active) -->
-        <div id="excl-brush-type-row" class="form-row hidden">
-          <label data-i18n="labels.type">Type</label>
-          <div class="excl-seg">
-            <button id="excl-brush-single" class="excl-seg-btn active" data-i18n="brushType.single">Single</button>
-            <button id="excl-brush-radius-btn" class="excl-seg-btn" data-i18n="brushType.circle">Circle</button>
-          </div>
-        </div>
-
-        <!-- Radius slider (shown when Brush + Radius) -->
-        <div id="excl-radius-row" class="form-row slider-row hidden">
-          <label for="excl-brush-radius-slider" data-i18n="labels.size">Size</label>
-          <input type="range" id="excl-brush-radius-slider" min="0.2" max="100" step="0.2" value="10" />
-          <input type="number" class="val" id="excl-brush-radius-val" value="10" min="0.2" max="100" step="0.2" />
-        </div>
-
-        <!-- Bucket threshold (shown when Fill is active) -->
-        <div id="excl-threshold-row" class="form-row slider-row hidden">
-          <label for="excl-threshold-slider" data-i18n="labels.maxAngle" data-i18n-title="tooltips.maxAngle" title="Maximum dihedral angle between adjacent triangles for the fill to cross">Max angle</label>
-          <input type="range" id="excl-threshold-slider" min="0" max="180" step="1" value="20" />
-          <input type="number" class="val" id="excl-threshold-val" value="20" min="0" max="180" step="1" />
-        </div>
-
-        <!-- Footer: count + clear -->
-        <div class="excl-footer">
-          <span id="excl-count" class="excl-count">0 faces masked</span>
-          <span id="excl-shift-hint" class="excl-shift-hint" data-i18n="excl.shiftHint">Hold Shift to erase</span>
-          <button id="excl-clear-btn" class="excl-clear-btn" data-i18n="ui.clearAll">Clear All</button>
-        </div>
-      </section>
-
-      <!-- Export -->
-      <section class="panel-section">
-        <h2 data-i18n="sections.export" data-i18n-title="tooltips.export" title="Smaller edge length = finer displacement detail. Output is then decimated to the triangle limit.">Export ⓘ</h2>
-        <div class="form-row slider-row">
-          <label for="refine-length" data-i18n="labels.resolution" data-i18n-title="tooltips.resolution" title="Edges longer than this value will be split during export">Resolution</label>
-          <input type="range" id="refine-length" min="0.01" max="5" step="0.01" value="1" />
-          <input type="number" class="val" id="refine-length-val" value="1" min="0.01" max="100" step="0.01" />
-        </div>
-        <div class="form-row slider-row">
-          <label for="max-triangles" data-i18n="labels.outputTriangles" data-i18n-title="tooltips.outputTriangles" title="Mesh is fully subdivided first, then decimated down to this count">Output Triangles</label>
-          <input type="range" id="max-triangles" min="10000" max="20000000" step="10000" value="750000" />
-          <span class="val" id="max-triangles-val">0.75 M</span>
-        </div>
-        <div id="tri-limit-warning" class="tri-limit-warning hidden" data-i18n="warnings.safetyCapHit">
-          ⚠ 20M-triangle safety cap hit during subdivision — result may still be coarser than requested edge length.
+          <input type="range" id="sew-tolerance" min="-6" max="-2" step="1" value="-4" />
+          <span class="val" id="sew-tolerance-val">1e-4</span>
         </div>
 
         <div id="export-progress" class="export-progress hidden">
           <div class="export-progress-track">
             <div id="export-progress-bar" class="export-progress-bar"></div>
-            <span id="export-progress-pct" class="export-progress-pct"></span>
           </div>
-          <span id="export-progress-label" data-i18n="progress.processing">Processing…</span>
+          <span id="export-progress-label" class="export-progress-label">Processing…</span>
         </div>
-        <button id="export-btn" class="export-btn" disabled data-i18n="ui.exportStl">Export STL</button>
+
+        <button id="export-btn" class="export-btn" disabled>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+            <polyline points="7 10 12 15 17 10"/>
+            <line x1="12" y1="15" x2="12" y2="3"/>
+          </svg>
+          Export STEP
+        </button>
+
+        <p class="oc-note">
+          First export downloads the OpenCASCADE geometry engine (~25 MB WASM) and
+          caches it in the browser. Subsequent exports are instant.
+        </p>
       </section>
 
-      <button id="license-link" class="license-link" data-i18n="license.btn">License &amp; Terms</button>
-      <button id="imprint-link" class="license-link" data-i18n="imprint.btn">Imprint &amp; Privacy</button>
+      <button id="license-link" class="license-link">License &amp; Terms</button>
 
     </aside>
   </main>
 
   <!-- License popup -->
-  <div id="license-overlay" class="license-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="license-title">
+  <div id="license-overlay" class="license-overlay hidden" role="dialog" aria-modal="true">
     <div class="license-modal">
       <button id="license-close" class="license-close-btn" aria-label="Close">&#215;</button>
-      <h2 id="license-title" data-i18n="license.title">License &amp; Terms</h2>
+      <h2>License &amp; Terms</h2>
       <ul class="license-list">
-        <li data-i18n-html="license.item1">Free to use for any purpose, including <strong>commercial work</strong> (e.g., texturing STLs for clients or products).</li>
-        <li data-i18n-html="license.item2">Attribution is <strong>appreciated</strong> but <strong>not required</strong> when using this tool as-is.</li>
-        <li data-i18n-html="license.item4">This tool is provided <strong>as-is</strong> with <strong>no warranty</strong> of any kind. Use at your own risk.</li>
-        <li data-i18n-html="license.item5"><strong>No support</strong> is provided. The author is under no obligation to fix bugs, answer questions, or update this tool. That said, bug reports and feature requests are always welcome at <a href="mailto:texturizer@cnckitchen.com">texturizer@cnckitchen.com</a>.</li>
-        <li data-i18n-html="license.item6">The author shall not be held <strong>liable</strong> for any damages, data loss, or issues arising from the use of this tool.</li>
-        <li data-i18n-html="license.item7">Want to license or embed this tool for your own business or website? Contact us at <a href="mailto:contact@cnckitchen.com">contact@cnckitchen.com</a>.</li>
-        <li data-i18n-html="license.item3">Support this tool? Shop at <a href="https://geni.us/CNCStoreTexture" target="_blank" rel="noopener">CNCKitchen.STORE</a> or donate on <a href="https://www.paypal.me/CNCKitchen" target="_blank" rel="noopener">PayPal</a>.</li>
+        <li>Free to use for any purpose, including <strong>commercial work</strong>.</li>
+        <li>Attribution is <strong>appreciated</strong> but <strong>not required</strong>.</li>
+        <li>This tool is provided <strong>as-is</strong> with <strong>no warranty</strong>.</li>
+        <li>OpenCASCADE Technology (OCCT) is used under the
+            <a href="https://www.opencascade.com/open-cascade-technology-public-license/" target="_blank" rel="noopener">OCCT Public License</a>.
+        </li>
+        <li>Three.js is used under the <a href="https://github.com/mrdoob/three.js/blob/dev/LICENSE" target="_blank" rel="noopener">MIT License</a>.</li>
       </ul>
-    </div>
-  </div>
-
-  <!-- Imprint & Privacy popup -->
-  <div id="imprint-overlay" class="license-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="imprint-title">
-    <div class="license-modal imprint-modal">
-      <button id="imprint-close" class="license-close-btn" aria-label="Close">&#215;</button>
-      <h2 id="imprint-title" data-i18n="imprint.title">Imprint &amp; Privacy Policy</h2>
-
-      <h3 class="imprint-section-heading" data-i18n="imprint.sectionImprint">Imprint (Impressum)</h3>
-      <p class="imprint-text" data-i18n-html="imprint.info">CNC Kitchen<br>Stefan Hermann<br>Bahnhofstr. 2<br>88145 Hergatz<br>Germany</p>
-      <p class="imprint-text" data-i18n-html="imprint.contact">Email: <a href="mailto:contact@cnckitchen.com">contact@cnckitchen.com</a><br>Phone: +49 175 2011824<br><em>The phone number is for legal/business inquiries only &mdash; not for support.</em></p>
-      <p class="imprint-text" data-i18n-html="imprint.odr">EU Online Dispute Resolution platform: <a href="https://ec.europa.eu/consumers/odr" target="_blank" rel="noopener">https://ec.europa.eu/consumers/odr</a></p>
-
-      <h3 class="imprint-section-heading" data-i18n="imprint.sectionPrivacy">Privacy Policy (Datenschutzerkl&auml;rung)</h3>
-      <p class="imprint-text" data-i18n-html="imprint.privacyIntro"><strong>Responsible party</strong> (Verantwortlicher gem. Art. 4 Abs. 7 DSGVO): Stefan Hermann, Bahnhofstr. 2, 88145 Hergatz, Germany.</p>
-      <ul class="license-list">
-        <li data-i18n-html="imprint.privacyHosting">This website is hosted on <strong>GitHub Pages</strong> (GitHub Inc. / Microsoft Corp., 88 Colin P Kelly Jr St, San Francisco, CA 94107, USA). When you visit this site, GitHub may process your IP address in server logs. Legal basis: Art. 6(1)(f) DSGVO (legitimate interest in providing the website). See <a href="https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement" target="_blank" rel="noopener">GitHub&rsquo;s Privacy Statement</a>.</li>
-        <li data-i18n-html="imprint.privacyLocal">This tool stores user preferences (language, theme) in your browser&rsquo;s <strong>localStorage</strong>. This data never leaves your device and is not transmitted to any server.</li>
-        <li data-i18n-html="imprint.privacyNoCookies">This website does <strong>not</strong> use cookies, analytics, or any tracking technologies.</li>
-        <li data-i18n-html="imprint.privacyExternal">This site contains links to external websites (e.g., CNCKitchen.STORE, PayPal). These sites have their own privacy policies, over which we have no control.</li>
-        <li data-i18n-html="imprint.privacyRights">Under the GDPR you have the right to <strong>access, rectification, erasure, restriction of processing, data portability</strong>, and the right to <strong>lodge a complaint</strong> with a supervisory authority.</li>
-      </ul>
-    </div>
-  </div>
-
-  <!-- Sponsor popup -->
-  <div id="sponsor-overlay" class="sponsor-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="sponsor-title">
-    <div class="sponsor-modal">
-      <h2 id="sponsor-title" data-i18n="sponsor.title">Thanks for using BumpMesh by CNC Kitchen!</h2>
-      <p data-i18n-html="sponsor.body">This tool is provided <strong>completely free</strong> by CNC Kitchen.<br>
-      While your STL is being processed, why not check out the store that helps us keep making cool stuff for you?</p>
-      <a href="https://geni.us/CNCStoreTexture" target="_blank" rel="noopener noreferrer" class="sponsor-link" data-i18n="sponsor.visitStore">
-        🛒 Visit CNCKitchen.STORE
-      </a>
-      <a href="https://www.paypal.me/CNCKitchen" target="_blank" rel="noopener noreferrer" class="sponsor-link sponsor-link--paypal" data-i18n="sponsor.donate">
-        💙 Donate on PayPal
-      </a>
-      <label class="sponsor-no-show">
-        <input type="checkbox" id="sponsor-dont-show" />
-        <span data-i18n="sponsor.dontShow">Don't show this again</span>
-      </label>
-      <button id="sponsor-close" class="sponsor-close-btn" data-i18n-html="sponsor.closeAndContinue">Close &amp; Continue</button>
     </div>
   </div>
 

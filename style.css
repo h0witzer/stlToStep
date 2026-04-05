@@ -1122,3 +1122,245 @@ input[type="number"].val:focus { outline: none; border-color: var(--accent); }
   border-color: var(--accent);
   color: var(--text);
 }
+/* ══════════════════════════════════════════════════════════════════════
+   B-rep Converter — new component styles
+   ══════════════════════════════════════════════════════════════════════ */
+
+/* ── Section hint text ───────────────────────────────────────────────── */
+.section-hint {
+  font-size: 11px;
+  color: var(--text-muted);
+  line-height: 1.5;
+  margin: -4px 0 10px;
+}
+
+/* ── Action buttons (Detect Groups / Fit Surfaces) ───────────────────── */
+.action-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: 100%;
+  padding: 7px 12px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+  font-family: inherit;
+}
+.action-btn:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent) 14%, var(--surface2));
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.action-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* ── Export button (accent-filled) ──────────────────────────────────── */
+.export-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: 100%;
+  padding: 9px 16px;
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: var(--radius);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s, opacity 0.15s;
+  font-family: inherit;
+}
+.export-btn:hover:not(:disabled) { background: var(--accent-hover); }
+.export-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* ── Status line (group count, etc.) ─────────────────────────────────── */
+.status-line {
+  margin-top: 8px;
+  font-size: 11px;
+  color: var(--text-muted);
+  min-height: 16px;
+}
+
+/* ── Surface list container ──────────────────────────────────────────── */
+.surface-list {
+  margin-top: 10px;
+  max-height: 320px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.surface-list::-webkit-scrollbar { width: 4px; }
+.surface-list::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+/* Summary chip row */
+.surface-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-bottom: 6px;
+}
+
+.surface-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 8px;
+  border-radius: 99px;
+  font-size: 11px;
+  font-weight: 600;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  color: var(--text);
+}
+.surface-chip::before {
+  content: '';
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--chip-color, var(--accent));
+  flex-shrink: 0;
+}
+
+/* Per-group rows */
+.surface-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 6px;
+  border-radius: 4px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  font-size: 11px;
+}
+.surface-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.surface-name {
+  flex: 1;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.surface-rms {
+  color: var(--text-muted);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.surface-override {
+  flex-shrink: 0;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--text);
+  font-size: 10px;
+  padding: 1px 4px;
+  cursor: pointer;
+}
+.surface-more {
+  font-size: 11px;
+  color: var(--text-muted);
+  text-align: center;
+  padding: 4px 0;
+}
+
+/* ── OC engine note ──────────────────────────────────────────────────── */
+.oc-note {
+  margin-top: 8px;
+  font-size: 10px;
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+
+/* ── Progress bar label ──────────────────────────────────────────────── */
+.export-progress-label {
+  display: block;
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: 4px;
+  min-height: 14px;
+}
+
+/* ── License / popup overlays ────────────────────────────────────────── */
+.license-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.65);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+.license-overlay.hidden { display: none; }
+
+.license-modal {
+  position: relative;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  max-width: 480px;
+  width: 90%;
+  padding: 28px 28px 24px;
+  max-height: 80vh;
+  overflow-y: auto;
+}
+
+.license-modal h2 {
+  font-size: 15px;
+  font-weight: 700;
+  margin-bottom: 14px;
+}
+
+.license-close-btn {
+  position: absolute;
+  top: 12px; right: 14px;
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-size: 18px;
+  cursor: pointer;
+  padding: 0 4px;
+  line-height: 1;
+}
+.license-close-btn:hover { color: var(--text); }
+
+.license-list {
+  list-style: disc;
+  padding-left: 18px;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--text);
+}
+.license-list a { color: var(--accent); }
+
+.license-link {
+  display: block;
+  text-align: center;
+  padding: 10px;
+  font-size: 11px;
+  color: var(--text-muted);
+  background: none;
+  border: none;
+  cursor: pointer;
+  transition: color 0.15s;
+  font-family: inherit;
+}
+.license-link:hover { color: var(--accent); }
