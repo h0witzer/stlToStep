@@ -681,6 +681,63 @@ function _buildCircularPlaneFace(oc, planeParams, circCenter, radius, toDelete) 
 }
 
 /**
+ * Build a planar face whose boundary is a full ellipse.
+ * Used for oblique (tilted) caps of cylinders/cones where the plane-surface
+ * intersection is an ellipse, not a circle.
+ *
+ * @param {object}   oc
+ * @param {object}   planeParams  { origin, normal }
+ * @param {number[]} center       [x,y,z] ellipse centre (on the plane)
+ * @param {number}   semiMajor    major semi-axis length (≥ semiMinor)
+ * @param {number}   semiMinor    minor semi-axis length
+ * @param {number[]} majorDir     unit vector of the major axis (lies in the plane)
+ * @param {object[]} toDelete
+ * @returns {object|null}  TopoDS_Face or null
+ */
+function _buildEllipticalPlaneFace(oc, planeParams, center, semiMajor, semiMinor, majorDir, toDelete) {
+  try {
+    const { origin, normal } = planeParams;
+    // gp_Ax2_2(P, N, Vx): Z = plane normal (ellipse normal), X = major-axis direction.
+    // In opencascade.js@1.1.4 the constructor index ordering is:
+    //   gp_Ax2_1() default, gp_Ax2_2(P,N,Vx) 3-arg, gp_Ax2_3(P,N) 2-arg.
+    const ax2 = new oc.gp_Ax2_2(
+      makePnt(oc, center),
+      makeDir(oc, normal),
+      makeDir(oc, majorDir),
+    );
+    toDelete.push(ax2);
+    // gp_Elips_2(ax2, majorRadius, minorRadius) — full ellipse
+    const elips = new oc.gp_Elips_2(ax2, semiMajor, semiMinor);
+    toDelete.push(elips);
+    // BRepBuilderAPI_MakeEdge_12(gp_Elips) → full ellipse edge
+    const edgeMaker = new oc.BRepBuilderAPI_MakeEdge_12(elips);
+    toDelete.push(edgeMaker);
+    if (!edgeMaker.IsDone()) {
+      console.warn('[brepBuilder] elliptical cap: MakeEdge_12 !IsDone()');
+      return null;
+    }
+    const wireMaker = new oc.BRepBuilderAPI_MakeWire_2(edgeMaker.Edge());
+    toDelete.push(wireMaker);
+    if (!wireMaker.IsDone()) {
+      console.warn('[brepBuilder] elliptical cap: MakeWire_2 !IsDone()');
+      return null;
+    }
+    const pln = new oc.gp_Pln_3(makePnt(oc, origin), makeDir(oc, normal));
+    toDelete.push(pln);
+    const mf = new oc.BRepBuilderAPI_MakeFace_16(pln, wireMaker.Wire(), true);
+    toDelete.push(mf);
+    if (!mf.IsDone()) {
+      console.warn('[brepBuilder] elliptical cap: MakeFace_16 !IsDone()');
+      return null;
+    }
+    return mf.Face();
+  } catch (e) {
+    console.warn('[brepBuilder] elliptical cap: exception in _buildEllipticalPlaneFace', e?.message ?? e);
+    return null;
+  }
+}
+
+/**
  * Build a planar cap face whose boundary is the exact analytical intersection
  * circle (or ellipse) between the plane and the adjacent curved surface,
  * computed by IntAna_QuadQuadGeo — OCCT's purpose-built quadric intersection
@@ -707,6 +764,10 @@ function _buildAnalyticalCapFace(oc, planeParams, adjSurface, toDelete) {
   const { origin, normal } = planeParams;
   const n = _u3(normal);
 
+  // ── Strategy A: IntAna_QuadQuadGeo ──────────────────────────────────────────
+  // OCCT's purpose-built quadric intersection package gives the exact analytic
+  // circle/ellipse without any additional maths.  Try it first; fall through to
+  // Strategy B if the constructor is not bound in this build of opencascade.js.
   try {
     const pln = new oc.gp_Pln_3(makePnt(oc, origin), makeDir(oc, n));
     toDelete.push(pln);
@@ -741,54 +802,123 @@ function _buildAnalyticalCapFace(oc, planeParams, adjSurface, toDelete) {
       toDelete.push(inter);
     }
 
-    if (!inter || !inter.IsDone() || inter.NbSolutions() < 1) return null;
+    if (inter && inter.IsDone() && inter.NbSolutions() >= 1) {
+      // IntAna_ResultType sequential enum values in OCCT 7.4:
+      //   IntAna_Circle = 3, IntAna_Ellipse = 6
+      const T_CIRCLE  = oc.IntAna_ResultType?.IntAna_Circle  ?? 3;
+      const T_ELLIPSE = oc.IntAna_ResultType?.IntAna_Ellipse ?? 6;
+      const typeInter = inter.TypeInter();
 
-    // IntAna_ResultType sequential enum values in OCCT 7.4:
-    //   IntAna_Circle = 3, IntAna_Ellipse = 6
-    // Use oc.IntAna_ResultType.IntAna_Circle when the namespace is bound;
-    // fall back to the correct integer literals otherwise.
-    const T_CIRCLE  = oc.IntAna_ResultType?.IntAna_Circle  ?? 3;
-    const T_ELLIPSE = oc.IntAna_ResultType?.IntAna_Ellipse ?? 6;
-    const typeInter = inter.TypeInter();
+      let edgeMaker;
+      if (typeInter === T_CIRCLE) {
+        const circ = inter.Circle(1);
+        toDelete.push(circ);
+        edgeMaker = new oc.BRepBuilderAPI_MakeEdge_8(circ);
+      } else if (typeInter === T_ELLIPSE) {
+        const elips = inter.Ellipse(1);
+        toDelete.push(elips);
+        edgeMaker = new oc.BRepBuilderAPI_MakeEdge_12(elips);
+      } else {
+        console.warn('[brepBuilder] IntAna cap: unexpected intersection type', typeInter,
+                     '(expected', T_CIRCLE, 'or', T_ELLIPSE, ') — will use gp_Circ fallback');
+      }
 
-    let edgeMaker;
-    if (typeInter === T_CIRCLE) {
-      const circ = inter.Circle(1);
-      toDelete.push(circ);
-      edgeMaker = new oc.BRepBuilderAPI_MakeEdge_8(circ);
-    } else if (typeInter === T_ELLIPSE) {
-      const elips = inter.Ellipse(1);
-      toDelete.push(elips);
-      edgeMaker = new oc.BRepBuilderAPI_MakeEdge_12(elips);
-    } else {
-      console.warn('[brepBuilder] IntAna cap: unexpected intersection type', typeInter,
-                   '(expected', T_CIRCLE, 'or', T_ELLIPSE, ')');
-      return null;
+      if (edgeMaker) {
+        toDelete.push(edgeMaker);
+        if (edgeMaker.IsDone()) {
+          const wireMaker = new oc.BRepBuilderAPI_MakeWire_2(edgeMaker.Edge());
+          toDelete.push(wireMaker);
+          if (wireMaker.IsDone()) {
+            const mf = new oc.BRepBuilderAPI_MakeFace_16(pln, wireMaker.Wire(), true);
+            toDelete.push(mf);
+            if (mf.IsDone()) return mf.Face();
+            console.warn('[brepBuilder] IntAna cap: MakeFace_16 !IsDone()');
+          } else {
+            console.warn('[brepBuilder] IntAna cap: MakeWire_2 !IsDone()');
+          }
+        } else {
+          console.warn('[brepBuilder] IntAna cap: MakeEdge !IsDone(), typeInter=', typeInter);
+        }
+      }
+    }
+  } catch (e) {
+    console.warn('[brepBuilder] IntAna cap: exception — falling back to gp_Circ', e?.message ?? e);
+  }
+
+  // ── Strategy B: construct gp_Circ / gp_Elips directly from surface parameters ─
+  // Used when IntAna_QuadQuadGeo is not available in this opencascade.js build.
+  //
+  // Cylinder oblique cross-section:
+  //   A plane with normal n cutting a cylinder of radius r whose axis direction
+  //   is aHat produces an *ellipse* in general.  The ellipse parameters are:
+  //     • Centre   = intersection of the cylinder axis line with the cap plane
+  //     • Semi-minor = r  (transverse to both axis and plane-normal)
+  //     • Semi-major = r / |dot(aHat, n)|  (along the axis projected onto the plane)
+  //   When |dot(aHat, n)| ≈ 1 (perpendicular cap) this reduces to a circle.
+  //
+  // Cone oblique cross-section:
+  //   Perpendicular (circle) case handled; tilted case deferred to IntAna (Strategy A).
+  //   For a tilted cone cut the ellipse centre does not lie on the axis-plane
+  //   intersection, requiring a full conic-section solve that IntAna already does.
+  //
+  // Sphere:
+  //   Any plane-sphere intersection is always a circle regardless of tilt.
+  try {
+    if (adjSurface.type === 'cylinder') {
+      const { axisPoint, axis, radius } = adjSurface.params;
+      const aHat  = _u3(axis);
+      // cosAlpha = |dot(aHat, nHat)| — cos of angle between axis and plane normal.
+      // denom carries the sign so we can determine which side t falls on.
+      const denom = _d3(n, aHat);
+      if (Math.abs(denom) < 1e-10) return null; // axis parallel to plane → no finite cap
+      const t = _d3(n, [origin[0]-axisPoint[0], origin[1]-axisPoint[1], origin[2]-axisPoint[2]]) / denom;
+      const center = [axisPoint[0]+t*aHat[0], axisPoint[1]+t*aHat[1], axisPoint[2]+t*aHat[2]];
+      const cosAlpha = Math.abs(denom); // both vectors are unit — |dot| = cos of angle
+
+      if (cosAlpha > 1 - 1e-4) {
+        // Perpendicular cap (or within 0.01°): circle
+        return _buildCircularPlaneFace(oc, planeParams, center, radius, toDelete);
+      }
+      // Oblique cap: ellipse.
+      // Major axis direction = component of the cylinder axis projected onto the cap
+      // plane (i.e. strip out the normal component), then normalised.
+      const axInPlane = _u3([aHat[0]-denom*n[0], aHat[1]-denom*n[1], aHat[2]-denom*n[2]]);
+      return _buildEllipticalPlaneFace(
+        oc, planeParams, center, radius / cosAlpha, radius, axInPlane, toDelete,
+      );
+
+    } else if (adjSurface.type === 'cone') {
+      const { apex, axis, halfAngle } = adjSurface.params;
+      const aHat  = _u3(axis);
+      const denom = _d3(n, aHat);
+      if (Math.abs(denom) < 1e-10) return null; // axis parallel to plane
+      const t = _d3(n, [origin[0]-apex[0], origin[1]-apex[1], origin[2]-apex[2]]) / denom;
+      if (t <= 0) return null; // wrong side of apex
+      const cosAlpha = Math.abs(denom);
+      if (cosAlpha <= 1 - 1e-4) {
+        // Tilted cone cap: the ellipse centre shifts off the axis-plane intersection
+        // and requires a full conic-section solve.  IntAna (Strategy A) handles this
+        // correctly; here we cannot recover without reinventing it, so return null.
+        return null;
+      }
+      // Perpendicular (or near-perpendicular) cone cap → circle
+      const center = [apex[0]+t*aHat[0], apex[1]+t*aHat[1], apex[2]+t*aHat[2]];
+      return _buildCircularPlaneFace(oc, planeParams, center, t * Math.tan(halfAngle), toDelete);
+
+    } else if (adjSurface.type === 'sphere') {
+      const { center, radius } = adjSurface.params;
+      // Plane-sphere intersection is always a circle regardless of tilt.
+      const d  = _d3(n, [center[0]-origin[0], center[1]-origin[1], center[2]-origin[2]]);
+      const r2 = radius * radius - d * d;
+      if (r2 <= 0) return null; // plane misses the sphere
+      const circCenter = [center[0]-d*n[0], center[1]-d*n[1], center[2]-d*n[2]];
+      return _buildCircularPlaneFace(oc, planeParams, circCenter, Math.sqrt(r2), toDelete);
     }
 
-    toDelete.push(edgeMaker);
-    if (!edgeMaker.IsDone()) {
-      console.warn('[brepBuilder] IntAna cap: MakeEdge !IsDone(), typeInter=', typeInter);
-      return null;
-    }
-
-    const wireMaker = new oc.BRepBuilderAPI_MakeWire_2(edgeMaker.Edge());
-    toDelete.push(wireMaker);
-    if (!wireMaker.IsDone()) {
-      console.warn('[brepBuilder] IntAna cap: MakeWire_2 !IsDone()');
-      return null;
-    }
-
-    const mf = new oc.BRepBuilderAPI_MakeFace_16(pln, wireMaker.Wire(), true);
-    toDelete.push(mf);
-    if (!mf.IsDone()) {
-      console.warn('[brepBuilder] IntAna cap: MakeFace_16 !IsDone()');
-      return null;
-    }
-    return mf.Face();
+    return null;
 
   } catch (e) {
-    console.warn('[brepBuilder] IntAna cap: exception in _buildAnalyticalCapFace', e);
+    console.warn('[brepBuilder] cap Strategy B: exception', e?.message ?? e);
     return null;
   }
 }
