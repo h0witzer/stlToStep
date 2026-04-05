@@ -758,7 +758,9 @@ function _buildAnalyticalCapFace(oc, planeParams, adjSurface, toDelete) {
     console.warn('[brepBuilder] IntAna cap: exception in _buildAnalyticalCapFace', e);
     return null;
   }
-}(oc, params, loop, toDelete, neighborVRange) {
+}
+
+function _buildCylinderFace(oc, params, loop, toDelete, neighborVRange) {
   // Build an analytical cylindrical face using UV parameter bounds.
   // BRepBuilderAPI_MakeFace_10(gp_Cylinder, UMin, UMax, VMin, VMax) creates a
   // proper Geom_CylindricalSurface face without requiring PCurves, avoiding the
