@@ -8,7 +8,8 @@
  *   4. Build an OCCT face: plane uses analytic gp_Pln;
  *      cylinder/cone/sphere/NURBS fall back to BRepBuilderAPI_MakeFace (wire-only)
  *   5. Assemble all faces into a TopoDS_Compound
- *   6. Write STEP via STEPControl_Writer
+ *   6. Write STEP via STEPControl_Writer; read back using oc.FS.cwd() to resolve the
+ *      actual MEMFS path where OSD_Path places the output file
  *
  * opencascade.js is loaded lazily via dynamic import() when the user first
  * clicks "Export STEP" so the 35 MB WASM does not block page load.
@@ -19,7 +20,7 @@ import { extractBoundaryLoop } from './faceGrouper.js';
 // ── Build version ─────────────────────────────────────────────────────────────
 
 /** Increment this string with each release to verify live-site deployments. */
-export const BUILD_VERSION = 'v0.4.0';
+export const BUILD_VERSION = 'v0.4.1';
 
 // ── OpenCASCADE lazy loader ───────────────────────────────────────────────────
 
@@ -348,35 +349,49 @@ export async function buildAndExportSTEP(groups, geometry, options = {}, onStatu
     throw new Error(`STEPControl_Writer.Transfer failed (status ${transferResult}).`);
   }
 
-  // All confirmed working opencascade.js examples pass a bare filename (no leading
-  // slash) to writer.Write — OSD_Path under Emscripten mis-handles absolute paths.
-  // We also pre-create the file via oc.FS.writeFile so that OSD_File can open it
-  // with O_WRONLY even if OCCT omits O_CREAT in the Emscripten build.
+  // OCCT's OSD_Path resolves bare filenames relative to the process CWD (not necessarily '/').
+  // We use oc.FS.cwd() to find the actual CWD so we can read back what Write created.
   const stepFile = 'brep_export.stp';
-  const stepPath = '/' + stepFile;
+  const cwd = typeof oc.FS.cwd === 'function' ? oc.FS.cwd() : '/';
+  const cwdPrefix = cwd.endsWith('/') ? cwd : cwd + '/';
+  const stepPath = cwdPrefix + stepFile;  // where OCCT will write
+  const stepPathRoot = '/' + stepFile;   // fallback in case CWD === '/'
 
-  // Clean up any leftover file from a previous failed export
+  // Clean up any leftovers from a previous failed export
   try { oc.FS.unlink(stepPath); } catch { /* ignore */ }
-  // Pre-create so that OSD_File can open an existing path for writing
-  oc.FS.writeFile(stepPath, '');
+  if (stepPath !== stepPathRoot) {
+    try { oc.FS.unlink(stepPathRoot); } catch { /* ignore */ }
+  }
 
   const writeResult = writer.Write(stepFile);
   if (writeResult !== DONE) {
     throw new Error(`STEPControl_Writer.Write failed (status ${writeResult}).`);
   }
 
+  // Try CWD-relative path first, then '/' as a fallback
   let stepContent;
-  try {
-    stepContent = oc.FS.readFile(stepPath, { encoding: 'utf8' });
-  } catch (fsErr) {
-    // Diagnostic: log MEMFS root so the user/developer can see what was written
-    try { console.error('MEMFS / contents after Write:', oc.FS.readdir('/')); } catch { /* ignore */ }
-    throw new Error(`STEP file not found in virtual FS after Write (${fsErr.message}). MEMFS root logged above.`);
+  for (const p of [stepPath, stepPathRoot]) {
+    try {
+      const raw = oc.FS.readFile(p);
+      // raw may be a Uint8Array (Emscripten default) or a string
+      const text = typeof raw === 'string' ? raw : new TextDecoder().decode(raw);
+      if (text && text.startsWith('ISO-10303')) {
+        stepContent = text;
+        try { oc.FS.unlink(p); } catch { /* ignore */ }
+        break;
+      }
+    } catch { /* try next candidate */ }
   }
-  if (!stepContent || !stepContent.startsWith('ISO-10303')) {
+
+  if (!stepContent) {
+    // Diagnostic: log MEMFS state so developers can pinpoint the issue
+    try {
+      console.error('STEP Write diagnostics — CWD:', cwd,
+        '/ contents:', oc.FS.readdir('/'),
+        ...(cwd !== '/' ? ['CWD contents:', oc.FS.readdir(cwd)] : []));
+    } catch { /* ignore */ }
     throw new Error('STEP export produced empty or invalid output. Transfer returned DONE but no ISO-10303 header found.');
   }
-  try { oc.FS.unlink(stepPath); } catch { /* ignore */ }
 
   onStatus?.('Cleaning up…', 95);
 

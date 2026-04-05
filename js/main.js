@@ -4,7 +4,7 @@
  * Workflow:
  *   1. Load STL / OBJ / 3MF  →  Three.js BufferGeometry for preview
  *   2. "Detect Groups"        →  faceGrouper.js (dihedral-angle segmentation)
- *   3. "Fit Surfaces"         →  surfaceFitter.js (plane / cylinder / sphere)
+ *   3. "Fit Surfaces"         →  surfaceFitter.js (plane / cylinder / cone / sphere)
  *   4. "Export STEP"          →  brepBuilder.js  (opencascade.js + STEPControl_Writer)
  */
 
@@ -222,8 +222,8 @@ async function handleFit() {
   }
 }
 
-const TYPE_LABELS = { plane: 'Plane', cylinder: 'Cylinder', sphere: 'Sphere', nurbs: 'NURBS' };
-const TYPE_COLORS = { plane: '#4a9eff', cylinder: '#ff9a3c', sphere: '#7dd67d', nurbs: '#c084fc' };
+const TYPE_LABELS = { plane: 'Plane', cylinder: 'Cylinder', cone: 'Cone', sphere: 'Sphere', nurbs: 'NURBS' };
+const TYPE_COLORS = { plane: '#4a9eff', cylinder: '#ff9a3c', cone: '#f97316', sphere: '#7dd67d', nurbs: '#c084fc' };
 
 function renderSurfaceList() {
   surfaceList.innerHTML = '';
@@ -274,7 +274,7 @@ function renderSurfaceList() {
     // Manual override select
     const sel = document.createElement('select');
     sel.className = 'surface-override';
-    ['auto', 'plane', 'cylinder', 'sphere', 'nurbs'].forEach(opt => {
+    ['auto', 'plane', 'cylinder', 'cone', 'sphere', 'nurbs'].forEach(opt => {
       const o = document.createElement('option');
       o.value = opt; o.textContent = opt === 'auto' ? 'auto' : TYPE_LABELS[opt];
       if ((type === opt) || (opt === 'auto' && !g._override)) o.selected = true;
