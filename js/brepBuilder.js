@@ -212,47 +212,17 @@ function _buildPlaneFace(oc, params, loop, toDelete) {
 }
 
 function _buildCylinderFace(oc, params, loop, toDelete) {
-  const { axisPoint, axis, radius } = params;
-
-  // Build gp_Cylinder: ax3 with axis as Z-direction, axisPoint as origin
-  const ax3 = makeAx3(oc, axisPoint, axis);
-  toDelete.push(ax3);
-  const cyl = new oc.gp_Cylinder_2(ax3, radius);
-  toDelete.push(cyl);
-
-  const wire = buildWire(oc, loop, toDelete);
-  if (!wire) return null;
-
-  try {
-    const mf = new oc.BRepBuilderAPI_MakeFace_17(cyl, wire, true);
-    toDelete.push(mf);
-    if (!mf.IsDone()) return _buildFallbackFace(oc, loop, toDelete);
-    return mf.Face();
-  } catch {
-    return _buildFallbackFace(oc, loop, toDelete);
-  }
+  // Straight 3D line segments between snapped vertices do not lie on the
+  // cylinder surface, so BRepBuilderAPI_MakeFace_17 would compute degenerate
+  // PCurves that silently pass IsDone() but crash inside STEPControl_Writer.
+  // Use a planar best-fit face (wire-only) instead.
+  return _buildFallbackFace(oc, loop, toDelete);
 }
 
 function _buildSphereFace(oc, params, loop, toDelete) {
-  const { center, radius } = params;
-
-  // Spherical surface — use a z-up ax3 at the center
-  const ax3 = makeAx3(oc, center, [0, 0, 1]);
-  toDelete.push(ax3);
-  const sphere = new oc.gp_Sphere_2(ax3, radius);
-  toDelete.push(sphere);
-
-  const wire = buildWire(oc, loop, toDelete);
-  if (!wire) return null;
-
-  try {
-    const mf = new oc.BRepBuilderAPI_MakeFace_19(sphere, wire, true);
-    toDelete.push(mf);
-    if (!mf.IsDone()) return _buildFallbackFace(oc, loop, toDelete);
-    return mf.Face();
-  } catch {
-    return _buildFallbackFace(oc, loop, toDelete);
-  }
+  // Same reasoning as cylinder: straight edges between snapped vertices lie
+  // inside the sphere, not on it. Skip MakeFace_19 and use the planar fallback.
+  return _buildFallbackFace(oc, loop, toDelete);
 }
 
 /**
@@ -283,7 +253,7 @@ function _buildFallbackFace(oc, loop, toDelete) {
  * @returns {Promise<string>}  STEP file content as UTF-8 string
  */
 export async function buildAndExportSTEP(groups, geometry, options = {}, onStatus) {
-  const { schema = 'AP214', sewTol = 1e-4 } = options;
+  const { schema = 'AP214' } = options;
 
   const oc = await initOC(msg => onStatus?.(msg, 5));
 
@@ -306,20 +276,7 @@ export async function buildAndExportSTEP(groups, geometry, options = {}, onStatu
 
   if (faces.length === 0) throw new Error('No valid B-rep faces could be constructed.');
 
-  onStatus?.(`Assembling ${faces.length} faces…`, 55);
-
-  // BRepBuilderAPI_Sewing::Perform requires a Handle(Message_ProgressIndicator) argument
-  // that opencascade.js@1.1.4 (OCCT 7.4.0p1) does not expose as a constructible JS type.
-  // Use BRep_Builder + TopoDS_Compound instead — no Perform() needed, and the compound
-  // exports cleanly to STEP with all analytic faces intact.
-  const builder = new oc.BRep_Builder();
-  const compound = new oc.TopoDS_Compound();
-  toDelete.push(compound);
-  builder.MakeCompound(compound);
-  for (const f of faces) builder.Add(compound, f);
-  const finalShape = compound;
-
-  onStatus?.('Writing STEP file…', 80);
+  onStatus?.(`Writing ${faces.length} faces to STEP…`, 70);
 
   // Set STEP schema
   try {
@@ -332,17 +289,25 @@ export async function buildAndExportSTEP(groups, geometry, options = {}, onStatu
   const writer = new oc.STEPControl_Writer_1();
   toDelete.push(writer);
 
-  const transferResult = writer.Transfer(
-    finalShape,
-    oc.STEPControl_StepModelType.STEPControl_AsIs,
-    true,
-  );
-
-  if (transferResult !== oc.IFSelect_ReturnStatus.IFSelect_RetDone) {
-    // Transfer failed with finalShape — no fallback available
-    throw new Error('STEPControl_Writer.Transfer failed.');
+  // Transfer each face individually so a single bad face can't abort the export.
+  // STEPControl_Writer accumulates shapes across Transfer calls; one Write() at the end.
+  let transferredCount = 0;
+  for (const face of faces) {
+    try {
+      const result = writer.Transfer(
+        face,
+        oc.STEPControl_StepModelType.STEPControl_AsIs,
+        true,
+      );
+      if (result === oc.IFSelect_ReturnStatus.IFSelect_RetDone) transferredCount++;
+    } catch (err) {
+      console.warn('STEP transfer failed for face:', err.message);
+    }
   }
 
+  if (transferredCount === 0) throw new Error('No faces could be transferred to STEP.');
+
+  onStatus?.('Writing STEP file…', 85);
   const stepPath = '/brep_export.stp';
   writer.Write(stepPath);
   const stepContent = oc.FS.readFile(stepPath, { encoding: 'utf8' });
