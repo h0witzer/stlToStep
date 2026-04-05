@@ -577,7 +577,7 @@ function _buildPlaneFace(oc, params, loop, toDelete) {
 
 function _buildCylinderFace(oc, params, loop, toDelete, neighborVRange) {
   // Build an analytical cylindrical face using UV parameter bounds.
-  // BRepBuilderAPI_MakeFace_11(gp_Cylinder, UMin, UMax, VMin, VMax) creates a
+  // BRepBuilderAPI_MakeFace_10(gp_Cylinder, UMin, UMax, VMin, VMax) creates a
   // proper Geom_CylindricalSurface face without requiring PCurves, avoiding the
   // null-PCurve crash that MakeFace_17 (cylinder + wire) triggers inside
   // STEPControl_Writer when the wire edges are straight 3-D line segments.
@@ -601,6 +601,7 @@ function _buildCylinderFace(oc, params, loop, toDelete, neighborVRange) {
       }
     }
     if (!isFinite(vmin) || !isFinite(vmax) || vmax - vmin < 1e-10) {
+      console.warn('[brepBuilder] cylinder: degenerate V range', { vmin, vmax });
       return null;
     }
 
@@ -612,20 +613,24 @@ function _buildCylinderFace(oc, params, loop, toDelete, neighborVRange) {
     // U: full circle (0 … 2π) — correct for a complete cylindrical hole or boss.
     // A small padding on V avoids degenerate edge artefacts at exact boundaries.
     const pad = (vmax - vmin) * 1e-6;
-    const mf = new oc.BRepBuilderAPI_MakeFace_11(
+    const mf = new oc.BRepBuilderAPI_MakeFace_10(
       cyl, 0.0, 2 * Math.PI, vmin - pad, vmax + pad,
     );
     toDelete.push(mf);
-    if (!mf.IsDone()) return null;
+    if (!mf.IsDone()) {
+      console.warn('[brepBuilder] cylinder: MakeFace_11 !IsDone()', { axisPoint, axis, radius, vmin, vmax });
+      return null;
+    }
     return mf.Face();
-  } catch {
+  } catch (e) {
+    console.warn('[brepBuilder] cylinder: exception in _buildCylinderFace', e);
     return null;
   }
 }
 
 function _buildConeFace(oc, params, loop, toDelete, neighborVRange) {
   // Build an analytical conical face using UV parameter bounds.
-  // BRepBuilderAPI_MakeFace_12(gp_Cone, UMin, UMax, VMin, VMax) avoids the
+  // BRepBuilderAPI_MakeFace_11(gp_Cone, UMin, UMax, VMin, VMax) avoids the
   // null-PCurve crash that occurs when using a wire of straight 3-D edges.
   const { apex, axis, halfAngle } = params;
   try {
@@ -647,6 +652,7 @@ function _buildConeFace(oc, params, loop, toDelete, neighborVRange) {
     }
     if (!isFinite(vmin) || !isFinite(vmax) || vmax - vmin < 1e-10 || vmin < -1e-6) {
       // Degenerate extent or apex behind origin — skip face
+      console.warn('[brepBuilder] cone: degenerate V range or apex issue', { vmin, vmax });
       return null;
     }
 
@@ -657,20 +663,24 @@ function _buildConeFace(oc, params, loop, toDelete, neighborVRange) {
     toDelete.push(cone);
 
     const pad = (vmax - vmin) * 1e-6;
-    const mf = new oc.BRepBuilderAPI_MakeFace_12(
+    const mf = new oc.BRepBuilderAPI_MakeFace_11(
       cone, 0.0, 2 * Math.PI, vmin - pad, vmax + pad,
     );
     toDelete.push(mf);
-    if (!mf.IsDone()) return null;
+    if (!mf.IsDone()) {
+      console.warn('[brepBuilder] cone: MakeFace_12 !IsDone()', { apex, axis, halfAngle, vmin, vmax });
+      return null;
+    }
     return mf.Face();
-  } catch {
+  } catch (e) {
+    console.warn('[brepBuilder] cone: exception in _buildConeFace', e);
     return null;
   }
 }
 
 function _buildSphereFace(oc, params, loop, toDelete) {
   // Build an analytical spherical face using UV parameter bounds.
-  // BRepBuilderAPI_MakeFace_13(gp_Sphere, UMin, UMax, VMin, VMax) avoids the
+  // BRepBuilderAPI_MakeFace_12(gp_Sphere, UMin, UMax, VMin, VMax) avoids the
   // null-PCurve crash from straight-edge wires.  Latitude is computed using the
   // Z-axis of a default frame centered at the sphere's centre; for a full or
   // near-full hemisphere use -π/2 … π/2.
@@ -685,7 +695,10 @@ function _buildSphereFace(oc, params, loop, toDelete) {
       if (lat < vmin) vmin = lat;
       if (lat > vmax) vmax = lat;
     }
-    if (vmax - vmin < 1e-10) return null;
+    if (vmax - vmin < 1e-10) {
+      console.warn('[brepBuilder] sphere: degenerate latitude range', { vmin, vmax });
+      return null;
+    }
 
     // Place the sphere centre at `center` with default Z-up orientation
     const ax3 = new oc.gp_Ax3_4(makePnt(oc, center), makeDir(oc, [0, 0, 1]));
@@ -694,13 +707,17 @@ function _buildSphereFace(oc, params, loop, toDelete) {
     toDelete.push(sph);
 
     const pad = Math.max((vmax - vmin) * 1e-6, 1e-8);
-    const mf = new oc.BRepBuilderAPI_MakeFace_13(
+    const mf = new oc.BRepBuilderAPI_MakeFace_12(
       sph, 0.0, 2 * Math.PI, vmin - pad, vmax + pad,
     );
     toDelete.push(mf);
-    if (!mf.IsDone()) return null;
+    if (!mf.IsDone()) {
+      console.warn('[brepBuilder] sphere: MakeFace_13 !IsDone()', { center, radius, vmin, vmax });
+      return null;
+    }
     return mf.Face();
-  } catch {
+  } catch (e) {
+    console.warn('[brepBuilder] sphere: exception in _buildSphereFace', e);
     return null;
   }
 }
