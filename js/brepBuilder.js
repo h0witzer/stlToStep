@@ -354,9 +354,16 @@ export async function buildAndExportSTEP(groups, geometry, options = {}, onStatu
   // (e.g. '/home/web_user') which causes Write to produce a file that is
   // invisible from a '/' lookup.
   const stepFile = 'brep_export.stp';
-  const stepPath = '/' + stepFile;
   const savedCwd = typeof oc.FS.cwd === 'function' ? oc.FS.cwd() : '/';
   try { oc.FS.chdir('/'); } catch { /* not fatal — best effort */ }
+
+  // Capture the ACTUAL CWD after the chdir attempt.  If chdir('/') succeeded
+  // this is '/'; if it threw we're still in the original directory.  Both the
+  // pre-created inode and the readFile call below MUST use this same path so
+  // that writer.Write(stepFile) and oc.FS.readFile(stepPath) refer to the
+  // exact same MEMFS inode.
+  const writeCwd = typeof oc.FS.cwd === 'function' ? oc.FS.cwd() : savedCwd;
+  const stepPath = writeCwd === '/' ? '/' + stepFile : writeCwd + '/' + stepFile;
 
   // Clean up any leftover from a previous failed export, then pre-create the
   // inode so that OSD_File can open it with O_WRONLY even if OCCT's libc open()
@@ -367,7 +374,7 @@ export async function buildAndExportSTEP(groups, geometry, options = {}, onStatu
   const writeResult = writer.Write(stepFile);
 
   // Restore the CWD regardless of outcome
-  try { if (savedCwd !== '/') oc.FS.chdir(savedCwd); } catch { /* ignore */ }
+  try { if (writeCwd !== savedCwd) oc.FS.chdir(savedCwd); } catch { /* ignore */ }
 
   if (writeResult !== DONE) {
     throw new Error(`STEPControl_Writer.Write failed (status ${writeResult}).`);
@@ -397,11 +404,14 @@ export async function buildAndExportSTEP(groups, geometry, options = {}, onStatu
   try { oc.FS.unlink(stepPath); } catch { /* ignore */ }
 
   if (!stepContent) {
-    // Diagnostic: log MEMFS state so developers can pinpoint the issue
+    // Diagnostic: log MEMFS state so developers can pinpoint the issue.
+    // We log the writeCwd (where the file was expected) and the root dir so
+    // the developer can verify whether the file was written at all and where.
     try {
-      const cwd = typeof oc.FS.cwd === 'function' ? oc.FS.cwd() : '?';
-      console.error('STEP Write diagnostics — CWD:', cwd,
-        '/ contents:', oc.FS.readdir('/'));
+      console.error('STEP Write diagnostics — writeCwd:', writeCwd,
+        '| stepPath:', stepPath,
+        '| writeCwd contents:', oc.FS.readdir(writeCwd),
+        '| / contents:', oc.FS.readdir('/'));
     } catch { /* ignore */ }
     throw new Error('STEP export produced empty or invalid output. Transfer returned DONE but no ISO-10303 header found.');
   }

@@ -190,50 +190,54 @@ function vizCone(surface, verts, mat) {
   const { axis, apex, halfAngle } = surface.params;
   const a     = new THREE.Vector3(...axis).normalize();
   const apexV = new THREE.Vector3(...apex);
+  const tanA  = Math.tan(halfAngle);
 
-  // Axial extent from apex along the axis
-  let maxT = 0;
+  // Find the axial extent of the mesh section measured FROM the apex.
+  // We need both the minimum and maximum signed projections so we can draw
+  // circles at BOTH ends of the cone section — not just the farthest end.
+  let tMin = Infinity, tMax = -Infinity;
   for (let i = 0; i < verts.length; i += 3) {
     const t = new THREE.Vector3(verts[i], verts[i + 1], verts[i + 2]).sub(apexV).dot(a);
-    if (Math.abs(t) > Math.abs(maxT)) maxT = t;
+    if (t < tMin) tMin = t;
+    if (t > tMax) tMax = t;
   }
-
-  const baseCenter = [apex[0] + maxT * a.x, apex[1] + maxT * a.y, apex[2] + maxT * a.z];
-  const baseRadius = Math.abs(maxT) * Math.tan(halfAngle);
+  if (!isFinite(tMin) || !isFinite(tMax)) return new THREE.Group();
 
   const xh = perpTo(axis);
   const yh = new THREE.Vector3().crossVectors(a, xh).normalize();
 
-  const g = new THREE.Group();
-  g.add(makeLine(circlePositions(baseCenter, axis, baseRadius), mat));
-  // Midpoint circle
-  const midT = maxT / 2;
-  g.add(makeLine(circlePositions(
-    [apex[0] + midT * a.x, apex[1] + midT * a.y, apex[2] + midT * a.z],
-    axis, Math.abs(midT) * Math.tan(halfAngle),
-  ), mat));
+  // Two end circles at tMin and tMax (with correct radii at each axial slice)
+  const c1 = [apexV.x + tMin * a.x, apexV.y + tMin * a.y, apexV.z + tMin * a.z];
+  const r1 = Math.abs(tMin) * tanA;
+  const c2 = [apexV.x + tMax * a.x, apexV.y + tMax * a.y, apexV.z + tMax * a.z];
+  const r2 = Math.abs(tMax) * tanA;
 
-  // 4 lines: apex → base circle
+  const g = new THREE.Group();
+  if (r1 > 1e-9) g.add(makeLine(circlePositions(c1, axis, r1), mat));
+  g.add(makeLine(circlePositions(c2, axis, r2), mat));
+
+  // 4 generator lines connecting the two end circles (avoids lines to a
+  // potentially distant apex outside the mesh bounds)
   for (let i = 0; i < 4; i++) {
     const θ = (i / 4) * Math.PI * 2;
     const dx = Math.cos(θ) * xh.x + Math.sin(θ) * yh.x;
     const dy = Math.cos(θ) * xh.y + Math.sin(θ) * yh.y;
     const dz = Math.cos(θ) * xh.z + Math.sin(θ) * yh.z;
     g.add(makeLine([
-      apex[0], apex[1], apex[2],
-      baseCenter[0] + baseRadius * dx,
-      baseCenter[1] + baseRadius * dy,
-      baseCenter[2] + baseRadius * dz,
+      c1[0] + r1 * dx, c1[1] + r1 * dy, c1[2] + r1 * dz,
+      c2[0] + r2 * dx, c2[1] + r2 * dy, c2[2] + r2 * dz,
     ], mat));
   }
 
-  // Apex marker (small cross)
-  const sz = baseRadius * 0.06;
-  g.add(makeLineSegments([
-    apex[0] - sz, apex[1], apex[2], apex[0] + sz, apex[1], apex[2],
-    apex[0], apex[1] - sz, apex[2], apex[0], apex[1] + sz, apex[2],
-    apex[0], apex[1], apex[2] - sz, apex[0], apex[1], apex[2] + sz,
-  ], mat));
+  // Apex marker — only when apex lies within the mesh's axial span (tMin ≤ 0 ≤ tMax)
+  if (tMin <= 0 && tMax >= 0) {
+    const sz = Math.max(r1, r2) * 0.06;
+    g.add(makeLineSegments([
+      apex[0] - sz, apex[1], apex[2], apex[0] + sz, apex[1], apex[2],
+      apex[0], apex[1] - sz, apex[2], apex[0], apex[1] + sz, apex[2],
+      apex[0], apex[1], apex[2] - sz, apex[0], apex[1], apex[2] + sz,
+    ], mat));
+  }
 
   return g;
 }
