@@ -179,7 +179,7 @@ export function buildGroupAdjacencyMap(groups, geometry) {
   return result;
 }
 
-// ── Analytical boundary helpers ──────────────────────────────────────────────
+// ── Vector math utilities ────────────────────────────────────────────────────
 
 function _d3(a, b)  { return a[0]*b[0] + a[1]*b[1] + a[2]*b[2]; }
 function _x3(a, b)  {
@@ -189,156 +189,8 @@ function _n3(v)     { return Math.sqrt(v[0]*v[0]+v[1]*v[1]+v[2]*v[2]); }
 function _u3(v)     { const n = _n3(v); return n > 1e-14 ? [v[0]/n, v[1]/n, v[2]/n] : v; }
 
 /**
- * Compute the unique point at the intersection of three planes.
- * Each plane is given by (unitNormal, pointOnPlane).
- * Returns null when the determinant is below threshold (parallel planes).
- */
-function _intersect3Planes(n1, o1, n2, o2, n3, o3) {
-  const d1 = _d3(n1, o1), d2 = _d3(n2, o2), d3 = _d3(n3, o3);
-  const c23 = _x3(n2, n3);
-  const det = _d3(n1, c23);
-  if (Math.abs(det) < 1e-10) return null;
-  const c31 = _x3(n3, n1);
-  const c12 = _x3(n1, n2);
-  return [
-    (d1*c23[0] + d2*c31[0] + d3*c12[0]) / det,
-    (d1*c23[1] + d2*c31[1] + d3*c12[1]) / det,
-    (d1*c23[2] + d2*c31[2] + d3*c12[2]) / det,
-  ];
-}
-
-/**
- * Compute the analytical boundary loop for a planar face.
- *
- * For each pair of planar neighbours (j, k) that are BOTH adjacent to face i
- * AND adjacent to each other, the three planes (i, j, k) share exactly one
- * corner point. Collecting all such corners and sorting them by azimuth
- * around the face normal yields the correct boundary polygon.
- *
- * This completely bypasses mesh edge topology so the resulting face extent is
- * defined by the intersection of analytical surfaces, not by triangulation
- * artefacts.
- *
- * @param {number}   gi         group index of the planar face
- * @param {object[]} groups     all groups with fitted surfaces
- * @param {Map}      adjacency  output of buildGroupAdjacencyMap()
- * @returns {Array<[number,number,number]>|null}  ordered corners, or null
- */
-function _analyticalPlaneBoundary(gi, groups, adjacency) {
-  const { params: pi } = groups[gi].surface;
-  const ni = pi.normal, oi = pi.origin;
-
-  // Only planar neighbours can contribute straight-line boundaries.
-  const planeNeighbors = [...(adjacency.get(gi) ?? [])]
-    .filter(j => groups[j].surface?.type === 'plane');
-
-  if (planeNeighbors.length < 3) return null;
-
-  const rawCorners = [];
-
-  for (let a = 0; a < planeNeighbors.length; a++) {
-    for (let b = a + 1; b < planeNeighbors.length; b++) {
-      const j = planeNeighbors[a];
-      const k = planeNeighbors[b];
-      // j and k must be directly adjacent to each other to form a corner
-      if (!adjacency.get(j)?.has(k)) continue;
-      const pj = groups[j].surface.params;
-      const pk = groups[k].surface.params;
-      const pt = _intersect3Planes(ni, oi, pj.normal, pj.origin, pk.normal, pk.origin);
-      if (pt) rawCorners.push(pt);
-    }
-  }
-
-  if (rawCorners.length < 3) return null;
-
-  // Deduplicate numerically coincident corners
-  const CTOL2 = 1e-8; // squared distance threshold
-  const corners = [];
-  for (const pt of rawCorners) {
-    if (!corners.some(c => {
-      const dx=pt[0]-c[0], dy=pt[1]-c[1], dz=pt[2]-c[2];
-      return dx*dx+dy*dy+dz*dz < CTOL2;
-    })) corners.push(pt);
-  }
-
-  if (corners.length < 3) return null;
-
-  // Sort corners by azimuth angle around the face normal so the polygon is
-  // wound consistently (required by OCCT's wire builder).
-  const cx = corners.reduce((s, p) => s + p[0], 0) / corners.length;
-  const cy = corners.reduce((s, p) => s + p[1], 0) / corners.length;
-  const cz = corners.reduce((s, p) => s + p[2], 0) / corners.length;
-  const nu = _u3(ni);
-  // Local X axis: pick a reference direction perpendicular to the face normal
-  const ref = Math.abs(nu[2]) < 0.9 ? [0, 0, 1] : [1, 0, 0];
-  const lx = _u3(_x3(nu, ref));
-  const ly = _x3(nu, lx); // second in-plane axis (nu × lx)
-
-  corners.sort((a, b) => {
-    const [dax, day, daz] = [a[0]-cx, a[1]-cy, a[2]-cz];
-    const [dbx, dby, dbz] = [b[0]-cx, b[1]-cy, b[2]-cz];
-    return Math.atan2(_d3([dax,day,daz], ly), _d3([dax,day,daz], lx))
-         - Math.atan2(_d3([dbx,dby,dbz], ly), _d3([dbx,dby,dbz], lx));
-  });
-
-  return corners;
-}
-
-// ── Analytical cylinder boundary helpers ─────────────────────────────────────
-
-/**
- * Compute the cylinder's axial V extents analytically by projecting each
- * adjacent planar group's origin onto the cylinder axis.
- *
- * This replaces mesh-topology V computation so that the cylinder face ends
- * exactly where neighbouring flat faces lie — making BRepBuilderAPI_Sewing
- * able to stitch the cylinder to those planes.
- *
- * @param {number}   gi         group index of the cylinder
- * @param {object[]} groups     all groups
- * @param {Map}      adjacency
- * @param {number[]} axisPoint  [x,y,z] point on the cylinder axis
- * @param {number[]} axis       unit vector along the axis
- * @returns {{ vmin: number, vmax: number } | null}
- */
-function _cylinderVExtentsFromNeighbors(gi, groups, adjacency, axisPoint, axis) {
-  const ax = _u3(axis);
-  const vs = [];
-  for (const j of adjacency.get(gi) ?? []) {
-    const s = groups[j]?.surface;
-    if (!s) continue;
-    if (s.type === 'plane') {
-      // Find where the cylinder/cone axis pierces this plane.
-      // This is the V value at which the analytical cap circle sits, so using
-      // it here ensures the cylinder face circles align exactly with the cap.
-      //   axis · (axisPoint + t*ax - planeOrigin) · n = 0
-      //   t = (planeOrigin - axisPoint) · n / (ax · n)
-      const n = _u3(s.params.normal);
-      const denom = ax[0]*n[0] + ax[1]*n[1] + ax[2]*n[2];
-      if (Math.abs(denom) < 1e-6) continue; // axis parallel to plane → not a cap
-      const o = s.params.origin;
-      const t = ((o[0]-axisPoint[0])*n[0] +
-                 (o[1]-axisPoint[1])*n[1] +
-                 (o[2]-axisPoint[2])*n[2]) / denom;
-      vs.push(t);
-    } else if (s.type === 'cylinder') {
-      // Co-axial cylinder neighbour: project its axis-point for approximate bound
-      const refPt = s.params.axisPoint;
-      vs.push(
-        (refPt[0] - axisPoint[0]) * ax[0] +
-        (refPt[1] - axisPoint[1]) * ax[1] +
-        (refPt[2] - axisPoint[2]) * ax[2],
-      );
-    }
-  }
-  if (vs.length < 1) return null;
-  return { vmin: Math.min(...vs), vmax: Math.max(...vs) };
-}
-
-/**
  * Scan all triangle vertices in a group to find the axial V extent.
- * Used as a last-resort fallback when no planar neighbours are available.
- * Unlike extractBoundaryLoop, this uses only vertex positions (no edge topology).
+ * Projects vertices onto the surface axis to find the parameter range.
  */
 function _cylinderVExtentsFromVertices(group, geometry, axisPoint, axis) {
   const ax  = _u3(axis);
@@ -360,8 +212,6 @@ function _cylinderVExtentsFromVertices(group, geometry, axisPoint, axis) {
 
 /**
  * Scan all triangle vertices in a sphere group to find the latitude (V) extent.
- * Latitude is measured from the Z-up frame centred at the sphere's centre,
- * matching the gp_Ax3 used in _buildSphereFace.
  */
 function _sphereVExtentsFromVertices(group, geometry, center, radius) {
   const pos  = geometry.attributes.position;
@@ -403,35 +253,42 @@ export function computeAnalyticalBoundaries(groups, geometry) {
     const { type, params } = g.surface;
 
     if (type === 'plane') {
-      const loop = _analyticalPlaneBoundary(gi, groups, adjacency);
-      if (loop) boundaries.set(gi, { type: 'plane', loop });
-    } else if (type === 'cylinder') {
-      const vr = _cylinderVExtentsFromNeighbors(gi, groups, adjacency,
-        params.axisPoint, params.axis);
-      boundaries.set(gi, {
-        type: 'cylinder',
-        vmin: vr?.vmin ?? null,
-        vmax: vr?.vmax ?? null,
-      });
-    } else if (type === 'cone') {
-      const { apex, axis } = params;
-      const ax = _u3(axis);
-      let vmin = Infinity, vmax = -Infinity;
-      for (const j of adjacency.get(gi) ?? []) {
-        const s = groups[j]?.surface;
-        if (!s) continue;
-        let refPt = null;
-        if (s.type === 'plane') refPt = s.params.origin;
-        if (!refPt) continue;
-        const v = (refPt[0]-apex[0])*ax[0] + (refPt[1]-apex[1])*ax[1] + (refPt[2]-apex[2])*ax[2];
-        if (v < vmin) vmin = v;
-        if (v > vmax) vmax = v;
+      // For viewport preview: compute a bounding rectangle in the plane's local frame
+      // using mesh vertices. The boundary shown in the preview is approximate.
+      const nu = _u3(params.normal);
+      const ref = Math.abs(nu[2]) < 0.9 ? [0, 0, 1] : [1, 0, 0];
+      const xA = _u3(_x3(nu, ref));
+      const yA = _x3(nu, xA);
+      const pos = geometry.attributes.position;
+      let umin = Infinity, umax = -Infinity, vmin = Infinity, vmax = -Infinity;
+      for (const t of g.triangleIndices) {
+        for (let j = 0; j < 3; j++) {
+          const i = t * 3 + j;
+          const dx = pos.getX(i) - params.origin[0];
+          const dy = pos.getY(i) - params.origin[1];
+          const dz = pos.getZ(i) - params.origin[2];
+          const u = dx*xA[0] + dy*xA[1] + dz*xA[2];
+          const v = dx*yA[0] + dy*yA[1] + dz*yA[2];
+          if (u < umin) umin = u; if (u > umax) umax = u;
+          if (v < vmin) vmin = v; if (v > vmax) vmax = v;
+        }
       }
-      boundaries.set(gi, {
-        type: 'cone',
-        vmin: isFinite(vmin) ? vmin : null,
-        vmax: isFinite(vmax) ? vmax : null,
-      });
+      if (isFinite(umin)) {
+        const o = params.origin;
+        const loop = [
+          [o[0]+umin*xA[0]+vmin*yA[0], o[1]+umin*xA[1]+vmin*yA[1], o[2]+umin*xA[2]+vmin*yA[2]],
+          [o[0]+umax*xA[0]+vmin*yA[0], o[1]+umax*xA[1]+vmin*yA[1], o[2]+umax*xA[2]+vmin*yA[2]],
+          [o[0]+umax*xA[0]+vmax*yA[0], o[1]+umax*xA[1]+vmax*yA[1], o[2]+umax*xA[2]+vmax*yA[2]],
+          [o[0]+umin*xA[0]+vmax*yA[0], o[1]+umin*xA[1]+vmax*yA[1], o[2]+umin*xA[2]+vmax*yA[2]],
+        ];
+        boundaries.set(gi, { type: 'plane', loop });
+      }
+    } else if (type === 'cylinder') {
+      const vr = _cylinderVExtentsFromVertices(g, geometry, params.axisPoint, params.axis);
+      boundaries.set(gi, { type: 'cylinder', vmin: vr?.vmin ?? null, vmax: vr?.vmax ?? null });
+    } else if (type === 'cone') {
+      const vr = _cylinderVExtentsFromVertices(g, geometry, params.apex, params.axis);
+      boundaries.set(gi, { type: 'cone', vmin: vr?.vmin ?? null, vmax: vr?.vmax ?? null });
     } else if (type === 'sphere') {
       boundaries.set(gi, { type: 'sphere' });
     }
@@ -440,62 +297,11 @@ export function computeAnalyticalBoundaries(groups, geometry) {
   return { adjacency, boundaries };
 }
 
-
-
-/**
- * Remove collinear intermediate vertices from a closed 3-D polygon loop.
- *
- * A vertex is considered collinear (and removed) when the sine of the turn
- * angle between the incoming and outgoing edge is below `angleTol`.  Multiple
- * passes are made until the loop is stable.  Returns the original loop if the
- * reduced version would have fewer than 3 vertices.
- *
- * @param {Array<[number,number,number]>} loop
- * @param {number} [angleTol=1e-4]  sine-of-angle threshold
- * @returns {Array<[number,number,number]>}
- */
-function simplifyLoop(loop, angleTol = 1e-4) {
-  if (loop.length <= 3) return loop;
-  let pts = loop.slice();
-  let changed = true;
-  while (changed && pts.length > 3) {
-    changed = false;
-    const next = [];
-    const n = pts.length;
-    for (let i = 0; i < n; i++) {
-      const prev = pts[(i + n - 1) % n];
-      const curr = pts[i];
-      const nxt  = pts[(i + 1) % n];
-      const d1x = curr[0]-prev[0], d1y = curr[1]-prev[1], d1z = curr[2]-prev[2];
-      const d2x = nxt[0]-curr[0],  d2y = nxt[1]-curr[1],  d2z = nxt[2]-curr[2];
-      const l1 = Math.sqrt(d1x*d1x+d1y*d1y+d1z*d1z);
-      const l2 = Math.sqrt(d2x*d2x+d2y*d2y+d2z*d2z);
-      if (l1 < 1e-14 || l2 < 1e-14) { next.push(curr); continue; }
-      // |cross(d1,d2)| / (|d1|*|d2|) = sin of turn angle
-      const cx = d1y*d2z-d1z*d2y, cy = d1z*d2x-d1x*d2z, cz = d1x*d2y-d1y*d2x;
-      const sinA = Math.sqrt(cx*cx+cy*cy+cz*cz) / (l1*l2);
-      if (sinA > angleTol) {
-        next.push(curr);
-      } else {
-        changed = true; // drop this collinear vertex
-      }
-    }
-    if (next.length < 3) return pts; // safety: don't over-reduce
-    pts = next;
-  }
-  return pts;
-}
-
 // ── Wire builder ─────────────────────────────────────────────────────────────
 
 /**
  * Build an OCCT wire from an ordered list of 3D points (linear edges).
  * Skips zero-length edges.  Returns null if the wire cannot be built.
- *
- * @param {object} oc       OCCT module
- * @param {Array}  loop     [[x,y,z], …]
- * @param {object[]} toDelete  objects that need .delete() later
- * @returns {object|null}   TopoDS_Wire or null
  */
 function buildWire(oc, loop, toDelete) {
   if (!loop || loop.length < 3) return null;
@@ -507,15 +313,14 @@ function buildWire(oc, loop, toDelete) {
   for (let i = 0; i < loop.length; i++) {
     const a = loop[i], b = loop[(i + 1) % loop.length];
     const dx=b[0]-a[0], dy=b[1]-a[1], dz=b[2]-a[2];
-    if (dx*dx+dy*dy+dz*dz < 1e-20) continue; // skip zero-length
+    if (dx*dx+dy*dy+dz*dz < 1e-20) continue;
 
     const pa = makePnt(oc, a); toDelete.push(pa);
     const pb = makePnt(oc, b); toDelete.push(pb);
     const edgeMaker = new oc.BRepBuilderAPI_MakeEdge_3(pa, pb);
     toDelete.push(edgeMaker);
     if (!edgeMaker.IsDone()) continue;
-    const edge = edgeMaker.Edge();
-    wireMaker.Add_1(edge);
+    wireMaker.Add_1(edgeMaker.Edge());
     edgeCount++;
   }
 
@@ -524,512 +329,233 @@ function buildWire(oc, loop, toDelete) {
 }
 
 // ── Face builder ─────────────────────────────────────────────────────────────
+//
+// Architecture: two-phase build.
+//
+//  Phase 1 — _buildLargePatch(oc, group, geometry, toDelete)
+//    Every surface type is treated identically: project mesh vertices into
+//    the surface's natural UV space, compute a bounding extent with margin,
+//    and call BRepBuilderAPI_MakeFace_X(surface, umin, umax, vmin, vmax).
+//    No intersection computation, no adjacency lookup, no type enumeration.
+//    For planes a rectangular wire face is used (same idea, different API).
+//
+//  Phase 2 — _buildSectionBoundedPlaneFace(oc, …, patches)
+//    For each planar face, replace its coarse rectangular patch with a face
+//    whose boundary is derived from the EXACT intersection with every adjacent
+//    surface patch.  A single OCCT kernel call — BRepAlgoAPI_Section — handles
+//    every surface-type pair (plane/cylinder, plane/cone, plane/sphere,
+//    plane/plane, …) without any JS-level special-casing.  The returned edges
+//    already carry PCurves on both surfaces; collecting them into a wire and
+//    calling MakeFace_16(gp_Pln, wire, true) gives the precisely trimmed face.
+//
+//  Curved surfaces (cylinder, cone, sphere) use the large-patch faces directly.
+//  BRepBuilderAPI_Sewing in buildAndExportSTEP then matches the UV-boundary
+//  circles of the curved patches to the analytically exact edges of the planar
+//  faces, stitching them into a manifold shell without any JS-written geometry.
 
 /**
- * Build a single OCCT face from a classified face group.
+ * Build a large analytical patch face for any surface type.
+ * UV extents come from mesh vertices plus a generous margin — no intersection
+ * computation, no adjacent-surface enumeration.
  *
- * All boundaries are derived purely from the analytical surface parameters —
- * no mesh edge topology is used at this stage.  If the analytical geometry is
- * insufficient to build a face, the face is skipped (returns null) rather than
- * falling back to mesh-polygon approximations.  Mixing analytical circles with
- * mesh-polygon approximations during sewing would cause OCCT to split the
- * analytical circle edges into hundreds of tiny edgelets to match the polygon
- * vertices — exactly the artefact this architecture is designed to prevent.
- *
- * @param {object} oc
- * @param {object} group          { triangleIndices, surface: {type, params} }
- * @param {THREE.BufferGeometry} geometry
+ * @param {object}   oc
+ * @param {object}   group    { triangleIndices, surface: {type, params} }
+ * @param {object}   geometry THREE.BufferGeometry
  * @param {object[]} toDelete
- * @param {number}   [groupIdx]   index of this group in allGroups
- * @param {object[]} [allGroups]  all groups (needed for analytical boundary)
- * @param {Map}      [adjacency]  output of buildGroupAdjacencyMap()
  * @returns {object|null}  TopoDS_Face or null
  */
-function buildFace(oc, group, geometry, toDelete, groupIdx, allGroups, adjacency) {
+function _buildLargePatch(oc, group, geometry, toDelete) {
   const { type, params } = group.surface;
 
-  // ── Planar faces ────────────────────────────────────────────────────────────
-  if (type === 'plane') {
-    if (allGroups && adjacency) {
-      // Priority 1: Planar face adjacent to a curved surface → the shared
-      // boundary is an analytic circle/ellipse computed by IntAna_QuadQuadGeo.
-      for (const j of adjacency.get(groupIdx) ?? []) {
-        const s = allGroups[j]?.surface;
-        if (!s || !['cylinder', 'cone', 'sphere'].includes(s.type)) continue;
-        const face = _buildAnalyticalCapFace(oc, params, s, toDelete);
-        if (face) return face;
+  try {
+    if (type === 'plane') {
+      const { origin, normal } = params;
+      const nu = _u3(normal);
+      const pln = new oc.gp_Pln_3(makePnt(oc, origin), makeDir(oc, nu));
+      toDelete.push(pln);
+
+      // Local frame for projecting vertices — consistent JS frame, doesn't need
+      // to match OCCT's internal UV axes because we build a 3D wire, not UV bounds.
+      const ref = Math.abs(nu[2]) < 0.9 ? [0, 0, 1] : [1, 0, 0];
+      const xA = _u3(_x3(nu, ref));
+      const yA = _x3(nu, xA);
+
+      const pos = geometry.attributes.position;
+      let umin = Infinity, umax = -Infinity, vmin = Infinity, vmax = -Infinity;
+      for (const t of group.triangleIndices) {
+        for (let j = 0; j < 3; j++) {
+          const i = t * 3 + j;
+          const dx = pos.getX(i) - origin[0];
+          const dy = pos.getY(i) - origin[1];
+          const dz = pos.getZ(i) - origin[2];
+          const u = dx*xA[0] + dy*xA[1] + dz*xA[2];
+          const v = dx*yA[0] + dy*yA[1] + dz*yA[2];
+          if (u < umin) umin = u; if (u > umax) umax = u;
+          if (v < vmin) vmin = v; if (v > vmax) vmax = v;
+        }
       }
+      if (!isFinite(umin)) return null;
+      const m = Math.max(umax - umin, vmax - vmin) * 0.25 + 1e-2;
+      umin -= m; umax += m; vmin -= m; vmax += m;
 
-      // Priority 2: Planar face bounded only by other planes →
-      // corners from 3-plane intersections, sorted by azimuth.
-      const analyticalLoop = _analyticalPlaneBoundary(groupIdx, allGroups, adjacency);
-      if (analyticalLoop) {
-        return _buildPlaneFace(oc, params, analyticalLoop, toDelete);
-      }
+      const corners = [
+        [origin[0]+umin*xA[0]+vmin*yA[0], origin[1]+umin*xA[1]+vmin*yA[1], origin[2]+umin*xA[2]+vmin*yA[2]],
+        [origin[0]+umax*xA[0]+vmin*yA[0], origin[1]+umax*xA[1]+vmin*yA[1], origin[2]+umax*xA[2]+vmin*yA[2]],
+        [origin[0]+umax*xA[0]+vmax*yA[0], origin[1]+umax*xA[1]+vmax*yA[1], origin[2]+umax*xA[2]+vmax*yA[2]],
+        [origin[0]+umin*xA[0]+vmax*yA[0], origin[1]+umin*xA[1]+vmax*yA[1], origin[2]+umin*xA[2]+vmax*yA[2]],
+      ];
+      const wire = buildWire(oc, corners, toDelete);
+      if (!wire) return null;
+      const mf = new oc.BRepBuilderAPI_MakeFace_16(pln, wire, true);
+      toDelete.push(mf);
+      return mf.IsDone() ? mf.Face() : null;
     }
-    // Cannot build this planar face analytically — skip rather than use mesh.
-    return null;
-  }
 
-  // ── Cylinder face ───────────────────────────────────────────────────────────
-  if (type === 'cylinder') {
-    const { axisPoint, axis } = params;
-    let vRange = null;
-    if (allGroups && adjacency) {
-      vRange = _cylinderVExtentsFromNeighbors(groupIdx, allGroups, adjacency, axisPoint, axis);
-    }
-    // Fallback: scan own triangle vertices — pure geometry, no edge topology
-    if (!vRange || vRange.vmax - vRange.vmin < 1e-10) {
-      vRange = _cylinderVExtentsFromVertices(group, geometry, axisPoint, axis);
-    }
-    return _buildCylinderFace(oc, params, toDelete, vRange);
-  }
-
-  // ── Cone face ───────────────────────────────────────────────────────────────
-  if (type === 'cone') {
-    const { apex, axis } = params;
-    let vRange = null;
-    if (allGroups && adjacency) {
-      vRange = _cylinderVExtentsFromNeighbors(groupIdx, allGroups, adjacency, apex, axis);
-    }
-    if (!vRange || vRange.vmax - vRange.vmin < 1e-10) {
-      vRange = _cylinderVExtentsFromVertices(group, geometry, apex, axis);
-    }
-    return _buildConeFace(oc, params, toDelete, vRange);
-  }
-
-  // ── Sphere face ─────────────────────────────────────────────────────────────
-  if (type === 'sphere') {
-    const vRange = _sphereVExtentsFromVertices(group, geometry, params.center, params.radius);
-    return _buildSphereFace(oc, params, toDelete, vRange);
-  }
-
-  return null; // NURBS and unknown types: no analytical face
-}
-
-function _buildPlaneFace(oc, params, loop, toDelete) {
-  const { origin, normal } = params;
-  const pln = new oc.gp_Pln_3(makePnt(oc, origin), makeDir(oc, normal));
-  toDelete.push(pln);
-
-  const wire = buildWire(oc, loop, toDelete);
-  if (!wire) return null;
-
-  try {
-    const mf = new oc.BRepBuilderAPI_MakeFace_16(pln, wire, true);
-    toDelete.push(mf);
-    if (!mf.IsDone()) return null;
-    return mf.Face();
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Build a circular (disk) planar face bounded by a single full-circle edge.
- * Used for cylinder/cone end caps where the boundary between the flat face
- * and the curved surface is an analytic circle, not a polygon.
- *
- * @param {object}   oc
- * @param {object}   planeParams  { origin, normal }
- * @param {number[]} circCenter   [x,y,z] circle centre (already on the plane)
- * @param {number}   radius
- * @param {object[]} toDelete
- * @returns {object|null}  TopoDS_Face or null
- */
-function _buildCircularPlaneFace(oc, planeParams, circCenter, radius, toDelete) {
-  try {
-    const { origin, normal } = planeParams;
-    // gp_Ax2_3(P, N): Z axis of the frame = circle normal = plane normal.
-    // The circle will be wound right-hand relative to N.
-    const ax2 = new oc.gp_Ax2_3(makePnt(oc, circCenter), makeDir(oc, normal));
-    toDelete.push(ax2);
-    const circ = new oc.gp_Circ_2(ax2, radius);
-    toDelete.push(circ);
-
-    // BRepBuilderAPI_MakeEdge_8(gp_Circ) → full circle edge
-    const edgeMaker = new oc.BRepBuilderAPI_MakeEdge_8(circ);
-    toDelete.push(edgeMaker);
-    if (!edgeMaker.IsDone()) {
-      console.warn('[brepBuilder] circular cap: MakeEdge_8 !IsDone()');
-      return null;
-    }
-    const edge = edgeMaker.Edge();
-
-    // BRepBuilderAPI_MakeWire_2(TopoDS_Edge) → single-edge wire
-    const wireMaker = new oc.BRepBuilderAPI_MakeWire_2(edge);
-    toDelete.push(wireMaker);
-    if (!wireMaker.IsDone()) {
-      console.warn('[brepBuilder] circular cap: MakeWire_2 !IsDone()');
-      return null;
-    }
-    const wire = wireMaker.Wire();
-
-    const pln = new oc.gp_Pln_3(makePnt(oc, origin), makeDir(oc, normal));
-    toDelete.push(pln);
-    const mf = new oc.BRepBuilderAPI_MakeFace_16(pln, wire, true);
-    toDelete.push(mf);
-    if (!mf.IsDone()) {
-      console.warn('[brepBuilder] circular cap: MakeFace_16 !IsDone()');
-      return null;
-    }
-    return mf.Face();
-  } catch (e) {
-    console.warn('[brepBuilder] circular cap: exception in _buildCircularPlaneFace', e);
-    return null;
-  }
-}
-
-/**
- * Build a planar face whose boundary is a full ellipse.
- * Used for oblique (tilted) caps of cylinders/cones where the plane-surface
- * intersection is an ellipse, not a circle.
- *
- * @param {object}   oc
- * @param {object}   planeParams  { origin, normal }
- * @param {number[]} center       [x,y,z] ellipse centre (on the plane)
- * @param {number}   semiMajor    major semi-axis length (≥ semiMinor)
- * @param {number}   semiMinor    minor semi-axis length
- * @param {number[]} majorDir     unit vector of the major axis (lies in the plane)
- * @param {object[]} toDelete
- * @returns {object|null}  TopoDS_Face or null
- */
-function _buildEllipticalPlaneFace(oc, planeParams, center, semiMajor, semiMinor, majorDir, toDelete) {
-  try {
-    const { origin, normal } = planeParams;
-    // gp_Ax2_2(P, N, Vx): Z = plane normal (ellipse normal), X = major-axis direction.
-    // In opencascade.js@1.1.4 the constructor index ordering is:
-    //   gp_Ax2_1() default, gp_Ax2_2(P,N,Vx) 3-arg, gp_Ax2_3(P,N) 2-arg.
-    const ax2 = new oc.gp_Ax2_2(
-      makePnt(oc, center),
-      makeDir(oc, normal),
-      makeDir(oc, majorDir),
-    );
-    toDelete.push(ax2);
-    // gp_Elips_2(ax2, majorRadius, minorRadius) — full ellipse
-    const elips = new oc.gp_Elips_2(ax2, semiMajor, semiMinor);
-    toDelete.push(elips);
-    // BRepBuilderAPI_MakeEdge_12(gp_Elips) → full ellipse edge
-    const edgeMaker = new oc.BRepBuilderAPI_MakeEdge_12(elips);
-    toDelete.push(edgeMaker);
-    if (!edgeMaker.IsDone()) {
-      console.warn('[brepBuilder] elliptical cap: MakeEdge_12 !IsDone()');
-      return null;
-    }
-    const wireMaker = new oc.BRepBuilderAPI_MakeWire_2(edgeMaker.Edge());
-    toDelete.push(wireMaker);
-    if (!wireMaker.IsDone()) {
-      console.warn('[brepBuilder] elliptical cap: MakeWire_2 !IsDone()');
-      return null;
-    }
-    const pln = new oc.gp_Pln_3(makePnt(oc, origin), makeDir(oc, normal));
-    toDelete.push(pln);
-    const mf = new oc.BRepBuilderAPI_MakeFace_16(pln, wireMaker.Wire(), true);
-    toDelete.push(mf);
-    if (!mf.IsDone()) {
-      console.warn('[brepBuilder] elliptical cap: MakeFace_16 !IsDone()');
-      return null;
-    }
-    return mf.Face();
-  } catch (e) {
-    console.warn('[brepBuilder] elliptical cap: exception in _buildEllipticalPlaneFace', e?.message ?? e);
-    return null;
-  }
-}
-
-/**
- * Build a planar cap face whose boundary is the exact analytical intersection
- * circle (or ellipse) between the plane and the adjacent curved surface,
- * computed by IntAna_QuadQuadGeo — OCCT's purpose-built quadric intersection
- * package.  All three types are bound in opencascade.js@1.1.4:
- *
- *   cylinder → IntAna_QuadQuadGeo_4(gp_Pln, gp_Cylinder, tolAng, tol)
- *   cone     → IntAna_QuadQuadGeo_5(gp_Pln, gp_Cone,     tolAng, tol)
- *   sphere   → IntAna_QuadQuadGeo_3(gp_Pln, gp_Sphere)
- *
- * IntAna returns the intersection as a gp_Circ / gp_Elips which becomes a
- * single analytic edge → wire → face.
- *
- * OCCT 7.4 IntAna_ResultType integer values (sequential from 0):
- *   IntAna_Same=0, IntAna_Point=1, IntAna_Line=2, IntAna_Circle=3,
- *   IntAna_PointAndCircle=4, IntAna_TwoCircles=5, IntAna_Ellipse=6, ...
- *
- * @param {object}   oc
- * @param {object}   planeParams  { origin, normal }
- * @param {object}   adjSurface   { type, params }  — the adjacent curved surface
- * @param {object[]} toDelete
- * @returns {object|null}  TopoDS_Face or null
- */
-function _buildAnalyticalCapFace(oc, planeParams, adjSurface, toDelete) {
-  const { origin, normal } = planeParams;
-  const n = _u3(normal);
-
-  // ── Strategy A: IntAna_QuadQuadGeo ──────────────────────────────────────────
-  // OCCT's purpose-built quadric intersection package gives the exact analytic
-  // circle/ellipse without any additional maths.  Try it first; fall through to
-  // Strategy B if the constructor is not bound in this build of opencascade.js.
-  try {
-    const pln = new oc.gp_Pln_3(makePnt(oc, origin), makeDir(oc, n));
-    toDelete.push(pln);
-
-    let inter = null;
-
-    if (adjSurface.type === 'cylinder') {
-      const { axisPoint, axis, radius } = adjSurface.params;
+    if (type === 'cylinder') {
+      const { axisPoint, axis, radius } = params;
+      const vr = _cylinderVExtentsFromVertices(group, geometry, axisPoint, axis);
+      if (!vr) return null;
       const ax3 = makeAx3(oc, axisPoint, axis);
       toDelete.push(ax3);
       const cyl = new oc.gp_Cylinder_2(ax3, radius);
       toDelete.push(cyl);
-      inter = new oc.IntAna_QuadQuadGeo_4(pln, cyl, 1e-7, 1e-7);
-      toDelete.push(inter);
+      const pad = (vr.vmax - vr.vmin) * 0.25 + 1e-2;
+      const mf = new oc.BRepBuilderAPI_MakeFace_10(cyl, 0.0, 2*Math.PI, vr.vmin - pad, vr.vmax + pad);
+      toDelete.push(mf);
+      return mf.IsDone() ? mf.Face() : null;
+    }
 
-    } else if (adjSurface.type === 'cone') {
-      const { apex, axis, halfAngle } = adjSurface.params;
+    if (type === 'cone') {
+      const { apex, axis, halfAngle } = params;
+      const vr = _cylinderVExtentsFromVertices(group, geometry, apex, axis);
+      if (!vr || vr.vmin < -1e-6) return null;
       const ax3 = makeAx3(oc, apex, axis);
       toDelete.push(ax3);
       const cone = new oc.gp_Cone_2(ax3, halfAngle, 0.0);
       toDelete.push(cone);
-      inter = new oc.IntAna_QuadQuadGeo_5(pln, cone, 1e-7, 1e-7);
-      toDelete.push(inter);
+      const pad = (vr.vmax - vr.vmin) * 0.25 + 1e-2;
+      const mf = new oc.BRepBuilderAPI_MakeFace_11(cone, 0.0, 2*Math.PI, Math.max(0, vr.vmin - pad), vr.vmax + pad);
+      toDelete.push(mf);
+      return mf.IsDone() ? mf.Face() : null;
+    }
 
-    } else if (adjSurface.type === 'sphere') {
-      const { center, radius } = adjSurface.params;
-      const ax3 = makeAx3(oc, center, [0, 0, 1]);
+    if (type === 'sphere') {
+      const { center, radius } = params;
+      const vr = _sphereVExtentsFromVertices(group, geometry, center, radius);
+      if (!vr) return null;
+      const ax3 = new oc.gp_Ax3_4(makePnt(oc, center), makeDir(oc, [0, 0, 1]));
       toDelete.push(ax3);
       const sph = new oc.gp_Sphere_2(ax3, radius);
       toDelete.push(sph);
-      inter = new oc.IntAna_QuadQuadGeo_3(pln, sph);
-      toDelete.push(inter);
-    }
-
-    if (inter && inter.IsDone() && inter.NbSolutions() >= 1) {
-      // IntAna_ResultType sequential enum values in OCCT 7.4:
-      //   IntAna_Circle = 3, IntAna_Ellipse = 6
-      const T_CIRCLE  = oc.IntAna_ResultType?.IntAna_Circle  ?? 3;
-      const T_ELLIPSE = oc.IntAna_ResultType?.IntAna_Ellipse ?? 6;
-      const typeInter = inter.TypeInter();
-
-      let edgeMaker;
-      if (typeInter === T_CIRCLE) {
-        const circ = inter.Circle(1);
-        toDelete.push(circ);
-        edgeMaker = new oc.BRepBuilderAPI_MakeEdge_8(circ);
-      } else if (typeInter === T_ELLIPSE) {
-        const elips = inter.Ellipse(1);
-        toDelete.push(elips);
-        edgeMaker = new oc.BRepBuilderAPI_MakeEdge_12(elips);
-      } else {
-        console.warn('[brepBuilder] IntAna cap: unexpected intersection type', typeInter,
-                     '(expected', T_CIRCLE, 'or', T_ELLIPSE, ') — will use gp_Circ fallback');
-      }
-
-      if (edgeMaker) {
-        toDelete.push(edgeMaker);
-        if (edgeMaker.IsDone()) {
-          const wireMaker = new oc.BRepBuilderAPI_MakeWire_2(edgeMaker.Edge());
-          toDelete.push(wireMaker);
-          if (wireMaker.IsDone()) {
-            const mf = new oc.BRepBuilderAPI_MakeFace_16(pln, wireMaker.Wire(), true);
-            toDelete.push(mf);
-            if (mf.IsDone()) return mf.Face();
-            console.warn('[brepBuilder] IntAna cap: MakeFace_16 !IsDone()');
-          } else {
-            console.warn('[brepBuilder] IntAna cap: MakeWire_2 !IsDone()');
-          }
-        } else {
-          console.warn('[brepBuilder] IntAna cap: MakeEdge !IsDone(), typeInter=', typeInter);
-        }
-      }
-    }
-  } catch (e) {
-    console.warn('[brepBuilder] IntAna cap: exception — falling back to gp_Circ', e?.message ?? e);
-  }
-
-  // ── Strategy B: construct gp_Circ / gp_Elips directly from surface parameters ─
-  // Used when IntAna_QuadQuadGeo is not available in this opencascade.js build.
-  //
-  // Cylinder oblique cross-section:
-  //   A plane with normal n cutting a cylinder of radius r whose axis direction
-  //   is aHat produces an *ellipse* in general.  The ellipse parameters are:
-  //     • Centre   = intersection of the cylinder axis line with the cap plane
-  //     • Semi-minor = r  (transverse to both axis and plane-normal)
-  //     • Semi-major = r / |dot(aHat, n)|  (along the axis projected onto the plane)
-  //   When |dot(aHat, n)| ≈ 1 (perpendicular cap) this reduces to a circle.
-  //
-  // Cone oblique cross-section:
-  //   Perpendicular (circle) case handled; tilted case deferred to IntAna (Strategy A).
-  //   For a tilted cone cut the ellipse centre does not lie on the axis-plane
-  //   intersection, requiring a full conic-section solve that IntAna already does.
-  //
-  // Sphere:
-  //   Any plane-sphere intersection is always a circle regardless of tilt.
-  try {
-    if (adjSurface.type === 'cylinder') {
-      const { axisPoint, axis, radius } = adjSurface.params;
-      const aHat  = _u3(axis);
-      // cosAlpha = |dot(aHat, nHat)| — cos of angle between axis and plane normal.
-      // denom carries the sign so we can determine which side t falls on.
-      const denom = _d3(n, aHat);
-      if (Math.abs(denom) < 1e-10) return null; // axis parallel to plane → no finite cap
-      const t = _d3(n, [origin[0]-axisPoint[0], origin[1]-axisPoint[1], origin[2]-axisPoint[2]]) / denom;
-      const center = [axisPoint[0]+t*aHat[0], axisPoint[1]+t*aHat[1], axisPoint[2]+t*aHat[2]];
-      const cosAlpha = Math.abs(denom); // both vectors are unit — |dot| = cos of angle
-
-      if (cosAlpha > 1 - 1e-4) {
-        // Perpendicular cap (or within 0.01°): circle
-        return _buildCircularPlaneFace(oc, planeParams, center, radius, toDelete);
-      }
-      // Oblique cap: ellipse.
-      // Major axis direction = component of the cylinder axis projected onto the cap
-      // plane (i.e. strip out the normal component), then normalised.
-      const axInPlane = _u3([aHat[0]-denom*n[0], aHat[1]-denom*n[1], aHat[2]-denom*n[2]]);
-      return _buildEllipticalPlaneFace(
-        oc, planeParams, center, radius / cosAlpha, radius, axInPlane, toDelete,
+      const pad = Math.max((vr.vmax - vr.vmin) * 0.25 + 1e-2, 0);
+      const mf = new oc.BRepBuilderAPI_MakeFace_12(
+        sph, 0.0, 2*Math.PI,
+        Math.max(-Math.PI/2, vr.vmin - pad),
+        Math.min( Math.PI/2, vr.vmax + pad),
       );
+      toDelete.push(mf);
+      return mf.IsDone() ? mf.Face() : null;
+    }
 
-    } else if (adjSurface.type === 'cone') {
-      const { apex, axis, halfAngle } = adjSurface.params;
-      const aHat  = _u3(axis);
-      const denom = _d3(n, aHat);
-      if (Math.abs(denom) < 1e-10) return null; // axis parallel to plane
-      const t = _d3(n, [origin[0]-apex[0], origin[1]-apex[1], origin[2]-apex[2]]) / denom;
-      if (t <= 0) return null; // wrong side of apex
-      const cosAlpha = Math.abs(denom);
-      if (cosAlpha <= 1 - 1e-4) {
-        // Tilted cone cap: the ellipse centre shifts off the axis-plane intersection
-        // and requires a full conic-section solve.  IntAna (Strategy A) handles this
-        // correctly; here we cannot recover without reinventing it, so return null.
-        return null;
+  } catch (e) {
+    console.warn('[brepBuilder] _buildLargePatch:', group.surface.type, e?.message ?? e);
+  }
+  return null;
+}
+
+/**
+ * Use BRepAlgoAPI_Section to find the intersection edges between two faces.
+ * The returned edges already carry PCurves on both surfaces — they can be fed
+ * directly into BRepBuilderAPI_MakeWire and used as face boundaries.
+ *
+ * BRepAlgoAPI_Section(S1, S2, PerformNow=true) takes two TopoDS_Shape values
+ * (no Handle<T>) and computes the section at construction time, avoiding the
+ * need to call Build() separately.
+ *
+ * @param {object}   oc
+ * @param {object}   shape1  TopoDS_Shape (first patch face)
+ * @param {object}   shape2  TopoDS_Shape (second patch face)
+ * @param {object[]} toDelete
+ * @returns {object[]}  array of TopoDS_Edge (may be empty on failure)
+ */
+function _getSectionEdges(oc, shape1, shape2, toDelete) {
+  // Try BRepAlgoAPI_Section constructor overloads until one works.
+  // opencascade.js@1.1.4 numbers constructors sequentially; the non-Handle
+  // (S1, S2, PerformNow) overload is typically _2 or _3.
+  const ctors = ['BRepAlgoAPI_Section_3', 'BRepAlgoAPI_Section_2', 'BRepAlgoAPI_Section_4'];
+  for (const ctorName of ctors) {
+    if (typeof oc[ctorName] !== 'function') continue;
+    try {
+      const section = new oc[ctorName](shape1, shape2, true);
+      toDelete.push(section);
+      if (!section.IsDone()) continue;
+
+      const result = section.Shape();
+      const edges  = [];
+      const EDGE_T  = oc.TopAbs_ShapeEnum?.TopAbs_EDGE  ?? 6;
+      const SHAPE_T = oc.TopAbs_ShapeEnum?.TopAbs_SHAPE ?? 8;
+      const exp = new oc.TopExp_Explorer_2(result, EDGE_T, SHAPE_T);
+      toDelete.push(exp);
+      while (exp.More()) {
+        // Downcast TopoDS_Shape → TopoDS_Edge
+        const shape = exp.Current();
+        try {
+          const edge = oc.TopoDS.Edge_1
+            ? oc.TopoDS.Edge_1(shape)
+            : shape; // fallback: pass shape directly
+          edges.push(edge);
+        } catch { edges.push(shape); }
+        exp.Next();
       }
-      // Perpendicular (or near-perpendicular) cone cap → circle
-      const center = [apex[0]+t*aHat[0], apex[1]+t*aHat[1], apex[2]+t*aHat[2]];
-      return _buildCircularPlaneFace(oc, planeParams, center, t * Math.tan(halfAngle), toDelete);
-
-    } else if (adjSurface.type === 'sphere') {
-      const { center, radius } = adjSurface.params;
-      // Plane-sphere intersection is always a circle regardless of tilt.
-      const d  = _d3(n, [center[0]-origin[0], center[1]-origin[1], center[2]-origin[2]]);
-      const r2 = radius * radius - d * d;
-      if (r2 <= 0) return null; // plane misses the sphere
-      const circCenter = [center[0]-d*n[0], center[1]-d*n[1], center[2]-d*n[2]];
-      return _buildCircularPlaneFace(oc, planeParams, circCenter, Math.sqrt(r2), toDelete);
+      return edges;
+    } catch (e) {
+      console.warn(`[brepBuilder] ${ctorName} failed:`, e?.message ?? e);
     }
-
-    return null;
-
-  } catch (e) {
-    console.warn('[brepBuilder] cap Strategy B: exception', e?.message ?? e);
-    return null;
   }
+  return [];
 }
 
-function _buildCylinderFace(oc, params, toDelete, neighborVRange) {
-  // Build an analytical cylindrical face using UV parameter bounds.
-  // BRepBuilderAPI_MakeFace_10(gp_Cylinder, UMin, UMax, VMin, VMax) creates a
-  // proper Geom_CylindricalSurface face without requiring PCurves, avoiding the
-  // null-PCurve crash that MakeFace_17 (cylinder + wire) triggers inside
-  // STEPControl_Writer when the wire edges are straight 3-D line segments.
-  const { axisPoint, axis, radius } = params;
-  try {
-    if (!neighborVRange || neighborVRange.vmax - neighborVRange.vmin < 1e-10) {
-      console.warn('[brepBuilder] cylinder: no usable V range', neighborVRange);
-      return null;
-    }
-    const { vmin, vmax } = neighborVRange;
+/**
+ * Build a planar face whose boundary is computed by intersecting the plane's
+ * large patch with the large patches of all adjacent surfaces.
+ *
+ * One BRepAlgoAPI_Section call per adjacent pair — the kernel handles every
+ * surface-type combination (plane/cylinder, plane/cone, plane/plane, …)
+ * without any JS-level geometry enumeration.
+ *
+ * Falls back to the large rectangular patch when Section returns no edges.
+ */
+function _buildSectionBoundedPlaneFace(oc, params, planePatch, groupIdx, allGroups, adjacency, patches, toDelete) {
+  const { origin, normal } = params;
+  const pln = new oc.gp_Pln_3(makePnt(oc, origin), makeDir(oc, _u3(normal)));
+  toDelete.push(pln);
 
-    const ax3 = makeAx3(oc, axisPoint, axis);
-    toDelete.push(ax3);
-    const cyl = new oc.gp_Cylinder_2(ax3, radius);
-    toDelete.push(cyl);
+  const wireMaker = new oc.BRepBuilderAPI_MakeWire_1();
+  toDelete.push(wireMaker);
+  let edgeCount = 0;
 
-    // U: full circle (0 … 2π) — correct for a complete cylindrical hole or boss.
-    // A small padding on V avoids degenerate edge artefacts at exact boundaries.
-    const pad = (vmax - vmin) * 1e-6;
-    const mf = new oc.BRepBuilderAPI_MakeFace_10(
-      cyl, 0.0, 2 * Math.PI, vmin - pad, vmax + pad,
-    );
-    toDelete.push(mf);
-    if (!mf.IsDone()) {
-      console.warn('[brepBuilder] cylinder: MakeFace_11 !IsDone()', { axisPoint, axis, radius, vmin, vmax });
-      return null;
+  for (const j of adjacency.get(groupIdx) ?? []) {
+    const adjPatch = patches.get(j);
+    if (!adjPatch) continue;
+    const sectionEdges = _getSectionEdges(oc, planePatch, adjPatch, toDelete);
+    for (const edge of sectionEdges) {
+      try { wireMaker.Add_1(edge); edgeCount++; } catch { /* skip bad edge */ }
     }
-    return mf.Face();
-  } catch (e) {
-    console.warn('[brepBuilder] cylinder: exception in _buildCylinderFace', e);
-    return null;
   }
-}
 
-function _buildConeFace(oc, params, toDelete, neighborVRange) {
-  // Build an analytical conical face using UV parameter bounds.
-  // BRepBuilderAPI_MakeFace_11(gp_Cone, UMin, UMax, VMin, VMax) avoids the
-  // null-PCurve crash that occurs when using a wire of straight 3-D edges.
-  const { apex, axis, halfAngle } = params;
-  try {
-    // V is the signed axial distance from the apex along the cone axis.
-    if (!neighborVRange || neighborVRange.vmax - neighborVRange.vmin < 1e-10 ||
-        neighborVRange.vmin < -1e-6) {
-      console.warn('[brepBuilder] cone: no usable V range or apex issue', neighborVRange);
-      return null;
+  if (edgeCount >= 3 && wireMaker.IsDone()) {
+    try {
+      const mf = new oc.BRepBuilderAPI_MakeFace_16(pln, wireMaker.Wire(), true);
+      toDelete.push(mf);
+      if (mf.IsDone()) return mf.Face();
+    } catch (e) {
+      console.warn('[brepBuilder] section-bounded plane: MakeFace_16 failed', e?.message ?? e);
     }
-    const { vmin, vmax } = neighborVRange;
-
-    const ax3 = makeAx3(oc, apex, axis);
-    toDelete.push(ax3);
-    // gp_Cone_2(Ax3, HalfAngle, RadiusAtOrigin): origin is at apex, radius=0 there.
-    const cone = new oc.gp_Cone_2(ax3, halfAngle, 0.0);
-    toDelete.push(cone);
-
-    const pad = (vmax - vmin) * 1e-6;
-    const mf = new oc.BRepBuilderAPI_MakeFace_11(
-      cone, 0.0, 2 * Math.PI, vmin - pad, vmax + pad,
-    );
-    toDelete.push(mf);
-    if (!mf.IsDone()) {
-      console.warn('[brepBuilder] cone: MakeFace_12 !IsDone()', { apex, axis, halfAngle, vmin, vmax });
-      return null;
-    }
-    return mf.Face();
-  } catch (e) {
-    console.warn('[brepBuilder] cone: exception in _buildConeFace', e);
-    return null;
   }
-}
 
-function _buildSphereFace(oc, params, toDelete, vRange) {
-  // Build an analytical spherical face using UV parameter bounds.
-  // BRepBuilderAPI_MakeFace_12(gp_Sphere, UMin, UMax, VMin, VMax) avoids the
-  // null-PCurve crash from straight-edge wires.  Latitude is computed using the
-  // Z-axis of a default frame centered at the sphere's centre; for a full or
-  // near-full hemisphere use -π/2 … π/2.
-  const { center, radius } = params;
-  try {
-    if (!vRange || vRange.vmax - vRange.vmin < 1e-10) {
-      console.warn('[brepBuilder] sphere: no usable latitude range', vRange);
-      return null;
-    }
-    const { vmin, vmax } = vRange;
-
-    // Place the sphere centre at `center` with default Z-up orientation
-    const ax3 = new oc.gp_Ax3_4(makePnt(oc, center), makeDir(oc, [0, 0, 1]));
-    toDelete.push(ax3);
-    const sph = new oc.gp_Sphere_2(ax3, radius);
-    toDelete.push(sph);
-
-    const pad = Math.max((vmax - vmin) * 1e-6, 1e-8);
-    const mf = new oc.BRepBuilderAPI_MakeFace_12(
-      sph, 0.0, 2 * Math.PI, vmin - pad, vmax + pad,
-    );
-    toDelete.push(mf);
-    if (!mf.IsDone()) {
-      console.warn('[brepBuilder] sphere: MakeFace_13 !IsDone()', { center, radius, vmin, vmax });
-      return null;
-    }
-    return mf.Face();
-  } catch (e) {
-    console.warn('[brepBuilder] sphere: exception in _buildSphereFace', e);
-    return null;
-  }
+  // Fall back to the large rectangular patch when Section is unavailable or
+  // produces insufficient edges (e.g. BRepAlgoAPI_Section not bound).
+  return planePatch;
 }
 
 // ── Main export: build B-rep + STEP ─────────────────────────────────────────
@@ -1050,23 +576,51 @@ export async function buildAndExportSTEP(groups, geometry, options = {}, onStatu
 
   onStatus?.('Building B-rep faces…', 20);
 
-  // Pre-compute group adjacency so planar faces can use analytical boundary
-  // construction (3-plane intersections) instead of mesh edge topology.
   const adjacency = buildGroupAdjacencyMap(groups, geometry);
+  const toDelete  = [];
 
-  const toDelete = []; // OCCT objects to free after export
-  const faces = [];
-
+  // ── Phase 1: build large analytical patches for every surface ────────────────
+  // Each patch covers the mesh vertex extent with generous margin.
+  // No intersection computation, no adjacency lookup, no type enumeration.
+  const patches = new Map(); // groupIdx → TopoDS_Face (large patch)
   for (let i = 0; i < groups.length; i++) {
     const g = groups[i];
     if (!g.surface) continue;
     try {
-      const face = buildFace(oc, g, geometry, toDelete, i, groups, adjacency);
-      if (face) faces.push(face);
-    } catch (err) {
-      console.warn(`Face ${i} (${g.surface.type}) failed:`, err);
+      const patch = _buildLargePatch(oc, g, geometry, toDelete);
+      if (patch) patches.set(i, patch);
+    } catch (e) {
+      console.warn(`Patch ${i} (${g.surface?.type}) failed:`, e?.message ?? e);
     }
-    if (i % 50 === 0) onStatus?.(`Building faces… ${i}/${groups.length}`, 20 + 30 * i / groups.length);
+    if (i % 50 === 0) onStatus?.(`Building patches… ${i}/${groups.length}`, 20 + 15 * i / groups.length);
+  }
+
+  // ── Phase 2: compute analytically exact faces ────────────────────────────────
+  // • Planar faces: use BRepAlgoAPI_Section against every adjacent patch so that
+  //   the boundary wire is the exact intersection curve — circle, ellipse, line,
+  //   or any other curve the kernel returns — for any surface-type pair.
+  // • Curved faces: the large UV-bounded patch already has correct analytical
+  //   surface geometry; its boundary circles will be matched by sewing below.
+  const faces = [];
+  for (let i = 0; i < groups.length; i++) {
+    const g = groups[i];
+    if (!g.surface) continue;
+    const patch = patches.get(i);
+    if (!patch) continue;
+    try {
+      let face;
+      if (g.surface.type === 'plane') {
+        face = _buildSectionBoundedPlaneFace(
+          oc, g.surface.params, patch, i, groups, adjacency, patches, toDelete,
+        );
+      } else {
+        face = patch;
+      }
+      if (face) faces.push(face);
+    } catch (e) {
+      console.warn(`Face ${i} (${g.surface.type}) failed:`, e?.message ?? e);
+    }
+    if (i % 50 === 0) onStatus?.(`Building faces… ${i}/${groups.length}`, 35 + 15 * i / groups.length);
   }
 
   if (faces.length === 0) throw new Error('No valid B-rep faces could be constructed.');
