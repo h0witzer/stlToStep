@@ -28,9 +28,9 @@
   <script type="importmap">
   {
     "imports": {
-      "three": "./vendor/three/three.module.js",
-      "three/addons/": "./vendor/three/addons/",
-      "fflate": "./vendor/fflate/browser.js"
+      "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/",
+      "fflate": "https://cdn.jsdelivr.net/npm/fflate@0.8.2/esm/browser.js"
     }
   }
   </script>
@@ -206,31 +206,35 @@
   <div id="load-error" style="display:none;position:fixed;inset:0;z-index:9999;background:#1a1a20;
        color:#f88;font:16px/1.6 system-ui,sans-serif;padding:2rem;white-space:pre-wrap;"></div>
   <script>
-    window.addEventListener('error', function (e) {
+    function _showLoadError(detail) {
       var box = document.getElementById('load-error');
-      if (!box) return;
+      if (!box || box.style.display !== 'none') return;
       box.style.display = 'block';
-      box.textContent =
-        '⚠️  A script failed to load. If you opened this file directly (file://) please\n' +
-        'use a local HTTP server instead:\n\n' +
-        '  node server.js\n\n' +
-        'Then open  http://localhost:3000  in your browser.\n\n' +
-        '──────────────────────────────\n' +
-        'Technical detail: ' + (e.message || e.type) + '\n' +
-        (e.filename ? 'File: ' + e.filename + (e.lineno ? ':' + e.lineno : '') : '');
+      var onFileProtocol = location.protocol === 'file:';
+      var msg = '⚠️  A script failed to load.\n\n';
+      if (onFileProtocol) {
+        msg +=
+          'You opened this file directly (file://). Please use a local HTTP server instead:\n\n' +
+          '  node server.js\n\n' +
+          'Then open  http://localhost:3000  in your browser.\n\n';
+      } else {
+        msg +=
+          'You are running on a local server — the problem is likely a CDN resource that\n' +
+          'could not be fetched. Check:\n\n' +
+          '  • Your internet connection is active\n' +
+          '  • cdn.jsdelivr.net and unpkg.com are not blocked by a firewall or extension\n' +
+          '  • Open the browser DevTools → Network tab and look for failed requests\n\n';
+      }
+      msg += '──────────────────────────────\n' + 'Technical detail: ' + detail;
+      box.textContent = msg;
+    }
+    window.addEventListener('error', function (e) {
+      var detail = (e.message || e.type) + (e.filename ? '\nFile: ' + e.filename + (e.lineno ? ':' + e.lineno : '') : '');
+      _showLoadError(detail);
     });
     window.addEventListener('unhandledrejection', function (e) {
-      var box = document.getElementById('load-error');
-      if (!box || box.style.display !== 'none') return; // already showing an error
-      box.style.display = 'block';
       var reason = e.reason ? (e.reason.message || String(e.reason)) : String(e);
-      box.textContent =
-        '⚠️  A script failed to load. If you opened this file directly (file://) please\n' +
-        'use a local HTTP server instead:\n\n' +
-        '  node server.js\n\n' +
-        'Then open  http://localhost:3000  in your browser.\n\n' +
-        '──────────────────────────────\n' +
-        'Technical detail: ' + reason;
+      _showLoadError(reason);
     });
   </script>
 

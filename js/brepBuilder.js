@@ -18,7 +18,7 @@ import { extractBoundaryLoop } from './faceGrouper.js';
 
 // ── OpenCASCADE lazy loader ───────────────────────────────────────────────────
 
-const OC_CDN = 'https://unpkg.com/opencascade.js@1.1.4/dist/';
+const OC_CDN = 'https://cdn.jsdelivr.net/npm/opencascade.js@1.1.4/dist/';
 
 let _oc = null;
 let _ocPromise = null;
@@ -37,8 +37,23 @@ export async function initOC(onStatus) {
   _ocPromise = (async () => {
     onStatus?.('Downloading OpenCASCADE geometry engine (~25 MB, first load only)…');
 
-    // Inject <script> so the UMD bundle exposes window.opencascade
-    await _injectScript(OC_CDN + 'opencascade.wasm.js');
+    // Only inject the script if the global hasn't been set yet.
+    // This handles both first-load and the edge case where a previous attempt
+    // left the <script> tag in the DOM but window.opencascade was never set.
+    if (typeof window.opencascade !== 'function') {
+      await _injectScript(OC_CDN + 'opencascade.wasm.js');
+    }
+
+    // Validate the global — the script may have loaded (HTTP 200) but thrown
+    // during execution, leaving window.opencascade undefined.
+    if (typeof window.opencascade !== 'function') {
+      throw new Error(
+        'opencascade.js loaded but window.opencascade is not a function. ' +
+        'The CDN script may have thrown a silent error. ' +
+        'Check the browser DevTools console and Network tab to verify that ' +
+        'cdn.jsdelivr.net is reachable and the script executed without errors.'
+      );
+    }
 
     onStatus?.('Initialising OpenCASCADE…');
     _oc = await window.opencascade({
@@ -59,8 +74,11 @@ function _injectScript(src) {
     if (document.querySelector(`script[src="${src}"]`)) { resolve(); return; }
     const s = document.createElement('script');
     s.src = src;
+    s.crossOrigin = 'anonymous'; // surfaces real errors instead of opaque "Script error."
     s.onload  = resolve;
-    s.onerror = () => reject(new Error(`Failed to load ${src}`));
+    s.onerror = () => reject(new Error(
+      `Failed to load ${src} — check your internet connection and that cdn.jsdelivr.net is reachable.`
+    ));
     document.head.appendChild(s);
   });
 }

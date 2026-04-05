@@ -100,9 +100,6 @@ js/
   exclusion.js      — Adjacency graph & bucket-fill utilities
   exporter.js       — Binary STL export helper (unused in STEP branch)
   i18n.js           — EN / DE translations
-vendor/
-  three/            — Three.js v0.170.0 (bundled locally for file:// compatibility)
-  fflate/           — fflate v0.8.2 (ZIP decompression for .3mf)
 ```
 
 ---
@@ -111,11 +108,12 @@ vendor/
 
 | Library | Version | How loaded |
 |---------|---------|------------|
-| [Three.js](https://threejs.org/) | 0.170.0 | Bundled in `vendor/` |
-| [fflate](https://github.com/101arrowz/fflate) | 0.8.2 | Bundled in `vendor/` |
-| [opencascade.js](https://github.com/donalffons/opencascade.js) | 2.0.0-pre.4 | Fetched from CDN on first STEP export (~25 MB, then cached) |
+| [Three.js](https://threejs.org/) | 0.170.0 | CDN via importmap (cdn.jsdelivr.net) |
+| [fflate](https://github.com/101arrowz/fflate) | 0.8.2 | CDN via importmap (cdn.jsdelivr.net) |
+| [opencascade.js](https://github.com/donalffons/opencascade.js) | 1.1.4 | Fetched from CDN on first STEP export (~25 MB, then cached) |
 
 All processing runs entirely in the browser — no data is uploaded to any server.
+An active internet connection is required to load libraries from the CDN on first use.
 
 ---
 
