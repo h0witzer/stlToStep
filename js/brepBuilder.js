@@ -527,6 +527,8 @@ function _buildLargePatch(oc, group, geometry, toDelete, modelDiag) {
       toDelete.push(ax3);
       const sph = new oc.gp_Sphere_2(ax3, radius);
       toDelete.push(sph);
+      // Sphere latitude is bounded to [-π/2, π/2]; use a smaller model-scale
+      // factor than cylinder/cone since the clamped range is inherently tighter.
       const pad = Math.max((vr.vmax - vr.vmin) * 0.15, (modelDiag || 0) * 0.02);
       const mf = new oc.BRepBuilderAPI_MakeFace_12(
         sph, 0.0, 2*Math.PI,
