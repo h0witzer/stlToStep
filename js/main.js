@@ -13,12 +13,14 @@ import {
   initViewer, loadGeometry, setMeshMaterial, setWireframe,
   getCamera, getCurrentMesh, showFaceGroupColors, setViewerTheme,
   setGroupHighlight, setGroupHoverCallback,
+  setBrepOverlay, setBrepOverlayVisible,
 } from './viewer.js';
 import { loadModelFile, computeBounds, getTriangleCount } from './stlLoader.js';
 import { t, initLang, setLang, getLang, applyTranslations } from './i18n.js';
 import { groupFaces } from './faceGrouper.js';
 import { fitAllGroups } from './surfaceFitter.js';
 import { initOC, buildAndExportSTEP, downloadSTEP, BUILD_VERSION } from './brepBuilder.js';
+import { buildBrepOverlay } from './brepVisualizer.js';
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
@@ -39,7 +41,8 @@ const dropZone      = document.getElementById('drop-zone');
 const dropHint      = document.getElementById('drop-hint');
 const stlFileInput  = document.getElementById('stl-file-input');
 const meshInfo      = document.getElementById('mesh-info');
-const wireframeToggle = document.getElementById('wireframe-toggle');
+const wireframeToggle    = document.getElementById('wireframe-toggle');
+const brepOverlayToggle  = document.getElementById('brep-overlay-toggle');
 
 // Face detection panel
 const creaseSlider  = document.getElementById('crease-angle');
@@ -194,6 +197,9 @@ async function handleDetect() {
     fitBtn.disabled = false;
     exportBtn.disabled = true;
     surfaceList.innerHTML = '';
+    // Clear any stale B-rep overlay from a previous Fit Surfaces run
+    setBrepOverlay(null);
+    if (brepOverlayToggle) brepOverlayToggle.checked = false;
   } catch (err) {
     console.error('Face detection failed:', err);
     alert(`Face detection failed: ${err.message}`);
@@ -214,6 +220,13 @@ async function handleFit() {
     fitAllGroups(currentGroups, currentGeometry);
     renderSurfaceList();
     exportBtn.disabled = false;
+    // Build and display the B-rep surface overlay automatically after fitting
+    const overlay = buildBrepOverlay(currentGroups, currentGeometry, TYPE_COLORS);
+    setBrepOverlay(overlay);
+    if (brepOverlayToggle) {
+      brepOverlayToggle.checked = true;
+      setBrepOverlayVisible(true);
+    }
   } catch (err) {
     console.error('Surface fitting failed:', err);
     alert(`Surface fitting failed: ${err.message}`);
@@ -418,6 +431,11 @@ function wireEvents() {
 
   // Wireframe
   wireframeToggle.addEventListener('change', () => setWireframe(wireframeToggle.checked));
+
+  // B-rep overlay
+  if (brepOverlayToggle) {
+    brepOverlayToggle.addEventListener('change', () => setBrepOverlayVisible(brepOverlayToggle.checked));
+  }
 
   // License overlay
   const licenseLink    = document.getElementById('license-link');

@@ -20,7 +20,7 @@ import { extractBoundaryLoop } from './faceGrouper.js';
 // ── Build version ─────────────────────────────────────────────────────────────
 
 /** Increment this string with each release to verify live-site deployments. */
-export const BUILD_VERSION = 'v0.4.2';
+export const BUILD_VERSION = 'v0.4.3';
 
 // ── OpenCASCADE lazy loader ───────────────────────────────────────────────────
 
