@@ -573,8 +573,8 @@ function _buildLargePatch(oc, group, geometry, toDelete, modelDiag) {
       toDelete.push(ax3);
       const sph = new oc.gp_Sphere_2(ax3, radius);
       toDelete.push(sph);
-      // Sphere latitude is bounded to [-π/2, π/2]; use a model-scale factor
-      // that keeps the face well outside the model while respecting the clamp.
+      // Sphere latitude is bounded to [-π/2, π/2]; the model-scale factor is
+      // smaller (0.1 vs 0.25) to avoid pushing past the pole singularities.
       const pad = Math.max((vr.vmax - vr.vmin) * 0.25, (modelDiag || 0) * 0.1);
       const mf = new oc.BRepBuilderAPI_MakeFace_12(
         sph, 0.0, 2*Math.PI,
@@ -675,8 +675,8 @@ function _buildSolidViaMakerVolume(oc, faces, fuzzyTol, toDelete) {
  * @returns {object|null}  resulting TopoDS_Shape or null
  */
 function _booleanCommon(oc, s1, s2, toDelete) {
-  // The two-shape constructor is typically _3 or _2, depending on how many
-  // earlier overloads (default, PaveFiller-only) the header declares.
+  // The two-shape constructor order varies by opencascade.js version:
+  // _2 or _3 is typically (S1, S2); _4 is (S1, S2, PaveFiller).
   for (const suffix of ['_3', '_2', '_4']) {
     const name = 'BRepAlgoAPI_Common' + suffix;
     if (typeof oc[name] !== 'function') continue;
@@ -752,8 +752,15 @@ function _buildSolidViaHalfSpaces(oc, faceEntries, geometry, modelDiag, toDelete
     }
   }
 
+  if (halfSpaces.length === 0) {
+    console.warn('No half-spaces could be built.');
+    return null;
+  }
+
+  // A single half-space is an unbounded region — not useful as a solid.
+  // We need at least 2 half-spaces to produce a finite intersection.
   if (halfSpaces.length < 2) {
-    console.warn(`Only ${halfSpaces.length} half-space(s) — need ≥ 2 for an intersection.`);
+    console.warn(`Only ${halfSpaces.length} half-space(s) — need ≥ 2 for a finite solid.`);
     return null;
   }
 
