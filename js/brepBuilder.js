@@ -488,6 +488,48 @@ function buildFace(oc, group, geometry, toDelete, groupIdx, allGroups, adjacency
   const { type, params } = group.surface;
 
   // ── Analytical boundary for planar faces ────────────────────────────────
+  // 1. If a planar face is adjacent to a cylinder or cone, its boundary on
+  //    that side is a true circle (or ellipse for oblique cuts — treated as
+  //    a circle here since we only handle axis-aligned cuts). Build an
+  //    analytic circular wire so the face boundary is represented by a
+  //    gp_Circ edge rather than dozens of polygon line-segments.
+  if (type === 'plane' && allGroups && adjacency) {
+    for (const j of adjacency.get(groupIdx) ?? []) {
+      const s = allGroups[j]?.surface;
+      if (!s) continue;
+      if (s.type === 'cylinder') {
+        const { axisPoint, axis, radius } = s.params;
+        // Project the cylinder axis point onto this plane to find circle centre.
+        const circCenter = snapToPlane(axisPoint, params.origin, params.normal);
+        const face = _buildCircularPlaneFace(oc, params, circCenter, radius, toDelete);
+        if (face) return face;
+      }
+      if (s.type === 'cone') {
+        const { apex, axis, halfAngle } = s.params;
+        // The cut of a cone by a plane perpendicular to its axis is a circle.
+        // Radius at axial distance t from apex = t * tan(halfAngle).
+        // Project apex onto this plane to find the cut centre, then derive t.
+        const apex3 = apex;
+        const plN = _u3(params.normal);
+        // Signed distance from apex to the plane along the plane normal
+        const t = (params.origin[0]-apex3[0])*plN[0]
+                + (params.origin[1]-apex3[1])*plN[1]
+                + (params.origin[2]-apex3[2])*plN[2];
+        // Only valid for a cut perpendicular to the cone axis.
+        // Check that the cone axis is (approximately) parallel to the plane normal.
+        const axN = _u3(axis);
+        const cosA = Math.abs(plN[0]*axN[0] + plN[1]*axN[1] + plN[2]*axN[2]);
+        if (cosA > 0.99 && t > 1e-10) {
+          const r = t * Math.tan(halfAngle);
+          const circCenter = snapToPlane(apex3, params.origin, params.normal);
+          const face = _buildCircularPlaneFace(oc, params, circCenter, r, toDelete);
+          if (face) return face;
+        }
+      }
+    }
+  }
+
+  // ── Analytical boundary for planar faces (polygon from 3-plane intersections)
   // Build the boundary by intersecting neighbouring analytical planes rather
   // than tracing mesh edge topology. This gives a clean polygon whose extents
   // match the fitted analytical surfaces, not the triangulation artefacts.
@@ -571,6 +613,61 @@ function _buildPlaneFace(oc, params, loop, toDelete) {
     if (!mf.IsDone()) return null;
     return mf.Face();
   } catch {
+    return null;
+  }
+}
+
+/**
+ * Build a circular (disk) planar face bounded by a single full-circle edge.
+ * Used for cylinder/cone end caps where the boundary between the flat face
+ * and the curved surface is an analytic circle, not a polygon.
+ *
+ * @param {object}   oc
+ * @param {object}   planeParams  { origin, normal }
+ * @param {number[]} circCenter   [x,y,z] circle centre (already on the plane)
+ * @param {number}   radius
+ * @param {object[]} toDelete
+ * @returns {object|null}  TopoDS_Face or null
+ */
+function _buildCircularPlaneFace(oc, planeParams, circCenter, radius, toDelete) {
+  try {
+    const { origin, normal } = planeParams;
+    // gp_Ax2_3(P, N): Z axis of the frame = circle normal = plane normal.
+    // The circle will be wound right-hand relative to N.
+    const ax2 = new oc.gp_Ax2_3(makePnt(oc, circCenter), makeDir(oc, normal));
+    toDelete.push(ax2);
+    const circ = new oc.gp_Circ_2(ax2, radius);
+    toDelete.push(circ);
+
+    // BRepBuilderAPI_MakeEdge_8(gp_Circ) → full circle edge
+    const edgeMaker = new oc.BRepBuilderAPI_MakeEdge_8(circ);
+    toDelete.push(edgeMaker);
+    if (!edgeMaker.IsDone()) {
+      console.warn('[brepBuilder] circular cap: MakeEdge_8 !IsDone()');
+      return null;
+    }
+    const edge = edgeMaker.Edge();
+
+    // BRepBuilderAPI_MakeWire_2(TopoDS_Edge) → single-edge wire
+    const wireMaker = new oc.BRepBuilderAPI_MakeWire_2(edge);
+    toDelete.push(wireMaker);
+    if (!wireMaker.IsDone()) {
+      console.warn('[brepBuilder] circular cap: MakeWire_2 !IsDone()');
+      return null;
+    }
+    const wire = wireMaker.Wire();
+
+    const pln = new oc.gp_Pln_3(makePnt(oc, origin), makeDir(oc, normal));
+    toDelete.push(pln);
+    const mf = new oc.BRepBuilderAPI_MakeFace_16(pln, wire, true);
+    toDelete.push(mf);
+    if (!mf.IsDone()) {
+      console.warn('[brepBuilder] circular cap: MakeFace_16 !IsDone()');
+      return null;
+    }
+    return mf.Face();
+  } catch (e) {
+    console.warn('[brepBuilder] circular cap: exception in _buildCircularPlaneFace', e);
     return null;
   }
 }
