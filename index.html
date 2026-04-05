@@ -66,7 +66,6 @@
           </svg>
           <p>Drop an <strong>.stl</strong>, <strong>.obj</strong> or <strong>.3mf</strong> file here<br/>
              or <label for="stl-file-input" class="link-label">click to browse</label></p>
-          <input type="file" id="stl-file-input" accept=".stl,.obj,.3mf" hidden />
         </div>
         <canvas id="viewport"></canvas>
       </div>
@@ -199,6 +198,9 @@
       </ul>
     </div>
   </div>
+
+  <!-- Hidden file input — placed at body level so it is never inside a display:none container -->
+  <input type="file" id="stl-file-input" accept=".stl,.obj,.3mf" style="display:none" />
 
   <script type="module" src="js/main.js"></script>
 </body>

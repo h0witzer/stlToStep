@@ -100,7 +100,7 @@ async function handleModelFile(file) {
     currentGroups = null;
 
     loadGeometry(geometry);
-    dropHint.style.display = 'none';
+    dropHint.classList.add('loaded');   // hide hint via CSS (does not affect the file input)
 
     const triCount = getTriangleCount(geometry);
     geometry.computeBoundingBox();
@@ -314,7 +314,23 @@ function wireEvents() {
     const file = [...e.dataTransfer.files].find(f => /\.(stl|obj|3mf)$/i.test(f.name));
     if (file) handleModelFile(file);
   });
-  dropZone.addEventListener('click', e => { if (e.target === dropZone) stlFileInput.click(); });
+
+  // Clicking the viewport (canvas) or the drop-zone background opens the file picker.
+  // The canvas is positioned absolute on top of the drop-zone, so we listen on the
+  // canvas directly.  We suppress the click during OrbitControls drags by checking
+  // that the pointer hasn't moved more than a few pixels between pointerdown and click.
+  let _pointerDownPos = null;
+  canvas.addEventListener('pointerdown', e => {
+    _pointerDownPos = { x: e.clientX, y: e.clientY };
+  });
+  canvas.addEventListener('click', e => {
+    if (!currentGeometry && _pointerDownPos) {
+      const dx = e.clientX - _pointerDownPos.x;
+      const dy = e.clientY - _pointerDownPos.y;
+      if (dx * dx + dy * dy < 25) stlFileInput.click(); // < 5px movement = genuine click
+    }
+    _pointerDownPos = null;
+  });
 
   // Crease angle slider
   creaseSlider.addEventListener('input', () => {

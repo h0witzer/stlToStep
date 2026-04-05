@@ -203,6 +203,7 @@ main {
 }
 
 .drop-hint.hidden { opacity: 0; pointer-events: none; }
+.drop-hint.loaded { opacity: 0; pointer-events: none; }
 
 .link-label {
   color: var(--accent);
