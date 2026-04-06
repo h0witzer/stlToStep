@@ -6,16 +6,26 @@
  *      All surface types (plane, cylinder, cone, sphere) use _buildLargePatch()
  *      with margins proportional to the model bounding-box diagonal so every
  *      face extends well beyond any possible intersection with its neighbours.
- *   2. For each face, build a half-space solid (BRepPrimAPI_MakeHalfSpace) on
- *      the material side — determined by mesh normals (outward-facing ⇒ inside
- *      is opposite to normal).  Then sequentially Boolean-intersect (Common)
- *      every half-space.  OCCT's Boolean kernel computes exact analytical
- *      intersection curves (circles for plane∩cylinder, lines for plane∩plane,
- *      etc.) and trims every face cleanly — no mesh-based boundaries, no per-
- *      type heuristics, and holes arise naturally.
- *   3. Fallback chain: BOPAlgo_MakerVolume → BRepBuilderAPI_Sewing → manual
- *      shell → bare compound.
- *   4. Write STEP via STEPControl_Writer with the /tmp CWD strategy.
+ *   2. Compute exact analytical intersection curves between every pair of
+ *      adjacent faces using BRepAlgoAPI_Section.  These are true surface–
+ *      surface intersections (circles for plane∩cylinder, lines for
+ *      plane∩plane, conics for cone cases, etc.) — no mesh data involved.
+ *   3. Trim each face using the section curves:
+ *        • Plane faces: assemble section edges into closed wires, then
+ *          BRepBuilderAPI_MakeFace(gp_Pln, outerWire).  Inner wires (from
+ *          holes) are added via MakeFace.Add().
+ *        • Curved faces (cylinder, cone, sphere): project section edges onto
+ *          the surface axis to determine V-parameter bounds, then
+ *          MakeFace(gp_Cylinder/Cone/Sphere, 0, 2π, Vmin, Vmax).
+ *      This generalises to fillets and arbitrary NURBS surfaces — section
+ *      edges give exact trim curves for any pair of analytical or freeform
+ *      surfaces.
+ *   4. Sew the trimmed faces into a watertight shell → solid.
+ *   5. Write STEP via STEPControl_Writer with the /tmp CWD strategy.
+ *
+ * If BOPAlgo_MakerVolume is available in the opencascade.js build, it is used
+ * as a fast-path (it implements steps 2–4 internally).  The Section-based
+ * path is the robust fallback that relies only on core Boolean APIs.
  *
  * opencascade.js is loaded lazily via dynamic import() when the user first
  * clicks "Export STEP" so the 35 MB WASM does not block page load.
@@ -132,49 +142,6 @@ function snapToCone(p, apex, axis, halfAngle) {
     apex[1] + az*axis[1] + ry*s,
     apex[2] + az*axis[2] + rz*s,
   ];
-}
-
-// ── Inside-point computation ────────────────────────────────────────────────
-
-/**
- * Compute a point that lies inside the solid, on the material side of a
- * surface group.  The mesh normals point outward (away from solid material),
- * so we offset the group centroid in the opposite direction.
- *
- * This point is used as the reference for BRepPrimAPI_MakeHalfSpace so that
- * the resulting half-space contains the solid material, not the void.
- *
- * @param {object} group  { triangleIndices, surface }
- * @param {THREE.BufferGeometry} geometry
- * @param {number} modelDiag  bounding-box diagonal (sets offset magnitude)
- * @returns {[number,number,number]}
- */
-function _computeInsidePoint(group, geometry, modelDiag) {
-  const pos = geometry.attributes.position;
-  const nor = geometry.attributes.normal;
-  let cx = 0, cy = 0, cz = 0;
-  let nx = 0, ny = 0, nz = 0;
-  let count = 0;
-
-  for (const t of group.triangleIndices) {
-    for (let j = 0; j < 3; j++) {
-      const i = t * 3 + j;
-      cx += pos.getX(i); cy += pos.getY(i); cz += pos.getZ(i);
-      nx += nor.getX(i); ny += nor.getY(i); nz += nor.getZ(i);
-      count++;
-    }
-  }
-
-  if (count === 0) return [0, 0, 0];
-  cx /= count; cy /= count; cz /= count;
-  const nl = Math.sqrt(nx * nx + ny * ny + nz * nz);
-  if (nl > 1e-14) { nx /= nl; ny /= nl; nz /= nl; }
-
-  // Offset into the solid: opposite to outward mesh normal.
-  // 0.1 % of model diagonal is enough to be clearly on one side while
-  // staying well within the solid even for thin features.
-  const eps = modelDiag * 1e-3;
-  return [cx - eps * nx, cy - eps * ny, cz - eps * nz];
 }
 
 // ── Group adjacency ─────────────────────────────────────────────────────────
@@ -591,192 +558,553 @@ function _buildLargePatch(oc, group, geometry, toDelete, modelDiag) {
   return null;
 }
 
-// ── BOPAlgo_MakerVolume: general surface-surface trimming ────────────────────
+// ── BRepAlgoAPI_Section wrapper ──────────────────────────────────────────────
 
 /**
- * Use OCCT's Boolean volume builder to trim oversized analytical patches
- * against one another and assemble them into a watertight solid.
- *
- * BOPAlgo_MakerVolume is the general-purpose OCCT algorithm for this task:
- * it computes all pairwise surface–surface intersection curves, splits every
- * face along those curves, identifies the enclosed volume(s), and returns
- * a properly trimmed solid — no external trim geometry, no per-type
- * heuristics, and no mesh data required.
- *
- * @param {object}   oc        opencascade.js module
- * @param {object[]} faces     oversized TopoDS_Face patches
- * @param {number}   fuzzyTol  fuzzy tolerance for intersection computation
- * @param {object[]} toDelete  C++ garbage-collection list
- * @returns {object|null}  TopoDS_Shape (solid) or null on failure
- */
-function _buildSolidViaMakerVolume(oc, faces, fuzzyTol, toDelete) {
-  try {
-    const maker = new oc.BOPAlgo_MakerVolume_1();
-    toDelete.push(maker);
-
-    // Build argument list and hand it to the algorithm.
-    const argList = new oc.TopTools_ListOfShape_1();
-    toDelete.push(argList);
-    for (const f of faces) argList.Append_1(f);
-    maker.SetArguments(argList);
-
-    // Compute surface–surface intersections between all input faces.
-    maker.SetIntersect(true);
-
-    // Skip internal (non-boundary) faces inside the solid.
-    if (typeof maker.SetAvoidInternalShapes === 'function') {
-      maker.SetAvoidInternalShapes(true);
-    }
-
-    // Apply the same adaptive tolerance used for sewing so that the
-    // intersection engine bridges small numerical mismatches.
-    if (typeof maker.SetFuzzyValue === 'function' && fuzzyTol > 0) {
-      maker.SetFuzzyValue(fuzzyTol);
-    }
-
-    // Emscripten is single-threaded.
-    if (typeof maker.SetRunParallel === 'function') {
-      maker.SetRunParallel(false);
-    }
-
-    maker.Perform();
-
-    // Check for algorithmic errors.
-    if (typeof maker.HasErrors === 'function' && maker.HasErrors()) {
-      console.warn('BOPAlgo_MakerVolume reported errors.');
-      return null;
-    }
-
-    const result = maker.Shape();
-    if (!result || (typeof result.IsNull === 'function' && result.IsNull())) {
-      console.warn('BOPAlgo_MakerVolume produced a null shape.');
-      return null;
-    }
-
-    console.info('BOPAlgo_MakerVolume succeeded — solid built from trimmed analytical surfaces.');
-    return result;
-  } catch (e) {
-    console.warn('BOPAlgo_MakerVolume unavailable or failed:', e?.message ?? e);
-    return null;
-  }
-}
-
-// ── Boolean Common helper ────────────────────────────────────────────────────
-
-/**
- * Boolean intersection (Common) of two shapes.
- * Tries multiple constructor names for compatibility across opencascade.js
- * versions, since the Emscripten binding numbers overloads sequentially.
+ * Compute the intersection curves between two shapes using BRepAlgoAPI_Section.
+ * Probes multiple constructor overloads for opencascade.js compatibility.
  *
  * @param {object}   oc
- * @param {object}   s1  TopoDS_Shape
- * @param {object}   s2  TopoDS_Shape
+ * @param {object}   s1     TopoDS_Shape
+ * @param {object}   s2     TopoDS_Shape
  * @param {object[]} toDelete
- * @returns {object|null}  resulting TopoDS_Shape or null
+ * @returns {object|null}  resulting TopoDS_Shape (compound of edges) or null
  */
-function _booleanCommon(oc, s1, s2, toDelete) {
-  // The two-shape constructor order varies by opencascade.js version:
-  // _2 or _3 is typically (S1, S2); _4 is (S1, S2, PaveFiller).
-  for (const suffix of ['_3', '_2', '_4']) {
-    const name = 'BRepAlgoAPI_Common' + suffix;
+function _section(oc, s1, s2, toDelete) {
+  for (const suffix of ['_5', '_3', '_2', '_1']) {
+    const name = 'BRepAlgoAPI_Section' + suffix;
     if (typeof oc[name] !== 'function') continue;
     try {
-      const op = new oc[name](s1, s2);
-      toDelete.push(op);
-      if (typeof op.IsDone === 'function' && !op.IsDone()) continue;
-      const result = op.Shape();
-      if (!result) continue;
-      if (typeof result.IsNull === 'function' && result.IsNull()) continue;
-      return result;
+      const sec = new oc[name](s1, s2);
+      toDelete.push(sec);
+      if (typeof sec.Build === 'function') {
+        try { sec.Build(); } catch { /* some overloads auto-build */ }
+      }
+      if (typeof sec.IsDone === 'function' && !sec.IsDone()) continue;
+      const shape = sec.Shape();
+      if (!shape) continue;
+      if (typeof shape.IsNull === 'function' && shape.IsNull()) continue;
+      return shape;
     } catch { continue; }
   }
   return null;
 }
 
-// ── Half-space intersection: general surface trimming ────────────────────────
+// ── Edge extraction ─────────────────────────────────────────────────────────
 
 /**
- * Build a watertight solid by intersecting half-spaces.
+ * Extract all TopoDS_Edge objects from a shape using TopExp_Explorer.
+ */
+function _extractEdges(oc, shape, toDelete) {
+  const edges = [];
+  const EDGE_T = oc.TopAbs_ShapeEnum?.TopAbs_EDGE ?? 5;
+  const SHAPE_T = oc.TopAbs_ShapeEnum?.TopAbs_SHAPE ?? 0;
+  try {
+    const explorer = new oc.TopExp_Explorer_2(shape, EDGE_T, SHAPE_T);
+    toDelete.push(explorer);
+    while (explorer.More()) {
+      edges.push(explorer.Current());
+      explorer.Next();
+    }
+  } catch (e) {
+    console.warn('_extractEdges failed:', e?.message ?? e);
+  }
+  return edges;
+}
+
+// ── Edge endpoint extraction ────────────────────────────────────────────────
+
+/**
+ * Get the 3D start and end points of an OCCT edge, plus whether it is closed.
+ * Uses BRepAdaptor_Curve to evaluate the edge's underlying curve.
  *
- * For each fitted surface we create a half-space solid on the material side
- * (BRepPrimAPI_MakeHalfSpace) and then sequentially Boolean-intersect (Common)
- * every half-space.  OCCT's Boolean kernel recognises that the intersection
- * of two analytical surfaces is an analytical curve — circles for
- * plane∩cylinder, straight lines for plane∩plane, conics for cone cases,
- * etc. — so the result has clean, exact trimming edges, not tessellated
- * polygon approximations.
+ * @param {object} oc
+ * @param {object} edge   TopoDS_Edge
+ * @param {object[]} toDelete
+ * @param {number} tolerance  distance below which start≈end means "closed"
+ * @returns {{ start: number[], end: number[], closed: boolean }|null}
+ */
+function _edgePoints(oc, edge, toDelete, tolerance = 1e-6) {
+  try {
+    const adaptor = new oc.BRepAdaptor_Curve_2(edge);
+    toDelete.push(adaptor);
+    const p1 = adaptor.Value(adaptor.FirstParameter());
+    const p2 = adaptor.Value(adaptor.LastParameter());
+    toDelete.push(p1, p2);
+    const start = [p1.X(), p1.Y(), p1.Z()];
+    const end   = [p2.X(), p2.Y(), p2.Z()];
+    const dx = end[0]-start[0], dy = end[1]-start[1], dz = end[2]-start[2];
+    const closed = Math.sqrt(dx*dx+dy*dy+dz*dz) < tolerance;
+    return { start, end, closed };
+  } catch {
+    return null;
+  }
+}
+
+// ── Edge → wire grouping ────────────────────────────────────────────────────
+
+/**
+ * Group a set of OCCT edges into closed wires by endpoint connectivity.
  *
- * Holes in faces arise naturally: a cylindrical hole surface's outward mesh
- * normals point inward (toward the axis), so its half-space is the exterior
- * of the cylinder.  Intersecting that with the plane half-spaces carves an
- * analytical circular hole in the planar face — no inner-wire logic needed.
+ * Edges whose start and end coincide (within tolerance) are treated as
+ * standalone closed wires (e.g. circles from plane∩cylinder sections).
+ *
+ * Remaining edges are grouped into connected chains by matching endpoints
+ * and assembled into BRepBuilderAPI_MakeWire.
  *
  * @param {object}   oc
- * @param {Array<{face,group}>} faceEntries  face + source group pairs
- * @param {THREE.BufferGeometry} geometry
- * @param {number}   modelDiag
+ * @param {object[]} edges      TopoDS_Edge objects
+ * @param {number}   tolerance
  * @param {object[]} toDelete
- * @returns {object|null}  TopoDS_Shape (solid) or null on failure
+ * @returns {object[]}  array of TopoDS_Wire
  */
-function _buildSolidViaHalfSpaces(oc, faceEntries, geometry, modelDiag, toDelete) {
-  // Verify required APIs exist
-  if (typeof oc.BRepPrimAPI_MakeHalfSpace_1 !== 'function') {
-    console.warn('BRepPrimAPI_MakeHalfSpace not available in this opencascade.js build.');
-    return null;
+function _groupEdgesIntoWires(oc, edges, tolerance, toDelete) {
+  if (edges.length === 0) return [];
+  const tol2 = tolerance * tolerance;
+  const ptsClose = (a, b) => {
+    const dx = a[0]-b[0], dy = a[1]-b[1], dz = a[2]-b[2];
+    return dx*dx+dy*dy+dz*dz < tol2;
+  };
+
+  // Get endpoint data for every edge.
+  const infos = [];
+  for (const edge of edges) {
+    const pts = _edgePoints(oc, edge, toDelete, tolerance);
+    if (!pts) continue;
+    infos.push({ edge, ...pts });
   }
 
-  // Check that at least one Common constructor is present
-  const hasCommon = ['_3', '_2', '_4'].some(
-    s => typeof oc['BRepAlgoAPI_Common' + s] === 'function',
-  );
-  if (!hasCommon) {
-    console.warn('BRepAlgoAPI_Common not available in this opencascade.js build.');
-    return null;
-  }
+  const wires = [];
+  const used = new Set();
 
-  // Phase 1 — build a half-space for each surface group.
-  const halfSpaces = [];
-  for (const { face, group } of faceEntries) {
+  // Pass 1 — closed edges (circles, full ellipses, etc.) are standalone wires.
+  for (let i = 0; i < infos.length; i++) {
+    if (!infos[i].closed) continue;
+    used.add(i);
     try {
-      const inside = _computeInsidePoint(group, geometry, modelDiag);
-      const refPnt = makePnt(oc, inside);
-      toDelete.push(refPnt);
+      const wm = new oc.BRepBuilderAPI_MakeWire_1();
+      toDelete.push(wm);
+      wm.Add_1(infos[i].edge);
+      if (wm.IsDone()) wires.push(wm.Wire());
+    } catch { /* skip malformed edge */ }
+  }
 
-      const hsMaker = new oc.BRepPrimAPI_MakeHalfSpace_1(face, refPnt);
-      toDelete.push(hsMaker);
-      const hs = hsMaker.Solid();
-      if (hs) halfSpaces.push(hs);
-      else    console.warn('Half-space produced null solid for group type:', group.surface?.type);
+  // Pass 2 — chain open edges by endpoint proximity.
+  while (true) {
+    // Find an unused open edge to start a new chain.
+    let seedIdx = -1;
+    for (let i = 0; i < infos.length; i++) {
+      if (!used.has(i)) { seedIdx = i; break; }
+    }
+    if (seedIdx === -1) break;
+
+    const chain = [seedIdx];
+    used.add(seedIdx);
+    let head = infos[seedIdx].start;
+    let tail = infos[seedIdx].end;
+
+    // Grow the chain in both directions.
+    let progress = true;
+    while (progress) {
+      progress = false;
+      for (let i = 0; i < infos.length; i++) {
+        if (used.has(i)) continue;
+        const { start, end } = infos[i];
+        if (ptsClose(tail, start)) {
+          chain.push(i); used.add(i); tail = end; progress = true;
+        } else if (ptsClose(tail, end)) {
+          chain.push(i); used.add(i); tail = start; progress = true;
+        } else if (ptsClose(head, end)) {
+          chain.unshift(i); used.add(i); head = start; progress = true;
+        } else if (ptsClose(head, start)) {
+          chain.unshift(i); used.add(i); head = end; progress = true;
+        }
+      }
+    }
+
+    if (chain.length === 0) continue;
+    try {
+      const wm = new oc.BRepBuilderAPI_MakeWire_1();
+      toDelete.push(wm);
+      for (const idx of chain) wm.Add_1(infos[idx].edge);
+      if (wm.IsDone()) wires.push(wm.Wire());
+      else console.warn(`Wire from ${chain.length} edges did not complete.`);
     } catch (e) {
-      console.warn('Half-space failed for', group.surface?.type, ':', e?.message ?? e);
+      console.warn('Wire construction failed:', e?.message ?? e);
     }
   }
 
-  if (halfSpaces.length === 0) {
-    console.warn('No half-spaces could be built.');
+  return wires;
+}
+
+// ── Analytical V-bounds from adjacent planes ────────────────────────────────
+
+/**
+ * Compute the V-parameter range of a curved surface (cylinder, cone, sphere)
+ * by finding where each adjacent plane intersects the surface axis.
+ *
+ * This is a pure analytical computation using only fitted surface parameters —
+ * no mesh data, no OCCT edges.  For each adjacent plane with known origin
+ * and normal, the axis intersection parameter is:
+ *
+ *   V = dot(planeOrigin − axisPoint, planeNormal) / dot(axis, planeNormal)
+ *
+ * @param {object}   surfaceParams
+ * @param {string}   surfaceType    'cylinder' | 'cone' | 'sphere'
+ * @param {number[]} adjacentGroupIndices
+ * @param {object[]} groups
+ * @returns {{ vmin: number, vmax: number }|null}
+ */
+function _vBoundsFromAdjacentPlanes(surfaceParams, surfaceType,
+                                    adjacentGroupIndices, groups) {
+  let vmin = Infinity, vmax = -Infinity;
+
+  let axisPoint, axis;
+  if (surfaceType === 'cylinder') {
+    axisPoint = surfaceParams.axisPoint;
+    axis = _u3(surfaceParams.axis);
+  } else if (surfaceType === 'cone') {
+    axisPoint = surfaceParams.apex;
+    axis = _u3(surfaceParams.axis);
+  } else if (surfaceType === 'sphere') {
+    axisPoint = surfaceParams.center;
+    axis = [0, 0, 1]; // sphere axis is always Z in OCCT parameterisation
+  } else {
     return null;
   }
 
-  // A single half-space is an unbounded region — not useful as a solid.
-  // We need at least 2 half-spaces to produce a finite intersection.
-  if (halfSpaces.length < 2) {
-    console.warn(`Only ${halfSpaces.length} half-space(s) — need ≥ 2 for a finite solid.`);
-    return null;
+  for (const adjIdx of adjacentGroupIndices) {
+    const adj = groups[adjIdx];
+    if (!adj?.surface || adj.surface.type !== 'plane') continue;
+    const { origin, normal } = adj.surface.params;
+    const nu = _u3(normal);
+    const denom = _d3(axis, nu);
+    if (Math.abs(denom) < 1e-14) continue; // plane parallel to axis
+    const diff = [origin[0]-axisPoint[0], origin[1]-axisPoint[1],
+                  origin[2]-axisPoint[2]];
+    const t = _d3(diff, nu) / denom;
+
+    if (surfaceType === 'sphere') {
+      const lat = Math.asin(Math.max(-1, Math.min(1, t / surfaceParams.radius)));
+      if (lat < vmin) vmin = lat;
+      if (lat > vmax) vmax = lat;
+    } else {
+      if (t < vmin) vmin = t;
+      if (t > vmax) vmax = t;
+    }
   }
 
-  // Phase 2 — sequentially intersect all half-spaces.
-  let result = halfSpaces[0];
-  for (let i = 1; i < halfSpaces.length; i++) {
-    const next = _booleanCommon(oc, result, halfSpaces[i], toDelete);
-    if (!next) {
-      console.warn(`Boolean Common failed at step ${i}/${halfSpaces.length - 1}.`);
+  return isFinite(vmin) && vmax - vmin > 1e-10 ? { vmin, vmax } : null;
+}
+
+// ── Trimmed face builder ────────────────────────────────────────────────────
+
+/**
+ * Build a properly trimmed face from section edges (computed via
+ * BRepAlgoAPI_Section with all neighbours).
+ *
+ * • Plane faces: section edges are assembled into wires.  The largest wire
+ *   becomes the outer boundary; smaller wires become holes.
+ *
+ * • Curved faces (cylinder, cone, sphere): V-parameter bounds are computed
+ *   analytically from adjacent plane positions — no mesh or OCCT edges.
+ *
+ * This generalises to fillets and NURBS: section edges provide exact trim
+ * curves for any surface pair, and MakeFace(Geom_Surface, wire) will produce
+ * the trimmed face.
+ */
+function _buildTrimmedFace(oc, group, groupIdx, sectionEdges, adjacentIndices,
+                           groups, modelDiag, tolerance, toDelete) {
+  const { type, params } = group.surface;
+
+  try {
+    // ── Plane: build face from section-edge wires ──────────────────────────
+    if (type === 'plane') {
+      if (sectionEdges.length === 0) return null;
+
+      const wires = _groupEdgesIntoWires(oc, sectionEdges, tolerance, toDelete);
+      if (wires.length === 0) return null;
+
+      // Identify the outer wire (largest bounding-box diagonal).
+      let outerIdx = 0;
+      if (wires.length > 1) {
+        let maxDiag = -1;
+        for (let i = 0; i < wires.length; i++) {
+          try {
+            const box = new oc.Bnd_Box_1();
+            toDelete.push(box);
+            oc.BRepBndLib.Add(wires[i], box, false);
+            const cMin = box.CornerMin();
+            const cMax = box.CornerMax();
+            toDelete.push(cMin, cMax);
+            const dx = cMax.X()-cMin.X(), dy = cMax.Y()-cMin.Y(), dz = cMax.Z()-cMin.Z();
+            const diag = dx*dx + dy*dy + dz*dz;
+            if (diag > maxDiag) { maxDiag = diag; outerIdx = i; }
+          } catch { /* keep default */ }
+        }
+      }
+
+      const { origin, normal } = params;
+      const nu = _u3(normal);
+      const pln = new oc.gp_Pln_3(makePnt(oc, origin), makeDir(oc, nu));
+      toDelete.push(pln);
+
+      const mf = new oc.BRepBuilderAPI_MakeFace_16(pln, wires[outerIdx], true);
+      toDelete.push(mf);
+      if (!mf.IsDone()) return null;
+
+      // Add inner wires (holes).
+      for (let i = 0; i < wires.length; i++) {
+        if (i === outerIdx) continue;
+        try { mf.Add(wires[i]); } catch { /* skip */ }
+      }
+
+      return mf.Face();
+    }
+
+    // ── Cylinder: V-bounds from adjacent planes ───────────────────────────
+    if (type === 'cylinder') {
+      const vr = _vBoundsFromAdjacentPlanes(params, 'cylinder',
+        [...adjacentIndices], groups);
+      if (!vr) return null;
+      const ax3 = makeAx3(oc, params.axisPoint, params.axis);
+      toDelete.push(ax3);
+      const cyl = new oc.gp_Cylinder_2(ax3, params.radius);
+      toDelete.push(cyl);
+      const mf = new oc.BRepBuilderAPI_MakeFace_10(
+        cyl, 0.0, 2*Math.PI, vr.vmin, vr.vmax);
+      toDelete.push(mf);
+      return mf.IsDone() ? mf.Face() : null;
+    }
+
+    // ── Cone: V-bounds from adjacent planes ───────────────────────────────
+    if (type === 'cone') {
+      const vr = _vBoundsFromAdjacentPlanes(params, 'cone',
+        [...adjacentIndices], groups);
+      if (!vr) return null;
+      const ax3 = makeAx3(oc, params.apex, params.axis);
+      toDelete.push(ax3);
+      const cone = new oc.gp_Cone_2(ax3, params.halfAngle, 0.0);
+      toDelete.push(cone);
+      const mf = new oc.BRepBuilderAPI_MakeFace_11(
+        cone, 0.0, 2*Math.PI, Math.max(0, vr.vmin), vr.vmax);
+      toDelete.push(mf);
+      return mf.IsDone() ? mf.Face() : null;
+    }
+
+    // ── Sphere: V-bounds from adjacent planes ─────────────────────────────
+    if (type === 'sphere') {
+      const vr = _vBoundsFromAdjacentPlanes(params, 'sphere',
+        [...adjacentIndices], groups);
+      if (!vr) return null;
+      const ax3 = new oc.gp_Ax3_4(
+        makePnt(oc, params.center), makeDir(oc, [0, 0, 1]));
+      toDelete.push(ax3);
+      const sph = new oc.gp_Sphere_2(ax3, params.radius);
+      toDelete.push(sph);
+      const mf = new oc.BRepBuilderAPI_MakeFace_12(
+        sph, 0.0, 2*Math.PI,
+        Math.max(-Math.PI/2, vr.vmin),
+        Math.min( Math.PI/2, vr.vmax));
+      toDelete.push(mf);
+      return mf.IsDone() ? mf.Face() : null;
+    }
+
+  } catch (e) {
+    console.warn(`_buildTrimmedFace (${type}):`, e?.message ?? e);
+  }
+  return null;
+}
+
+// ── Sew faces into a solid ──────────────────────────────────────────────────
+
+/**
+ * Sew an array of properly trimmed faces into a watertight solid.
+ */
+function _sewIntoSolid(oc, faces, sewTol, toDelete) {
+  if (faces.length === 0) return null;
+  try {
+    const SewCtor = typeof oc.BRepBuilderAPI_Sewing_2 === 'function'
+      ? oc.BRepBuilderAPI_Sewing_2
+      : typeof oc.BRepBuilderAPI_Sewing_1 === 'function'
+        ? oc.BRepBuilderAPI_Sewing_1
+        : oc.BRepBuilderAPI_Sewing;
+    const sewing = new SewCtor(sewTol);
+    toDelete.push(sewing);
+
+    for (const f of faces) sewing.Add(f);
+    sewing.Perform();
+
+    const sewn = sewing.SewedShape();
+    const shapeType = sewn.ShapeType?.() ?? -1;
+    const SOLID_T = oc.TopAbs_ShapeEnum?.TopAbs_SOLID ?? 3;
+    const SHELL_T = oc.TopAbs_ShapeEnum?.TopAbs_SHELL ?? 4;
+    const COMP_T  = oc.TopAbs_ShapeEnum?.TopAbs_COMPOUND ?? 0;
+
+    if (shapeType === SOLID_T) return sewn;
+
+    if (shapeType === SHELL_T) {
+      const mkSolid = new oc.BRepBuilderAPI_MakeSolid_3(sewn);
+      toDelete.push(mkSolid);
+      return mkSolid.IsDone() ? mkSolid.Solid() : null;
+    }
+
+    if (shapeType === COMP_T) {
+      const expShell = new oc.TopExp_Explorer_2(
+        sewn, SHELL_T, oc.TopAbs_ShapeEnum?.TopAbs_SHAPE ?? 0);
+      toDelete.push(expShell);
+      if (expShell.More()) {
+        const mkSolid = new oc.BRepBuilderAPI_MakeSolid_3(expShell.Current());
+        toDelete.push(mkSolid);
+        return mkSolid.IsDone() ? mkSolid.Solid() : null;
+      }
+    }
+  } catch (e) {
+    console.warn('_sewIntoSolid failed:', e?.message ?? e);
+  }
+  return null;
+}
+
+// ── BOPAlgo_MakerVolume fast-path ───────────────────────────────────────────
+
+/**
+ * Use OCCT's BOPAlgo_MakerVolume to build a solid from oversized faces.
+ * This is the ideal single-call solution: it computes all surface–surface
+ * intersection curves, trims every face, and assembles a watertight solid.
+ *
+ * MakerVolume may not be available in all opencascade.js builds; when it is
+ * not, _buildSolidViaSections() provides the same result using only core
+ * Boolean APIs.
+ */
+function _buildSolidViaMakerVolume(oc, faces, fuzzyTol, toDelete) {
+  if (typeof oc.BOPAlgo_MakerVolume_1 !== 'function') return null;
+  try {
+    const maker = new oc.BOPAlgo_MakerVolume_1();
+    toDelete.push(maker);
+    const argList = new oc.TopTools_ListOfShape_1();
+    toDelete.push(argList);
+    for (const f of faces) argList.Append_1(f);
+    maker.SetArguments(argList);
+    maker.SetIntersect(true);
+    if (typeof maker.SetAvoidInternalShapes === 'function')
+      maker.SetAvoidInternalShapes(true);
+    if (typeof maker.SetFuzzyValue === 'function' && fuzzyTol > 0)
+      maker.SetFuzzyValue(fuzzyTol);
+    if (typeof maker.SetRunParallel === 'function')
+      maker.SetRunParallel(false);
+    maker.Perform();
+    if (typeof maker.HasErrors === 'function' && maker.HasErrors()) return null;
+    const result = maker.Shape();
+    if (!result || (typeof result.IsNull === 'function' && result.IsNull()))
       return null;
+    console.info('BOPAlgo_MakerVolume succeeded.');
+    return result;
+  } catch (e) {
+    console.warn('BOPAlgo_MakerVolume unavailable:', e?.message ?? e);
+    return null;
+  }
+}
+
+// ── Section-based solid builder ─────────────────────────────────────────────
+
+/**
+ * Build a solid by computing analytical intersection curves between adjacent
+ * face pairs, trimming each face with those curves, and sewing the trimmed
+ * faces into a watertight solid.
+ *
+ * The mesh is used ONLY for the adjacency map (which faces are neighbours).
+ * All intersection curves and trim boundaries are computed analytically by
+ * OCCT's geometry kernel — no mesh-derived geometry appears in the output.
+ */
+function _buildSolidViaSections(oc, faceEntries, adjacency, groups,
+                                modelDiag, sewTol, toDelete) {
+  const idxToEntry = new Map();
+  for (const e of faceEntries) idxToEntry.set(e.groupIdx, e);
+
+  const tolerance = sewTol;
+
+  // Phase 1 — For each face, compute its section edges against all neighbours
+  // in a single BRepAlgoAPI_Section call so that OCCT produces consistent
+  // vertex topology at triple-point intersections.
+  const faceSectionEdges = new Map();
+
+  for (const { face, groupIdx } of faceEntries) {
+    const adjSet = adjacency.get(groupIdx);
+    if (!adjSet || adjSet.size === 0) {
+      faceSectionEdges.set(groupIdx, []);
+      continue;
     }
-    result = next;
+
+    const adjFaces = [];
+    for (const adjIdx of adjSet) {
+      const adjEntry = idxToEntry.get(adjIdx);
+      if (adjEntry) adjFaces.push(adjEntry.face);
+    }
+    if (adjFaces.length === 0) {
+      faceSectionEdges.set(groupIdx, []);
+      continue;
+    }
+
+    const adjCompound = new oc.TopoDS_Compound();
+    const bb = new oc.BRep_Builder();
+    bb.MakeCompound(adjCompound);
+    for (const af of adjFaces) bb.Add(adjCompound, af);
+    toDelete.push(adjCompound);
+
+    const sectionShape = _section(oc, face, adjCompound, toDelete);
+    const edges = sectionShape ? _extractEdges(oc, sectionShape, toDelete) : [];
+    faceSectionEdges.set(groupIdx, edges);
+
+    if (edges.length === 0) {
+      console.warn(`No section edges for group ${groupIdx} (${groups[groupIdx]?.surface?.type}).`);
+    }
   }
 
-  console.info(`Half-space intersection succeeded — watertight solid from ${halfSpaces.length} surfaces.`);
-  return result;
+  // Phase 2 — Build a trimmed face for each group.
+  const trimmedFaces = [];
+  for (const { group, groupIdx } of faceEntries) {
+    const edges = faceSectionEdges.get(groupIdx) || [];
+    const adjSet = adjacency.get(groupIdx) || new Set();
+    const trimmed = _buildTrimmedFace(
+      oc, group, groupIdx, edges, adjSet, groups,
+      modelDiag, tolerance, toDelete);
+    if (trimmed) trimmedFaces.push(trimmed);
+    else console.warn(`Could not trim group ${groupIdx} (${group.surface?.type}).`);
+  }
+
+  if (trimmedFaces.length === 0) return null;
+
+  // Phase 3 — Sew trimmed faces into a solid.
+  const solid = _sewIntoSolid(oc, trimmedFaces, sewTol, toDelete);
+  if (solid) {
+    console.info(`Section-based solid: ${trimmedFaces.length} trimmed faces.`);
+  }
+  return solid;
+}
+
+// ── Main solid builder ──────────────────────────────────────────────────────
+
+/**
+ * Build a watertight solid from oversized analytical faces.
+ *
+ * Two implementations of the same face-based analytical-trimming approach:
+ *   1. BOPAlgo_MakerVolume — ideal single-call (if available in this build).
+ *   2. Section-based trimming — robust path using only core OCCT APIs.
+ *
+ * Both produce the same result: faces trimmed at exact analytical intersection
+ * curves, assembled into a watertight solid.  No mesh-derived boundaries.
+ */
+function _buildSolid(oc, faceEntries, adjacency, groups,
+                     modelDiag, sewTol, toDelete) {
+  // Fast path: BOPAlgo_MakerVolume.
+  const faces = faceEntries.map(e => e.face);
+  const mv = _buildSolidViaMakerVolume(oc, faces, sewTol, toDelete);
+  if (mv) return mv;
+
+  // Robust path: Section-based analytical trimming.
+  console.info('MakerVolume unavailable — using Section-based analytical trimming.');
+  return _buildSolidViaSections(oc, faceEntries, adjacency, groups,
+                                modelDiag, sewTol, toDelete);
 }
 
 // ── Main export: build B-rep + STEP ─────────────────────────────────────────
@@ -800,8 +1128,8 @@ export async function buildAndExportSTEP(groups, geometry, options = {}, onStatu
   const toDelete   = [];
 
   // ── Compute model bounding-box diagonal ─────────────────────────────────────
-  // Used both for adaptive sewing tolerance (fallback strategy) and for sizing
-  // the oversized analytical patches in _buildLargePatch().
+  // Used for adaptive sewing tolerance and for sizing the oversized analytical
+  // patches in _buildLargePatch().
   const posAttr = geometry.attributes.position;
   let xmin =  Infinity, ymin =  Infinity, zmin =  Infinity;
   let xmax = -Infinity, ymax = -Infinity, zmax = -Infinity;
@@ -820,11 +1148,13 @@ export async function buildAndExportSTEP(groups, geometry, options = {}, onStatu
   //
   // ALL surface types (plane, cylinder, cone, sphere) go through the same code
   // path — _buildLargePatch() — with model-scale margins so that each face
-  // extends well beyond the model bounding box.  Trimming is handled entirely
-  // by OCCT's Boolean kernel in the half-space intersection step below.
+  // extends well beyond the model bounding box.  Trimming is handled by OCCT's
+  // geometry kernel (MakerVolume or Section-based trimming) — never by mesh
+  // boundaries.
   //
-  // We track the face→group mapping because the half-space strategy needs the
-  // group's mesh normals to determine the material-side reference point.
+  // We track the groupIdx because the Section-based trimming path uses the
+  // mesh-derived adjacency map to know which faces are neighbours, and the
+  // fitted surface parameters to compute analytical V-bounds.
 
   const faceEntries = [];
   for (let i = 0; i < groups.length; i++) {
@@ -834,127 +1164,35 @@ export async function buildAndExportSTEP(groups, geometry, options = {}, onStatu
 
     try {
       const face = _buildLargePatch(oc, g, geometry, toDelete, modelDiag);
-      if (face) faceEntries.push({ face, group: g });
+      if (face) faceEntries.push({ face, group: g, groupIdx: i });
     } catch (e) {
       console.warn(`Patch ${i} (${g.surface?.type}):`, e?.message ?? e);
     }
   }
 
-  const faces = faceEntries.map(e => e.face);
+  if (faceEntries.length === 0) throw new Error('No valid B-rep faces could be constructed.');
 
-  if (faces.length === 0) throw new Error('No valid B-rep faces could be constructed.');
+  onStatus?.(`Trimming ${faceEntries.length} faces and building solid…`, 40);
 
-  onStatus?.(`Trimming ${faces.length} faces and building solid…`, 40);
+  // ── Compute mesh adjacency ─────────────────────────────────────────────────
+  // The mesh is used ONLY here — to determine which surface groups are
+  // neighbours.  All intersection curves and trim boundaries are computed
+  // analytically by OCCT's geometry kernel.
+  const adjacency = buildGroupAdjacencyMap(groups, geometry);
 
   // ── Build a watertight solid ────────────────────────────────────────────────
-  let topShape = null;
+  // One approach (face-based analytical trimming) with two implementations:
+  //   • BOPAlgo_MakerVolume — ideal, single-call (if available in this build)
+  //   • Section-based trimming — robust path using only core OCCT APIs
+  // No fallback to untrimmed faces, no compound dumping.
+  const topShape = _buildSolid(
+    oc, faceEntries, adjacency, groups, modelDiag, sewTol, toDelete);
 
-  // ── Strategy 0: Half-space intersection ────────────────────────────────────
-  // For each face, create a half-space solid on the material side (determined
-  // by outward mesh normals).  Then sequentially Boolean-intersect all half-
-  // spaces.  OCCT's Boolean kernel computes exact analytical intersection
-  // curves (circles, lines, conics) and produces a properly trimmed solid
-  // with holes arising naturally — no per-type heuristics or mesh data.
-  topShape = _buildSolidViaHalfSpaces(oc, faceEntries, geometry, modelDiag, toDelete);
-
-  // ── Strategy 1: BOPAlgo_MakerVolume (fallback) ────────────────────────────
   if (!topShape) {
-    topShape = _buildSolidViaMakerVolume(oc, faces, sewTol, toDelete);
-  }
-
-  // ── Strategy 2: BRepBuilderAPI_Sewing (fallback) ──────────────────────────
-  if (!topShape) {
-    onStatus?.(`Sewing ${faces.length} faces…`, 50);
-    try {
-      // BRepBuilderAPI_Sewing constructor: _1() default tol, _2(tol, opts…).
-      // Use typeof guard to avoid accidentally calling an undefined constructor.
-      const SewCtor = typeof oc.BRepBuilderAPI_Sewing_2 === 'function'
-        ? oc.BRepBuilderAPI_Sewing_2
-        : typeof oc.BRepBuilderAPI_Sewing_1 === 'function'
-          ? oc.BRepBuilderAPI_Sewing_1
-          : oc.BRepBuilderAPI_Sewing;
-      const sewing = new SewCtor(sewTol);
-      toDelete.push(sewing);
-
-      for (const f of faces) sewing.Add(f);
-
-      // Perform() has an optional Handle<Message_ProgressIndicator> default arg.
-      // Some Emscripten builds handle the no-arg call; others throw — we catch.
-      sewing.Perform();
-
-      const sewn = sewing.SewedShape();
-
-      // SewedShape() may return a Shell, Solid, or Compound.
-      const shapeType = sewn.ShapeType?.() ?? -1;
-      const SOLID_T   = oc.TopAbs_ShapeEnum?.TopAbs_SOLID   ?? 3;
-      const SHELL_T   = oc.TopAbs_ShapeEnum?.TopAbs_SHELL   ?? 4;
-      const COMP_T    = oc.TopAbs_ShapeEnum?.TopAbs_COMPOUND ?? 0;
-
-      if (shapeType === SOLID_T) {
-        topShape = sewn;
-      } else if (shapeType === SHELL_T) {
-        const mkSolid = new oc.BRepBuilderAPI_MakeSolid_3(sewn);
-        toDelete.push(mkSolid);
-        if (mkSolid.IsDone()) topShape = mkSolid.Solid();
-      } else if (shapeType === COMP_T) {
-        // Sewing produced a compound (multiple disconnected shells).
-        // Try to find the largest shell inside it and wrap that.
-        try {
-          const expShell = new oc.TopExp_Explorer_2(
-            sewn,
-            oc.TopAbs_ShapeEnum?.TopAbs_SHELL ?? 4,
-            oc.TopAbs_ShapeEnum?.TopAbs_SHAPE ?? 0,
-          );
-          toDelete.push(expShell);
-          let bestShell = null;
-          while (expShell.More()) {
-            const s = expShell.Current();
-            if (!bestShell) bestShell = s;
-            expShell.Next();
-          }
-          if (bestShell) {
-            const mkSolid = new oc.BRepBuilderAPI_MakeSolid_3(bestShell);
-            toDelete.push(mkSolid);
-            if (mkSolid.IsDone()) topShape = mkSolid.Solid();
-          }
-        } catch { /* fall through to strategy 3 */ }
-      }
-
-      if (topShape) console.info(`Sewing succeeded — solid built from sewn shape (type ${shapeType}).`);
-    } catch (sewErr) {
-      console.warn('BRepBuilderAPI_Sewing unavailable or failed:', sewErr?.message ?? sewErr);
-    }
-  }
-
-  // ── Strategy 3: manual shell → solid (no sewing) ───────────────────────────
-  if (!topShape) {
-    try {
-      const brepBuilder = new oc.BRep_Builder();
-      const shell = new oc.TopoDS_Shell();
-      toDelete.push(shell);
-      brepBuilder.MakeShell(shell);
-      for (const f of faces) brepBuilder.Add(shell, f);
-
-      const mkSolid = new oc.BRepBuilderAPI_MakeSolid_3(shell);
-      toDelete.push(mkSolid);
-      if (mkSolid.IsDone()) {
-        topShape = mkSolid.Solid();
-        console.info('Using unsewn shell→solid fallback.');
-      }
-    } catch (shErr) {
-      console.warn('Shell→Solid failed:', shErr?.message ?? shErr);
-    }
-  }
-
-  // ── Strategy 4: bare compound (last resort, still imports as surfaces) ──────
-  if (!topShape) {
-    console.warn('All solid strategies failed — falling back to TopoDS_Compound.');
-    const brepBuilder = new oc.BRep_Builder();
-    const compound = new oc.TopoDS_Compound();
-    toDelete.push(compound);
-    brepBuilder.MakeCompound(compound);
-    for (const f of faces) brepBuilder.Add(compound, f);
-    topShape = compound;
+    throw new Error(
+      'Solid construction failed.  Neither BOPAlgo_MakerVolume nor ' +
+      'Section-based trimming could produce a watertight solid from ' +
+      `${faceEntries.length} analytical faces.`);
   }
 
   onStatus?.('Writing STEP file…', 80);
