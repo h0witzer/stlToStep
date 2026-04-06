@@ -1259,9 +1259,8 @@ function _filterSolidsInsideMesh(oc, shape, geometry, tol, toDelete) {
   }
 
   if (solids.length === 0) return null;
-  if (solids.length === 1) return solids[0];  // no filtering needed
 
-  console.info(`BOPAlgo_MakerVolume: filtering ${solids.length} cells against mesh boundary…`);
+  console.info(`BOPAlgo_MakerVolume: filtering ${solids.length} cell(s) against mesh boundary…`);
 
   const kept = [];
   for (const solid of solids) {
