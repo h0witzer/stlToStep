@@ -34,12 +34,13 @@
 // ── Build version ─────────────────────────────────────────────────────────────
 
 /** Increment this string with each release to verify live-site deployments. */
-export const BUILD_VERSION = 'v0.2.2';
+export const BUILD_VERSION = 'v0.2.3';
 
 // ── OpenCASCADE lazy loader ───────────────────────────────────────────────────
 
-// jsdelivr returns HTTP 403 for the .wasm binary; unpkg serves all file types.
-const OC_CDN = 'https://unpkg.com/opencascade.js@1.1.4/dist/';
+// opencascade.js 2.0 beta — full OCCT 7.6.2 bindings with proper TypeScript types.
+// BOPAlgo_MakerVolume_1() is supported here (it was RED/unsupported in 1.1.4).
+const OC_CDN = 'https://unpkg.com/opencascade.js@2.0.0-beta.b5ff984/dist/';
 
 let _oc = null;
 let _ocPromise = null;
@@ -56,11 +57,12 @@ export async function initOC(onStatus) {
   if (_ocPromise) return _ocPromise;
 
   _ocPromise = (async () => {
-    onStatus?.('Downloading OpenCASCADE geometry engine (~25 MB, first load only)…');
+    onStatus?.('Downloading OpenCASCADE geometry engine (~35 MB, first load only)…');
 
-    // opencascade.js@1.1.4 ships as an ES module, so dynamic import() is the
-    // correct loader. The module's default export is the factory function.
-    const ocMod = await import(/* @vite-ignore */ OC_CDN + 'opencascade.wasm.js');
+    // opencascade.js 2.0 beta ships opencascade.full.js (Emscripten glue) +
+    // opencascade.full.wasm.  Dynamic import() fetches the glue; locateFile
+    // maps the .wasm request back to the CDN.
+    const ocMod = await import(/* @vite-ignore */ OC_CDN + 'opencascade.full.js');
     const factory = ocMod.default ?? ocMod.opencascade;
     if (typeof factory !== 'function') {
       throw new Error(
@@ -71,7 +73,11 @@ export async function initOC(onStatus) {
 
     onStatus?.('Initialising OpenCASCADE…');
     _oc = await factory({
-      locateFile: (file) => OC_CDN + file,
+      locateFile: (file) => {
+        // The wasm binary is always named opencascade.full.wasm in 2.0 beta.
+        if (file.endsWith('.wasm')) return OC_CDN + 'opencascade.full.wasm';
+        return OC_CDN + file;
+      },
       print:    () => {},
       printErr: () => {},
     });
@@ -93,6 +99,16 @@ function makeDir(oc, v)  {
 
 function makeAx3(oc, origin, normal) {
   return new oc.gp_Ax3_4(makePnt(oc, origin), makeDir(oc, normal));
+}
+
+/**
+ * Return a new Message_ProgressRange for passing to OCCT Perform()/Build()
+ * calls that require one in opencascade.js 2.0 beta (OCCT 7.5+).
+ * The range is "dead" (no reporter attached) so OCCT treats it as a no-op
+ * progress indicator.
+ */
+function _mkRange(oc) {
+  try { return new oc.Message_ProgressRange_1(); } catch { return null; }
 }
 
 // ── Surface snapping helpers ─────────────────────────────────────────────────
@@ -571,64 +587,46 @@ function _buildLargePatch(oc, group, geometry, toDelete, modelDiag) {
  * @returns {object|null}  resulting TopoDS_Shape (compound of edges) or null
  */
 function _section(oc, s1, s2, toDelete) {
-  // opencascade.js Emscripten bindings number constructor overloads
-  // sequentially.  For BRepAlgoAPI_Section the C++ constructors are:
-  //   _1()                               — empty (then Init1/Init2/Build)
-  //   _2(S1, S2, PaveFiller, bool)       — 4 args
-  //   _3(S1, S2, bool)                   — 3 args  ← most common
-  //   _4(S1, gp_Pln, bool)              — 3 args
-  //   _5(S1, Geom_Surface, bool)         — 3 args
-  // The numbering varies between opencascade.js builds so we probe
-  // systematically: try (S1, S2, true), then (S1, S2), then empty+Build.
+  // opencascade.js 2.0 beta TypeScript declaration (verified from d.ts):
+  //   BRepAlgoAPI_Section_1()                         — empty ctor
+  //   BRepAlgoAPI_Section_2(PaveFiller)               — with filler
+  //   BRepAlgoAPI_Section_3(S1, S2, PerformNow)       — two shapes ← use this
+  //   BRepAlgoAPI_Section_4(S1, S2, PaveFiller, Now)  — with filler
+  //   BRepAlgoAPI_Section_5(S1, gp_Pln, Now)
+  //   BRepAlgoAPI_Section_6(S1, Geom_Surface, Now)
+  //   Build(Message_ProgressRange)                     — required in 2.0 beta
 
-  // ── Attempt 1: try every suffix with 3-arg (S1, S2, PerformNow=true) ────
-  for (const suffix of ['_3', '_2', '_5', '_4']) {
-    const name = 'BRepAlgoAPI_Section' + suffix;
+  // ── Attempt 1: three-arg (S1, S2, PerformNow=true) ───────────────────────
+  // _3 is the (S1, S2, PerformNow) overload in both 1.1.4 and 2.0 beta.
+  // Also try _2 which was (S1, S2, PerformNow) in older builds.
+  for (const name of ['BRepAlgoAPI_Section_3', 'BRepAlgoAPI_Section_2']) {
     if (typeof oc[name] !== 'function') continue;
     try {
       const sec = new oc[name](s1, s2, true);
       toDelete.push(sec);
       if (typeof sec.IsDone === 'function' && !sec.IsDone()) continue;
       const shape = sec.Shape();
-      if (!shape) continue;
-      if (typeof shape.IsNull === 'function' && shape.IsNull()) continue;
+      if (!shape || (typeof shape.IsNull === 'function' && shape.IsNull())) continue;
       return shape;
     } catch { continue; }
   }
 
-  // ── Attempt 2: try every suffix with 2-arg (S1, S2) ─────────────────────
-  for (const suffix of ['_3', '_2', '_5', '_4']) {
-    const name = 'BRepAlgoAPI_Section' + suffix;
-    if (typeof oc[name] !== 'function') continue;
-    try {
-      const sec = new oc[name](s1, s2);
-      toDelete.push(sec);
-      if (typeof sec.Build === 'function') {
-        try { sec.Build(); } catch { /* auto-built */ }
-      }
-      if (typeof sec.IsDone === 'function' && !sec.IsDone()) continue;
-      const shape = sec.Shape();
-      if (!shape) continue;
-      if (typeof shape.IsNull === 'function' && shape.IsNull()) continue;
-      return shape;
-    } catch { continue; }
-  }
-
-  // ── Attempt 3: empty constructor → Init1/Init2 → Build ──────────────────
+  // ── Attempt 2: empty ctor → Init1/Init2 → Build ──────────────────────────
   if (typeof oc.BRepAlgoAPI_Section_1 === 'function') {
     try {
       const sec = new oc.BRepAlgoAPI_Section_1();
       toDelete.push(sec);
-      // The Init methods may be named Init1_1/Init2_1 in some builds.
       const init1 = sec.Init1_1 ?? sec.Init1;
       const init2 = sec.Init2_1 ?? sec.Init2;
       if (typeof init1 === 'function') init1.call(sec, s1);
       if (typeof init2 === 'function') init2.call(sec, s2);
-      if (typeof sec.Build === 'function') sec.Build();
+      if (typeof sec.Build === 'function') {
+        const range = _mkRange(oc);
+        try { sec.Build(range); } catch { try { sec.Build(); } catch {} }
+      }
       if (typeof sec.IsDone === 'function' && !sec.IsDone()) return null;
       const shape = sec.Shape();
-      if (!shape) return null;
-      if (typeof shape.IsNull === 'function' && shape.IsNull()) return null;
+      if (!shape || (typeof shape.IsNull === 'function' && shape.IsNull())) return null;
       return shape;
     } catch { /* fall through */ }
   }
@@ -650,7 +648,15 @@ function _extractEdges(oc, shape, toDelete) {
     const explorer = new oc.TopExp_Explorer_2(shape, EDGE_T, SHAPE_T);
     toDelete.push(explorer);
     while (explorer.More()) {
-      edges.push(explorer.Current());
+      // explorer.Current() returns TopoDS_Shape; cast to TopoDS_Edge so that
+      // BRepAdaptor_Curve_2 and BRepBuilderAPI_MakeWire.Add_1 receive the
+      // correct type (required in opencascade.js 2.0 beta).
+      try {
+        const e = oc.TopoDS.Edge_1(explorer.Current());
+        edges.push(e);
+      } catch {
+        edges.push(explorer.Current()); // fallback for older builds
+      }
       explorer.Next();
     }
   } catch (e) {
@@ -977,33 +983,15 @@ function _buildTrimmedFace(oc, group, groupIdx, sectionEdges, adjacentIndices,
 function _sewIntoSolid(oc, faces, sewTol, toDelete) {
   if (faces.length === 0) return null;
   try {
-    // BRepBuilderAPI_Sewing constructor overloads in opencascade.js:
-    //   _1()               — no args (default tol 1e-6)
-    //   _2(tol,o1,o2,o3,o4) — ALL 5 C++ args required (no default args in Emscripten)
-    // The C++ signature: Sewing(tolerance=1e-6, option1=true, option2=true,
-    //   option3=true, option4=false)
-    let sewing;
-    if (typeof oc.BRepBuilderAPI_Sewing_2 === 'function') {
-      try {
-        sewing = new oc.BRepBuilderAPI_Sewing_2(sewTol, true, true, true, false);
-      } catch {
-        // If _2 exists but rejects 5 args, try other patterns
-        sewing = null;
-      }
-    }
-    if (!sewing && typeof oc.BRepBuilderAPI_Sewing_1 === 'function') {
-      sewing = new oc.BRepBuilderAPI_Sewing_1();
-      // Set tolerance on the default-constructed sewing object
-      if (typeof sewing.SetTolerance === 'function') sewing.SetTolerance(sewTol);
-    }
-    if (!sewing) {
-      // Last resort: try unversioned name
-      sewing = new oc.BRepBuilderAPI_Sewing(sewTol, true, true, true, false);
-    }
+    // opencascade.js 2.0 beta (verified from d.ts):
+    //   BRepBuilderAPI_Sewing(tolerance, option1, option2, option3, option4)
+    //   — ALL 5 args required; no numbered suffix (single overload exported).
+    //   Perform(Message_ProgressRange) — progress range is required.
+    const sewing = new oc.BRepBuilderAPI_Sewing(sewTol, true, true, true, false);
     toDelete.push(sewing);
 
     for (const f of faces) sewing.Add(f);
-    sewing.Perform();
+    sewing.Perform(_mkRange(oc));
 
     const sewn = sewing.SewedShape();
     const shapeType = sewn.ShapeType?.() ?? -1;
@@ -1014,7 +1002,9 @@ function _sewIntoSolid(oc, faces, sewTol, toDelete) {
     if (shapeType === SOLID_T) return sewn;
 
     if (shapeType === SHELL_T) {
-      const mkSolid = new oc.BRepBuilderAPI_MakeSolid_3(sewn);
+      // BRepBuilderAPI_MakeSolid_3 takes TopoDS_Shell — cast from TopoDS_Shape.
+      const shell = oc.TopoDS.Shell_1 ? oc.TopoDS.Shell_1(sewn) : sewn;
+      const mkSolid = new oc.BRepBuilderAPI_MakeSolid_3(shell);
       toDelete.push(mkSolid);
       return mkSolid.IsDone() ? mkSolid.Solid() : null;
     }
@@ -1024,7 +1014,9 @@ function _sewIntoSolid(oc, faces, sewTol, toDelete) {
         sewn, SHELL_T, oc.TopAbs_ShapeEnum?.TopAbs_SHAPE ?? 0);
       toDelete.push(expShell);
       if (expShell.More()) {
-        const mkSolid = new oc.BRepBuilderAPI_MakeSolid_3(expShell.Current());
+        const shellShape = expShell.Current();
+        const shell = oc.TopoDS.Shell_1 ? oc.TopoDS.Shell_1(shellShape) : shellShape;
+        const mkSolid = new oc.BRepBuilderAPI_MakeSolid_3(shell);
         toDelete.push(mkSolid);
         return mkSolid.IsDone() ? mkSolid.Solid() : null;
       }
@@ -1047,18 +1039,18 @@ function _sewIntoSolid(oc, faces, sewTol, toDelete) {
  * Boolean APIs.
  */
 function _buildSolidViaMakerVolume(oc, faces, fuzzyTol, toDelete) {
-  // Probe for the MakerVolume constructor — try _1 (default) and _2 (allocator).
-  let MakerCtor = null;
-  for (const suffix of ['_1', '_2', '']) {
-    const name = 'BOPAlgo_MakerVolume' + suffix;
-    if (typeof oc[name] === 'function') { MakerCtor = oc[name]; break; }
-  }
-  if (!MakerCtor) {
-    console.warn('BOPAlgo_MakerVolume: no constructor found in this opencascade.js build.');
+  // opencascade.js 2.0 beta (verified from d.ts):
+  //   BOPAlgo_MakerVolume_1()  — no-arg constructor
+  //   SetArguments(TopTools_ListOfShape)  — via BOPAlgo_Builder base
+  //   Perform(Message_ProgressRange)      — required
+  //
+  // In 1.1.4 this class was marked RED (not exported); 2.0 beta exports it fully.
+  if (typeof oc.BOPAlgo_MakerVolume_1 !== 'function') {
+    console.warn('BOPAlgo_MakerVolume_1 not found in this opencascade.js build.');
     return null;
   }
   try {
-    const maker = new MakerCtor();
+    const maker = new oc.BOPAlgo_MakerVolume_1();
     toDelete.push(maker);
     const argList = new oc.TopTools_ListOfShape_1();
     toDelete.push(argList);
@@ -1071,7 +1063,7 @@ function _buildSolidViaMakerVolume(oc, faces, fuzzyTol, toDelete) {
       maker.SetFuzzyValue(fuzzyTol);
     if (typeof maker.SetRunParallel === 'function')
       maker.SetRunParallel(false);
-    maker.Perform();
+    maker.Perform(_mkRange(oc));
     if (typeof maker.HasErrors === 'function' && maker.HasErrors()) {
       console.warn('BOPAlgo_MakerVolume: Perform() completed with errors.');
       return null;
@@ -1300,6 +1292,7 @@ export async function buildAndExportSTEP(groups, geometry, options = {}, onStatu
     topShape,
     oc.STEPControl_StepModelType?.STEPControl_AsIs ?? 0,
     true,
+    _mkRange(oc),
   );
 
   if (transferResult !== DONE) {
