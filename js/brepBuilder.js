@@ -6,22 +6,16 @@
  *      All surface types (plane, cylinder, cone, sphere) use _buildLargePatch()
  *      with margins proportional to the model bounding-box diagonal so every
  *      face extends well beyond any possible intersection with its neighbours.
- *   2. Compute exact analytical intersection curves between every pair of
- *      adjacent faces using BRepAlgoAPI_Section.  These are true surface–
- *      surface intersections (circles for plane∩cylinder, lines for
- *      plane∩plane, conics for cone cases, etc.) — no mesh data involved.
- *   3. Trim each face using the section curves:
- *        • Plane faces: assemble section edges into closed wires, then
- *          BRepBuilderAPI_MakeFace(gp_Pln, outerWire).  Inner wires (from
- *          holes) are added via MakeFace.Add().
- *        • Curved faces (cylinder, cone, sphere): project section edges onto
- *          the surface axis to determine V-parameter bounds, then
- *          MakeFace(gp_Cylinder/Cone/Sphere, 0, 2π, Vmin, Vmax).
- *      This generalises to fillets and arbitrary NURBS surfaces — section
- *      edges give exact trim curves for any pair of analytical or freeform
- *      surfaces.
- *   4. Sew the trimmed faces into a watertight shell → solid.
- *   5. Write STEP via STEPControl_Writer with the /tmp CWD strategy.
+ *   2. Feed all oversized faces into BRepAlgoAPI_Splitter as both Arguments
+ *      and Tools.  The kernel finds every surface–surface intersection (lines,
+ *      circles, ellipses, conics, …) simultaneously and trims every face into
+ *      the exact fragments bounded by those intersections — no surface-type
+ *      enumeration, no manual wire-building, no vertex math.
+ *   3. For each input group, keep the one output fragment whose centroid (via
+ *      BRepGProp.SurfaceProperties) is closest to the group's surface origin.
+ *      This discards the "exterior" flaps from the oversized patches.
+ *   4. Sew the kept fragments into a watertight shell → solid.
+ *   5. Write STEP via STEPControl_Writer.
  *
  * opencascade.js is loaded lazily via dynamic import() when the user first
  * clicks "Export STEP" so the 35 MB WASM does not block page load.
@@ -30,7 +24,7 @@
 // ── Build version ─────────────────────────────────────────────────────────────
 
 /** Increment this string with each release to verify live-site deployments. */
-export const BUILD_VERSION = 'v0.2.11';
+export const BUILD_VERSION = 'v0.2.12';
 
 // ── OpenCASCADE lazy loader ───────────────────────────────────────────────────
 
@@ -613,509 +607,175 @@ function _buildLargePatch(oc, group, geometry, toDelete, modelDiag) {
   return null;
 }
 
-// ── BRepAlgoAPI_Section wrapper ──────────────────────────────────────────────
+// ── Splitter-based solid builder ────────────────────────────────────────────
 
 /**
- * Compute the intersection curves between two shapes using BRepAlgoAPI_Section.
- * Probes multiple constructor overloads for opencascade.js compatibility.
+ * Compute the centroid of a TopoDS_Face using BRepGProp.SurfaceProperties.
  *
  * @param {object}   oc
- * @param {object}   s1     TopoDS_Shape
- * @param {object}   s2     TopoDS_Shape
+ * @param {object}   face     TopoDS_Face
  * @param {object[]} toDelete
- * @returns {object|null}  resulting TopoDS_Shape (compound of edges) or null
+ * @returns {number[]|null}  [x, y, z] centroid or null on failure
  */
-function _section(oc, s1, s2, toDelete) {
-  // opencascade.js 2.0 beta TypeScript declaration (verified from d.ts):
-  //   BRepAlgoAPI_Section_1()                         — empty ctor
-  //   BRepAlgoAPI_Section_2(PaveFiller)               — with filler
-  //   BRepAlgoAPI_Section_3(S1, S2, PerformNow)       — two shapes ← use this
-  //   BRepAlgoAPI_Section_4(S1, S2, PaveFiller, Now)  — with filler
-  //   BRepAlgoAPI_Section_5(S1, gp_Pln, Now)
-  //   BRepAlgoAPI_Section_6(S1, Geom_Surface, Now)
-  //   Build(Message_ProgressRange)                     — required in 2.0 beta
-
-  // ── Attempt 1: three-arg (S1, S2, PerformNow=true) ───────────────────────
-  // _3 is the (S1, S2, PerformNow) overload in both 1.1.4 and 2.0 beta.
-  // Also try _2 which was (S1, S2, PerformNow) in older builds.
-  for (const name of ['BRepAlgoAPI_Section_3', 'BRepAlgoAPI_Section_2']) {
-    if (typeof oc[name] !== 'function') continue;
-    try {
-      const sec = new oc[name](s1, s2, true);
-      toDelete.push(sec);
-      if (typeof sec.IsDone === 'function' && !sec.IsDone()) continue;
-      const shape = sec.Shape();
-      if (!shape || (typeof shape.IsNull === 'function' && shape.IsNull())) continue;
-      return shape;
-    } catch { continue; }
-  }
-
-  // ── Attempt 2: empty ctor → Init1/Init2 → Build ──────────────────────────
-  if (typeof oc.BRepAlgoAPI_Section_1 === 'function') {
-    try {
-      const sec = new oc.BRepAlgoAPI_Section_1();
-      toDelete.push(sec);
-      const init1 = sec.Init1_1 ?? sec.Init1;
-      const init2 = sec.Init2_1 ?? sec.Init2;
-      if (typeof init1 === 'function') init1.call(sec, s1);
-      if (typeof init2 === 'function') init2.call(sec, s2);
-      if (typeof sec.Build === 'function') {
-        const range = _mkRange(oc);
-        try { sec.Build(range); } catch { try { sec.Build(); } catch {} }
-      }
-      if (typeof sec.IsDone === 'function' && !sec.IsDone()) return null;
-      const shape = sec.Shape();
-      if (!shape || (typeof shape.IsNull === 'function' && shape.IsNull())) return null;
-      return shape;
-    } catch { /* fall through */ }
-  }
-
-  console.warn('BRepAlgoAPI_Section: no working constructor found.');
-  return null;
-}
-
-// ── Edge extraction ─────────────────────────────────────────────────────────
-
-/**
- * Extract all TopoDS_Edge objects from a shape using TopExp_Explorer.
- */
-function _extractEdges(oc, shape, toDelete) {
-  const edges = [];
-  const EDGE_T = oc.TopAbs_ShapeEnum?.TopAbs_EDGE ?? 5;
-  const SHAPE_T = oc.TopAbs_ShapeEnum?.TopAbs_SHAPE ?? 0;
+function _faceGPropCentroid(oc, face, toDelete) {
   try {
-    const explorer = new oc.TopExp_Explorer_2(shape, EDGE_T, SHAPE_T);
-    toDelete.push(explorer);
-    while (explorer.More()) {
-      // explorer.Current() returns TopoDS_Shape; cast to TopoDS_Edge so that
-      // BRepAdaptor_Curve_2 and BRepBuilderAPI_MakeWire.Add_1 receive the
-      // correct type (required in opencascade.js 2.0 beta).
-      try {
-        const e = oc.TopoDS.Edge_1(explorer.Current());
-        edges.push(e);
-      } catch {
-        edges.push(explorer.Current()); // fallback for older builds
-      }
-      explorer.Next();
-    }
-  } catch (e) {
-    console.warn('_extractEdges failed:', e?.message ?? e);
-  }
-  return edges;
-}
-
-// ── Edge endpoint extraction ────────────────────────────────────────────────
-
-/**
- * Get the 3D start and end points of an OCCT edge, plus whether it is closed.
- * Uses BRepAdaptor_Curve to evaluate the edge's underlying curve.
- *
- * @param {object} oc
- * @param {object} edge   TopoDS_Edge
- * @param {object[]} toDelete
- * @param {number} tolerance  distance below which start≈end means "closed"
- * @returns {{ start: number[], end: number[], closed: boolean }|null}
- */
-function _edgePoints(oc, edge, toDelete, tolerance = 1e-6) {
-  try {
-    const adaptor = new oc.BRepAdaptor_Curve_2(edge);
-    toDelete.push(adaptor);
-    const p1 = adaptor.Value(adaptor.FirstParameter());
-    const p2 = adaptor.Value(adaptor.LastParameter());
-    toDelete.push(p1, p2);
-    const start = [p1.X(), p1.Y(), p1.Z()];
-    const end   = [p2.X(), p2.Y(), p2.Z()];
-    const dx = end[0]-start[0], dy = end[1]-start[1], dz = end[2]-start[2];
-    const closed = Math.sqrt(dx*dx+dy*dy+dz*dz) < tolerance;
-    return { start, end, closed };
+    const props = new oc.GProp_GProps_1();
+    toDelete.push(props);
+    oc.BRepGProp.SurfaceProperties_1(face, props, false, false);
+    const com = props.CentreOfMass();
+    toDelete.push(com);
+    return [com.X(), com.Y(), com.Z()];
   } catch {
     return null;
   }
 }
 
-// ── Edge → wire grouping ────────────────────────────────────────────────────
-
 /**
- * Group a set of OCCT edges into closed wires by endpoint connectivity.
+ * Build a watertight solid using BRepAlgoAPI_Splitter:
  *
- * Edges whose start and end coincide (within tolerance) are treated as
- * standalone closed wires (e.g. circles from plane∩cylinder sections).
+ *  1. Feed all oversized analytical patches as both Arguments and Tools so the
+ *     Splitter fragments every surface by every other surface simultaneously.
+ *     OCCT handles all curve types (lines, circles, ellipses, conics) and all
+ *     angle combinations internally — no surface-type enumeration needed.
  *
- * Remaining edges are grouped into connected chains by matching endpoints
- * and assembled into BRepBuilderAPI_MakeWire.
+ *  2. Filter the resulting face fragments: keep only the fragment whose
+ *     centroid (via BRepGProp.SurfaceProperties) is closest to the original
+ *     mesh group's average vertex position.  One winning fragment per group.
+ *
+ *  3. Sew the winning fragments into a watertight shell → solid.
  *
  * @param {object}   oc
- * @param {object[]} edges      TopoDS_Edge objects
- * @param {number}   tolerance
+ * @param {object[]} faceEntries  [{face, group, groupIdx}]
+ * @param {number}   sewTol
  * @param {object[]} toDelete
- * @returns {object[]}  array of TopoDS_Wire
+ * @returns {object|null}  TopoDS_Solid/Shell or null
  */
-function _groupEdgesIntoWires(oc, edges, tolerance, toDelete) {
-  if (edges.length === 0) return [];
-  const tol2 = tolerance * tolerance;
-  const ptsClose = (a, b) => {
-    const dx = a[0]-b[0], dy = a[1]-b[1], dz = a[2]-b[2];
-    return dx*dx+dy*dy+dz*dz < tol2;
-  };
+function _buildSolidViaSplitter(oc, faceEntries, sewTol, toDelete, geometry) {
+  if (faceEntries.length === 0) return null;
 
-  // Get endpoint data for every edge.
-  const infos = [];
-  for (const edge of edges) {
-    const pts = _edgePoints(oc, edge, toDelete, tolerance);
-    if (!pts) continue;
-    infos.push({ edge, ...pts });
-  }
+  // ── Phase 1: Run the Splitter ───────────────────────────────────────────
+  // BRepAlgoAPI_Splitter (OCCT 7.3+) takes Arguments (shapes to be split)
+  // and Tools (shapes that do the splitting).  By adding every oversized face
+  // as both an Argument and a Tool every surface is cut by every other surface
+  // in one pass — the kernel finds all intersections at once and produces
+  // shared edges at every junction.
+  let splitter = null;
+  let allPieces = null;
 
-  const wires = [];
-  const used = new Set();
-
-  // Pass 1 — closed edges (circles, full ellipses, etc.) are standalone wires.
-  for (let i = 0; i < infos.length; i++) {
-    if (!infos[i].closed) continue;
-    used.add(i);
-    try {
-      const wm = new oc.BRepBuilderAPI_MakeWire_1();
-      toDelete.push(wm);
-      wm.Add_1(infos[i].edge);
-      if (wm.IsDone()) wires.push(wm.Wire());
-    } catch { /* skip malformed edge */ }
-  }
-
-  // Pass 2 — chain open edges by endpoint proximity.
-  while (true) {
-    // Find an unused open edge to start a new chain.
-    let seedIdx = -1;
-    for (let i = 0; i < infos.length; i++) {
-      if (!used.has(i)) { seedIdx = i; break; }
-    }
-    if (seedIdx === -1) break;
-
-    const chain = [seedIdx];
-    used.add(seedIdx);
-    let head = infos[seedIdx].start;
-    let tail = infos[seedIdx].end;
-
-    // Grow the chain in both directions.
-    let progress = true;
-    while (progress) {
-      progress = false;
-      for (let i = 0; i < infos.length; i++) {
-        if (used.has(i)) continue;
-        const { start, end } = infos[i];
-        if (ptsClose(tail, start)) {
-          chain.push(i); used.add(i); tail = end; progress = true;
-        } else if (ptsClose(tail, end)) {
-          chain.push(i); used.add(i); tail = start; progress = true;
-        } else if (ptsClose(head, end)) {
-          chain.unshift(i); used.add(i); head = start; progress = true;
-        } else if (ptsClose(head, start)) {
-          chain.unshift(i); used.add(i); head = end; progress = true;
-        }
-      }
-    }
-
-    if (chain.length === 0) continue;
-    try {
-      const wm = new oc.BRepBuilderAPI_MakeWire_1();
-      toDelete.push(wm);
-      for (const idx of chain) wm.Add_1(infos[idx].edge);
-      if (wm.IsDone()) wires.push(wm.Wire());
-      else console.warn(`Wire from ${chain.length} edges did not complete.`);
-    } catch (e) {
-      console.warn('Wire construction failed:', e?.message ?? e);
-    }
-  }
-
-  return wires;
-}
-
-// ── Analytical V-bounds from adjacent planes ────────────────────────────────
-
-/**
- * Compute the V-parameter range of a curved surface (cylinder, cone, sphere)
- * by finding where each adjacent plane intersects the surface axis.
- *
- * This is a pure analytical computation using only fitted surface parameters —
- * no mesh data, no OCCT edges.  For each adjacent plane with known origin
- * and normal, the axis intersection parameter is:
- *
- *   V = dot(planeOrigin − axisPoint, planeNormal) / dot(axis, planeNormal)
- *
- * @param {object}   surfaceParams
- * @param {string}   surfaceType    'cylinder' | 'cone' | 'sphere'
- * @param {number[]} adjacentGroupIndices
- * @param {object[]} groups
- * @returns {{ vmin: number, vmax: number }|null}
- */
-function _vBoundsFromAdjacentPlanes(surfaceParams, surfaceType,
-                                    adjacentGroupIndices, groups) {
-  let vmin = Infinity, vmax = -Infinity;
-
-  let axisPoint, axis;
-  if (surfaceType === 'cylinder') {
-    axisPoint = surfaceParams.axisPoint;
-    axis = _u3(surfaceParams.axis);
-  } else if (surfaceType === 'cone') {
-    axisPoint = surfaceParams.apex;
-    axis = _u3(surfaceParams.axis);
-  } else if (surfaceType === 'sphere') {
-    axisPoint = surfaceParams.center;
-    // OCCT gp_Sphere_2(Ax3, R) always uses the Ax3 main direction as the
-    // sphere's pole axis.  We construct it with makeDir([0,0,1]) in
-    // _buildTrimmedFace, so V (latitude) is measured relative to Z.
-    axis = [0, 0, 1];
-  } else {
+  // Probe constructor name — opencascade.js 2.0 beta exports it as
+  // BRepAlgoAPI_Splitter_1 (default ctor).
+  const SplitterCtor = oc.BRepAlgoAPI_Splitter_1 ?? oc.BRepAlgoAPI_Splitter;
+  if (typeof SplitterCtor !== 'function') {
+    console.warn('BRepAlgoAPI_Splitter not available in this opencascade.js build.');
     return null;
   }
 
-  for (const adjIdx of adjacentGroupIndices) {
-    const adj = groups[adjIdx];
-    if (!adj?.surface || adj.surface.type !== 'plane') continue;
-    const { origin, normal } = adj.surface.params;
-    const nu = _u3(normal);
-    const denom = _d3(axis, nu);
-    if (Math.abs(denom) < 1e-14) continue; // plane parallel to axis
-    const diff = [origin[0]-axisPoint[0], origin[1]-axisPoint[1],
-                  origin[2]-axisPoint[2]];
-    const t = _d3(diff, nu) / denom;
+  try {
+    splitter = new SplitterCtor();
+    toDelete.push(splitter);
 
-    if (surfaceType === 'sphere') {
-      // t is the signed distance along the Z-axis from the sphere centre
-      // to the plane intersection.  Dividing by radius gives sin(latitude),
-      // so asin(t/R) converts it to the OCCT sphere V parameter.
-      const lat = Math.asin(Math.max(-1, Math.min(1, t / surfaceParams.radius)));
-      if (lat < vmin) vmin = lat;
-      if (lat > vmax) vmax = lat;
-    } else {
-      if (t < vmin) vmin = t;
-      if (t > vmax) vmax = t;
+    for (const { face } of faceEntries) {
+      splitter.AddArgument(face);
+      splitter.AddTool(face);
     }
+
+    const range = _mkRange(oc);
+    if (range) splitter.SetRunParallel(false);
+    try { splitter.Build(range ?? undefined); } catch { splitter.Build(); }
+
+    if (!splitter.IsDone()) {
+      console.warn('BRepAlgoAPI_Splitter.Build() failed (IsDone=false).');
+      return null;
+    }
+
+    allPieces = splitter.Shape();
+  } catch (e) {
+    console.warn('BRepAlgoAPI_Splitter error:', e?.message ?? e);
+    return null;
   }
 
-  return isFinite(vmin) && vmax - vmin > 1e-10 ? { vmin, vmax } : null;
-}
-
-// ── Edge–edge corner finder ──────────────────────────────────────────────────
-
-/**
- * Find the 3D point where two OCCT section edges cross using
- * BRepExtrema_DistShapeShape.
- *
- * When two boundary curves meet at a face corner the distance between the
- * edges is zero; DistShapeShape computes that shared point robustly for any
- * curve type (line, circle, ellipse, …) without any 2D projection or surface-
- * type assumptions.
- *
- * @param {object}   oc
- * @param {object}   edge1  TopoDS_Edge
- * @param {object}   edge2  TopoDS_Edge
- * @param {number}   tolerance
- * @param {object[]} toDelete
- * @returns {number[]|null}  [x,y,z] corner or null
- */
-function _edgeEdgeCorner(oc, edge1, edge2, tolerance, toDelete) {
-  // Probe constructor overloads — opencascade.js numbers them from _1.
-  // The two-shape ctor is typically _2(S1, S2) or _3(S1, S2, ...).
-  for (const name of [
-    'BRepExtrema_DistShapeShape_2',
-    'BRepExtrema_DistShapeShape_3',
-  ]) {
-    if (typeof oc[name] !== 'function') continue;
-    try {
-      const dss = new oc[name](edge1, edge2);
-      toDelete.push(dss);
-      if (!dss.IsDone()) continue;
-      if (dss.Value() > tolerance) continue;
-      const pt = dss.PointOnShape1(1);
-      toDelete.push(pt);
-      return [pt.X(), pt.Y(), pt.Z()];
-    } catch { continue; }
+  if (!allPieces || (typeof allPieces.IsNull === 'function' && allPieces.IsNull())) {
+    return null;
   }
-  return null;
-}
 
-// ── Trimmed face builder ────────────────────────────────────────────────────
+  // ── Phase 2: Filter face fragments by proximity to mesh group centroids ──
+  // For each input group, compute its centroid from mesh triangle vertices
+  // (the most accurate representative point on each original surface patch).
+  // Fall back to the surface params origin if geometry is unavailable.
+  const pos = geometry?.attributes?.position;
+  const groupCentroids = faceEntries.map(({ group, groupIdx }) => {
+    let cx = 0, cy = 0, cz = 0, n = 0;
+    if (pos && group.triangleIndices) {
+      for (const t of group.triangleIndices) {
+        for (let v = 0; v < 3; v++) {
+          const i = t * 3 + v;
+          cx += pos.getX(i); cy += pos.getY(i); cz += pos.getZ(i); n++;
+        }
+      }
+    }
+    if (n === 0) {
+      // Fallback: use surface params origin / axisPoint / apex / center.
+      const p = group.surface.params;
+      const pt = p.origin ?? p.axisPoint ?? p.apex ?? p.center ?? [0, 0, 0];
+      cx = pt[0]; cy = pt[1]; cz = pt[2]; n = 1;
+    }
+    return { groupIdx, cx: cx/n, cy: cy/n, cz: cz/n };
+  });
 
-/**
- * Build a properly trimmed face from section edges.
- *
- * • Plane faces: for every pair of open section edges,
- *   BRepExtrema_DistShapeShape finds the shared corner point where the two
- *   boundary curves actually cross — no 2D projection, no surface-type
- *   enumeration.  Closed section edges (circles/arcs from curved neighbours)
- *   become inner hole wires.  Falls back to wire-chaining when no corners are
- *   found (e.g. a circular cap whose only neighbour is a cylinder).
- *
- * • Curved faces (cylinder, cone, sphere): V-parameter bounds are computed
- *   analytically from adjacent plane positions.
- */
-function _buildTrimmedFace(oc, group, groupIdx, sectionEdges, adjacentIndices,
-                           groups, modelDiag, tolerance, toDelete) {
-  const { type, params } = group.surface;
+  const FACE_T  = oc.TopAbs_ShapeEnum?.TopAbs_FACE  ?? 4;
+  const SHAPE_T = oc.TopAbs_ShapeEnum?.TopAbs_SHAPE ?? 0;
+
+  // Map groupIdx → {face, distSq} — best (closest) fragment per group.
+  const best = new Map();
+  for (const { groupIdx } of faceEntries) best.set(groupIdx, { face: null, distSq: Infinity });
 
   try {
-    // ── Plane ──────────────────────────────────────────────────────────────
-    if (type === 'plane') {
-      const { origin, normal } = params;
-      const nu = _u3(normal);
-      const pln = new oc.gp_Pln_3(makePnt(oc, origin), makeDir(oc, nu));
-      toDelete.push(pln);
+    const exp = new oc.TopExp_Explorer_2(allPieces, FACE_T, SHAPE_T);
+    toDelete.push(exp);
+    while (exp.More()) {
+      let fragFace;
+      try { fragFace = oc.TopoDS.Face_1 ? oc.TopoDS.Face_1(exp.Current()) : exp.Current(); }
+      catch { fragFace = exp.Current(); }
 
-      // Partition section edges: closed = inner holes, open = outer boundary.
-      const closedEdges = [], openEdges = [];
-      for (const edge of sectionEdges) {
-        const pts = _edgePoints(oc, edge, toDelete, tolerance);
-        if (!pts) continue;
-        (pts.closed ? closedEdges : openEdges).push(edge);
-      }
-
-      // ── Primary path: OCCT edge–edge corner detection ──────────────────
-      // Two open section edges that share a face corner cross each other at
-      // that corner.  BRepExtrema_DistShapeShape finds that shared point
-      // exactly for any curve type, without projection assumptions.
-      const corners = [];
-      for (let a = 0; a < openEdges.length; a++) {
-        for (let b = a + 1; b < openEdges.length; b++) {
-          const pt = _edgeEdgeCorner(
-            oc, openEdges[a], openEdges[b], tolerance, toDelete);
-          if (pt) corners.push(pt);
+      const c = _faceGPropCentroid(oc, fragFace, toDelete);
+      if (c) {
+        // Find the nearest group centroid.
+        let bestGroupIdx = -1, bestDist = Infinity;
+        for (const g of groupCentroids) {
+          const d = (c[0]-g.cx)**2 + (c[1]-g.cy)**2 + (c[2]-g.cz)**2;
+          if (d < bestDist) { bestDist = d; bestGroupIdx = g.groupIdx; }
         }
-      }
-
-      // Deduplicate.
-      const tol2 = tolerance * tolerance * 4;
-      const unique = corners.filter((p, i) =>
-        !corners.slice(0, i).some(q =>
-          (p[0]-q[0])**2 + (p[1]-q[1])**2 + (p[2]-q[2])**2 < tol2));
-
-      if (unique.length >= 3) {
-        // Sort counter-clockwise around centroid in the plane's local frame.
-        const ref = Math.abs(nu[2]) < 0.9 ? [0, 0, 1] : [1, 0, 0];
-        const xA = _u3(_x3(nu, ref));
-        const yA = _x3(nu, xA);
-        const cu = unique.reduce((s, p) =>
-          s + _d3([p[0]-origin[0], p[1]-origin[1], p[2]-origin[2]], xA), 0) / unique.length;
-        const cv = unique.reduce((s, p) =>
-          s + _d3([p[0]-origin[0], p[1]-origin[1], p[2]-origin[2]], yA), 0) / unique.length;
-        unique.sort((a, b) => {
-          const ua = _d3([a[0]-origin[0], a[1]-origin[1], a[2]-origin[2]], xA) - cu;
-          const va = _d3([a[0]-origin[0], a[1]-origin[1], a[2]-origin[2]], yA) - cv;
-          const ub = _d3([b[0]-origin[0], b[1]-origin[1], b[2]-origin[2]], xA) - cu;
-          const vb = _d3([b[0]-origin[0], b[1]-origin[1], b[2]-origin[2]], yA) - cv;
-          return Math.atan2(va, ua) - Math.atan2(vb, ub);
-        });
-
-        const outerWire = buildWire(oc, unique, toDelete);
-        if (outerWire) {
-          const mf = new oc.BRepBuilderAPI_MakeFace_16(pln, outerWire, true);
-          toDelete.push(mf);
-          if (!mf.IsDone()) return null;
-
-          for (const he of closedEdges) {
-            try {
-              const wm = new oc.BRepBuilderAPI_MakeWire_1();
-              toDelete.push(wm);
-              wm.Add_1(he);
-              if (wm.IsDone()) mf.Add(wm.Wire());
-            } catch { /* skip malformed hole */ }
+        if (bestGroupIdx >= 0) {
+          const slot = best.get(bestGroupIdx);
+          if (slot && bestDist < slot.distSq) {
+            slot.face = fragFace;
+            slot.distSq = bestDist;
           }
-
-          return mf.Face();
         }
       }
 
-      // ── Fallback: wire-chain all section edges ─────────────────────────
-      // Used when no corners were found (circular cap, single-curve boundary).
-      if (sectionEdges.length === 0) return null;
-
-      const wires = _groupEdgesIntoWires(oc, sectionEdges, tolerance, toDelete);
-      if (wires.length === 0) return null;
-
-      let outerIdx = 0;
-      if (wires.length > 1) {
-        let maxDiag = -1;
-        for (let i = 0; i < wires.length; i++) {
-          try {
-            const box = new oc.Bnd_Box_1();
-            toDelete.push(box);
-            oc.BRepBndLib.Add(wires[i], box, false);
-            const cMin = box.CornerMin();
-            const cMax = box.CornerMax();
-            toDelete.push(cMin, cMax);
-            const dx = cMax.X()-cMin.X(), dy = cMax.Y()-cMin.Y(), dz = cMax.Z()-cMin.Z();
-            const diag = dx*dx + dy*dy + dz*dz;
-            if (diag > maxDiag) { maxDiag = diag; outerIdx = i; }
-          } catch { /* keep default */ }
-        }
-      }
-
-      const mf = new oc.BRepBuilderAPI_MakeFace_16(pln, wires[outerIdx], true);
-      toDelete.push(mf);
-      if (!mf.IsDone()) return null;
-
-      for (let i = 0; i < wires.length; i++) {
-        if (i === outerIdx) continue;
-        try { mf.Add(wires[i]); } catch { /* skip */ }
-      }
-
-      return mf.Face();
+      exp.Next();
     }
-
-    // ── Cylinder: V-bounds from adjacent planes ───────────────────────────
-    if (type === 'cylinder') {
-      const vr = _vBoundsFromAdjacentPlanes(params, 'cylinder',
-        [...adjacentIndices], groups);
-      if (!vr) return null;
-      const ax3 = makeAx3(oc, params.axisPoint, params.axis);
-      toDelete.push(ax3);
-      const cyl = new oc.gp_Cylinder_2(ax3, params.radius);
-      toDelete.push(cyl);
-      const mf = new oc.BRepBuilderAPI_MakeFace_10(
-        cyl, 0.0, 2*Math.PI, vr.vmin, vr.vmax);
-      toDelete.push(mf);
-      return mf.IsDone() ? mf.Face() : null;
-    }
-
-    // ── Cone: V-bounds from adjacent planes ───────────────────────────────
-    if (type === 'cone') {
-      const vr = _vBoundsFromAdjacentPlanes(params, 'cone',
-        [...adjacentIndices], groups);
-      if (!vr) return null;
-      const ax3 = makeAx3(oc, params.apex, params.axis);
-      toDelete.push(ax3);
-      const cone = new oc.gp_Cone_2(ax3, params.halfAngle, 0.0);
-      toDelete.push(cone);
-      const mf = new oc.BRepBuilderAPI_MakeFace_11(
-        cone, 0.0, 2*Math.PI, Math.max(0, vr.vmin), vr.vmax);
-      toDelete.push(mf);
-      return mf.IsDone() ? mf.Face() : null;
-    }
-
-    // ── Sphere: V-bounds from adjacent planes ─────────────────────────────
-    if (type === 'sphere') {
-      const vr = _vBoundsFromAdjacentPlanes(params, 'sphere',
-        [...adjacentIndices], groups);
-      if (!vr) return null;
-      const ax3 = new oc.gp_Ax3_4(
-        makePnt(oc, params.center), makeDir(oc, [0, 0, 1]));
-      toDelete.push(ax3);
-      const sph = new oc.gp_Sphere_2(ax3, params.radius);
-      toDelete.push(sph);
-      const mf = new oc.BRepBuilderAPI_MakeFace_12(
-        sph, 0.0, 2*Math.PI,
-        Math.max(-Math.PI/2, vr.vmin),
-        Math.min( Math.PI/2, vr.vmax));
-      toDelete.push(mf);
-      return mf.IsDone() ? mf.Face() : null;
-    }
-
   } catch (e) {
-    console.warn(`_buildTrimmedFace (${type}):`, e?.message ?? e);
+    console.warn('Splitter face exploration error:', e?.message ?? e);
+    return null;
   }
-  return null;
-}
 
-// ── Sew faces into a solid ──────────────────────────────────────────────────
+  const keptFaces = [];
+  for (const { face, distSq } of best.values()) {
+    if (face && isFinite(distSq)) keptFaces.push(face);
+  }
+
+  if (keptFaces.length === 0) {
+    console.warn('Splitter produced no usable face fragments.');
+    return null;
+  }
+
+  console.info(`Splitter: ${keptFaces.length}/${faceEntries.length} face fragments kept.`);
+
+  // ── Phase 3: Sew into solid ─────────────────────────────────────────────
+  return _sewIntoSolid(oc, keptFaces, sewTol, toDelete);
+}
 
 /**
  * Sew an array of properly trimmed faces into a watertight solid.
@@ -1123,10 +783,6 @@ function _buildTrimmedFace(oc, group, groupIdx, sectionEdges, adjacentIndices,
 function _sewIntoSolid(oc, faces, sewTol, toDelete) {
   if (faces.length === 0) return null;
   try {
-    // opencascade.js 2.0 beta (verified from d.ts):
-    //   BRepBuilderAPI_Sewing(tolerance, option1, option2, option3, option4)
-    //   — ALL 5 args required; no numbered suffix (single overload exported).
-    //   Perform(Message_ProgressRange) — progress range is required.
     const sewing = new oc.BRepBuilderAPI_Sewing(sewTol, true, true, true, false);
     toDelete.push(sewing);
 
@@ -1142,7 +798,6 @@ function _sewIntoSolid(oc, faces, sewTol, toDelete) {
     if (shapeType === SOLID_T) return sewn;
 
     if (shapeType === SHELL_T) {
-      // BRepBuilderAPI_MakeSolid_3 takes TopoDS_Shell — cast from TopoDS_Shape.
       const shell = oc.TopoDS.Shell_1 ? oc.TopoDS.Shell_1(sewn) : sewn;
       const mkSolid = new oc.BRepBuilderAPI_MakeSolid_3(shell);
       toDelete.push(mkSolid);
@@ -1167,99 +822,19 @@ function _sewIntoSolid(oc, faces, sewTol, toDelete) {
   return null;
 }
 
-
-// ── Section-based solid builder ─────────────────────────────────────────────
-
-/**
- * Build a solid by computing analytical intersection curves between adjacent
- * face pairs, trimming each face with those curves, and sewing the trimmed
- * faces into a watertight solid.
- *
- * The mesh is used ONLY for the adjacency map (which faces are neighbours).
- * All intersection curves and trim boundaries are computed analytically by
- * OCCT's geometry kernel — no mesh-derived geometry appears in the output.
- */
-function _buildSolidViaSections(oc, faceEntries, adjacency, groups,
-                                modelDiag, sewTol, toDelete) {
-  const idxToEntry = new Map();
-  for (const e of faceEntries) idxToEntry.set(e.groupIdx, e);
-
-  const tolerance = sewTol;
-
-  // Phase 1 — For each face, compute its section edges against all neighbours
-  // in a single BRepAlgoAPI_Section call so that OCCT produces consistent
-  // vertex topology at triple-point intersections.
-  const faceSectionEdges = new Map();
-
-  for (const { face, groupIdx } of faceEntries) {
-    const adjSet = adjacency.get(groupIdx);
-    if (!adjSet || adjSet.size === 0) {
-      faceSectionEdges.set(groupIdx, []);
-      continue;
-    }
-
-    const adjFaces = [];
-    for (const adjIdx of adjSet) {
-      const adjEntry = idxToEntry.get(adjIdx);
-      if (adjEntry) adjFaces.push(adjEntry.face);
-    }
-    if (adjFaces.length === 0) {
-      faceSectionEdges.set(groupIdx, []);
-      continue;
-    }
-
-    const adjCompound = new oc.TopoDS_Compound();
-    const bb = new oc.BRep_Builder();
-    toDelete.push(bb);
-    bb.MakeCompound(adjCompound);
-    for (const af of adjFaces) bb.Add(adjCompound, af);
-    toDelete.push(adjCompound);
-
-    const sectionShape = _section(oc, face, adjCompound, toDelete);
-    const edges = sectionShape ? _extractEdges(oc, sectionShape, toDelete) : [];
-    faceSectionEdges.set(groupIdx, edges);
-
-    if (edges.length === 0) {
-      console.warn(`No section edges for group ${groupIdx} (${groups[groupIdx]?.surface?.type}).`);
-    }
-  }
-
-  // Phase 2 — Build a trimmed face for each group.
-  const trimmedFaces = [];
-  for (const { group, groupIdx } of faceEntries) {
-    const edges = faceSectionEdges.get(groupIdx) || [];
-    const adjSet = adjacency.get(groupIdx) || new Set();
-    const trimmed = _buildTrimmedFace(
-      oc, group, groupIdx, edges, adjSet, groups,
-      modelDiag, tolerance, toDelete);
-    if (trimmed) trimmedFaces.push(trimmed);
-    else console.warn(`Could not trim group ${groupIdx} (${group.surface?.type}).`);
-  }
-
-  if (trimmedFaces.length === 0) return null;
-
-  // Phase 3 — Sew trimmed faces into a solid.
-  const solid = _sewIntoSolid(oc, trimmedFaces, sewTol, toDelete);
-  if (solid) {
-    console.info(`Section-based solid: ${trimmedFaces.length} trimmed faces.`);
-  }
-  return solid;
-}
-
 // ── Main solid builder ──────────────────────────────────────────────────────
 
 /**
- * Build a watertight solid from oversized analytical faces using
- * Section-based analytical trimming: BRepAlgoAPI_Section is called for every
- * adjacent face pair (using the mesh adjacency graph), each face is trimmed
- * with the resulting intersection curves, and the trimmed faces are sewn into
- * a watertight solid.  O(N·k) in face count N and average neighbour count k.
+ * Build a watertight solid from oversized analytical faces via
+ * BRepAlgoAPI_Splitter: all faces shatter each other simultaneously, then
+ * the fragment closest to each original mesh group centroid is kept and
+ * the kept fragments are sewn into a solid.
  */
 function _buildSolid(oc, faceEntries, adjacency, groups,
-                     modelDiag, sewTol, toDelete) {
-  return _buildSolidViaSections(oc, faceEntries, adjacency, groups,
-                                modelDiag, sewTol, toDelete);
+                     modelDiag, sewTol, toDelete, geometry) {
+  return _buildSolidViaSplitter(oc, faceEntries, sewTol, toDelete, geometry);
 }
+
 
 // ── Main export: build B-rep + STEP ─────────────────────────────────────────
 
@@ -1364,7 +939,7 @@ export async function buildAndExportSTEP(groups, geometry, options = {}, onStatu
     );
 
     const solid = _buildSolid(
-      oc, islandFaceEntries, adjacency, groups, modelDiag, sewTol, toDelete);
+      oc, islandFaceEntries, adjacency, groups, modelDiag, sewTol, toDelete, geometry);
 
     if (solid) {
       islandSolids.push(solid);
