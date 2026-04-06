@@ -24,7 +24,7 @@
 // ── Build version ─────────────────────────────────────────────────────────────
 
 /** Increment this string with each release to verify live-site deployments. */
-export const BUILD_VERSION = 'v0.2.12';
+export const BUILD_VERSION = 'v0.2.13';
 
 // ── OpenCASCADE lazy loader ───────────────────────────────────────────────────
 
@@ -662,8 +662,7 @@ function _buildSolidViaSplitter(oc, faceEntries, sewTol, toDelete, geometry) {
   let splitter = null;
   let allPieces = null;
 
-  // Probe constructor name — opencascade.js 2.0 beta exports it as
-  // BRepAlgoAPI_Splitter_1 (default ctor).
+  // opencascade.js 2.0 beta exports the default ctor as BRepAlgoAPI_Splitter_1.
   const SplitterCtor = oc.BRepAlgoAPI_Splitter_1 ?? oc.BRepAlgoAPI_Splitter;
   if (typeof SplitterCtor !== 'function') {
     console.warn('BRepAlgoAPI_Splitter not available in this opencascade.js build.');
@@ -674,13 +673,39 @@ function _buildSolidViaSplitter(oc, faceEntries, sewTol, toDelete, geometry) {
     splitter = new SplitterCtor();
     toDelete.push(splitter);
 
-    for (const { face } of faceEntries) {
-      splitter.AddArgument(face);
-      splitter.AddTool(face);
+    // BRepAlgoAPI_Splitter inherits from BRepAlgoAPI_BuilderShape.
+    // In OCCT 7.x the argument API is:
+    //   • AddArgument(TopoDS_Shape) / AddTool(TopoDS_Shape) — on some subclasses
+    //   • SetArguments(TopTools_ListOfShape) / SetTools(TopTools_ListOfShape) — always present
+    // opencascade.js 2.0 beta only exports SetArguments/SetTools for this class.
+    // Try AddArgument first (forward-compat), fall back to list API.
+    if (typeof splitter.AddArgument === 'function') {
+      for (const { face } of faceEntries) {
+        splitter.AddArgument(face);
+        splitter.AddTool(face);
+      }
+    } else {
+      // Build TopTools_ListOfShape lists and use SetArguments / SetTools.
+      const ListCtor = oc.TopTools_ListOfShape_1 ?? oc.TopTools_ListOfShape;
+      if (typeof ListCtor !== 'function') {
+        console.warn('TopTools_ListOfShape not available; cannot set Splitter arguments.');
+        return null;
+      }
+      const argList  = new ListCtor();
+      const toolList = new ListCtor();
+      toDelete.push(argList, toolList);
+      for (const { face } of faceEntries) {
+        // Append_1 is the single-element overload in opencascade.js 2.0 beta.
+        const append = typeof argList.Append_1 === 'function' ? 'Append_1' : 'Append';
+        argList[append](face);
+        toolList[append](face);
+      }
+      splitter.SetArguments(argList);
+      splitter.SetTools(toolList);
     }
 
+    splitter.SetRunParallel(false);
     const range = _mkRange(oc);
-    if (range) splitter.SetRunParallel(false);
     try { splitter.Build(range ?? undefined); } catch { splitter.Build(); }
 
     if (!splitter.IsDone()) {
