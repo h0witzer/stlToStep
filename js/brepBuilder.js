@@ -34,7 +34,7 @@
 // ── Build version ─────────────────────────────────────────────────────────────
 
 /** Increment this string with each release to verify live-site deployments. */
-export const BUILD_VERSION = 'v0.3.0';
+export const BUILD_VERSION = 'v0.2.2';
 
 // ── OpenCASCADE lazy loader ───────────────────────────────────────────────────
 
@@ -571,16 +571,40 @@ function _buildLargePatch(oc, group, geometry, toDelete, modelDiag) {
  * @returns {object|null}  resulting TopoDS_Shape (compound of edges) or null
  */
 function _section(oc, s1, s2, toDelete) {
-  // Probe from higher-numbered (more-arg) constructors first — _5 and _3 are
-  // typically (S1, S2, PerformNow) while _2/_1 are simpler overloads.
-  for (const suffix of ['_5', '_3', '_2', '_1']) {
+  // opencascade.js Emscripten bindings number constructor overloads
+  // sequentially.  For BRepAlgoAPI_Section the C++ constructors are:
+  //   _1()                               — empty (then Init1/Init2/Build)
+  //   _2(S1, S2, PaveFiller, bool)       — 4 args
+  //   _3(S1, S2, bool)                   — 3 args  ← most common
+  //   _4(S1, gp_Pln, bool)              — 3 args
+  //   _5(S1, Geom_Surface, bool)         — 3 args
+  // The numbering varies between opencascade.js builds so we probe
+  // systematically: try (S1, S2, true), then (S1, S2), then empty+Build.
+
+  // ── Attempt 1: try every suffix with 3-arg (S1, S2, PerformNow=true) ────
+  for (const suffix of ['_3', '_2', '_5', '_4']) {
+    const name = 'BRepAlgoAPI_Section' + suffix;
+    if (typeof oc[name] !== 'function') continue;
+    try {
+      const sec = new oc[name](s1, s2, true);
+      toDelete.push(sec);
+      if (typeof sec.IsDone === 'function' && !sec.IsDone()) continue;
+      const shape = sec.Shape();
+      if (!shape) continue;
+      if (typeof shape.IsNull === 'function' && shape.IsNull()) continue;
+      return shape;
+    } catch { continue; }
+  }
+
+  // ── Attempt 2: try every suffix with 2-arg (S1, S2) ─────────────────────
+  for (const suffix of ['_3', '_2', '_5', '_4']) {
     const name = 'BRepAlgoAPI_Section' + suffix;
     if (typeof oc[name] !== 'function') continue;
     try {
       const sec = new oc[name](s1, s2);
       toDelete.push(sec);
       if (typeof sec.Build === 'function') {
-        try { sec.Build(); } catch { /* some overloads auto-build */ }
+        try { sec.Build(); } catch { /* auto-built */ }
       }
       if (typeof sec.IsDone === 'function' && !sec.IsDone()) continue;
       const shape = sec.Shape();
@@ -589,6 +613,27 @@ function _section(oc, s1, s2, toDelete) {
       return shape;
     } catch { continue; }
   }
+
+  // ── Attempt 3: empty constructor → Init1/Init2 → Build ──────────────────
+  if (typeof oc.BRepAlgoAPI_Section_1 === 'function') {
+    try {
+      const sec = new oc.BRepAlgoAPI_Section_1();
+      toDelete.push(sec);
+      // The Init methods may be named Init1_1/Init2_1 in some builds.
+      const init1 = sec.Init1_1 ?? sec.Init1;
+      const init2 = sec.Init2_1 ?? sec.Init2;
+      if (typeof init1 === 'function') init1.call(sec, s1);
+      if (typeof init2 === 'function') init2.call(sec, s2);
+      if (typeof sec.Build === 'function') sec.Build();
+      if (typeof sec.IsDone === 'function' && !sec.IsDone()) return null;
+      const shape = sec.Shape();
+      if (!shape) return null;
+      if (typeof shape.IsNull === 'function' && shape.IsNull()) return null;
+      return shape;
+    } catch { /* fall through */ }
+  }
+
+  console.warn('BRepAlgoAPI_Section: no working constructor found.');
   return null;
 }
 
@@ -932,12 +977,29 @@ function _buildTrimmedFace(oc, group, groupIdx, sectionEdges, adjacentIndices,
 function _sewIntoSolid(oc, faces, sewTol, toDelete) {
   if (faces.length === 0) return null;
   try {
-    const SewCtor = typeof oc.BRepBuilderAPI_Sewing_2 === 'function'
-      ? oc.BRepBuilderAPI_Sewing_2
-      : typeof oc.BRepBuilderAPI_Sewing_1 === 'function'
-        ? oc.BRepBuilderAPI_Sewing_1
-        : oc.BRepBuilderAPI_Sewing;
-    const sewing = new SewCtor(sewTol);
+    // BRepBuilderAPI_Sewing constructor overloads in opencascade.js:
+    //   _1()               — no args (default tol 1e-6)
+    //   _2(tol,o1,o2,o3,o4) — ALL 5 C++ args required (no default args in Emscripten)
+    // The C++ signature: Sewing(tolerance=1e-6, option1=true, option2=true,
+    //   option3=true, option4=false)
+    let sewing;
+    if (typeof oc.BRepBuilderAPI_Sewing_2 === 'function') {
+      try {
+        sewing = new oc.BRepBuilderAPI_Sewing_2(sewTol, true, true, true, false);
+      } catch {
+        // If _2 exists but rejects 5 args, try other patterns
+        sewing = null;
+      }
+    }
+    if (!sewing && typeof oc.BRepBuilderAPI_Sewing_1 === 'function') {
+      sewing = new oc.BRepBuilderAPI_Sewing_1();
+      // Set tolerance on the default-constructed sewing object
+      if (typeof sewing.SetTolerance === 'function') sewing.SetTolerance(sewTol);
+    }
+    if (!sewing) {
+      // Last resort: try unversioned name
+      sewing = new oc.BRepBuilderAPI_Sewing(sewTol, true, true, true, false);
+    }
     toDelete.push(sewing);
 
     for (const f of faces) sewing.Add(f);
@@ -985,9 +1047,18 @@ function _sewIntoSolid(oc, faces, sewTol, toDelete) {
  * Boolean APIs.
  */
 function _buildSolidViaMakerVolume(oc, faces, fuzzyTol, toDelete) {
-  if (typeof oc.BOPAlgo_MakerVolume_1 !== 'function') return null;
+  // Probe for the MakerVolume constructor — try _1 (default) and _2 (allocator).
+  let MakerCtor = null;
+  for (const suffix of ['_1', '_2', '']) {
+    const name = 'BOPAlgo_MakerVolume' + suffix;
+    if (typeof oc[name] === 'function') { MakerCtor = oc[name]; break; }
+  }
+  if (!MakerCtor) {
+    console.warn('BOPAlgo_MakerVolume: no constructor found in this opencascade.js build.');
+    return null;
+  }
   try {
-    const maker = new oc.BOPAlgo_MakerVolume_1();
+    const maker = new MakerCtor();
     toDelete.push(maker);
     const argList = new oc.TopTools_ListOfShape_1();
     toDelete.push(argList);
@@ -1001,14 +1072,19 @@ function _buildSolidViaMakerVolume(oc, faces, fuzzyTol, toDelete) {
     if (typeof maker.SetRunParallel === 'function')
       maker.SetRunParallel(false);
     maker.Perform();
-    if (typeof maker.HasErrors === 'function' && maker.HasErrors()) return null;
-    const result = maker.Shape();
-    if (!result || (typeof result.IsNull === 'function' && result.IsNull()))
+    if (typeof maker.HasErrors === 'function' && maker.HasErrors()) {
+      console.warn('BOPAlgo_MakerVolume: Perform() completed with errors.');
       return null;
+    }
+    const result = maker.Shape();
+    if (!result || (typeof result.IsNull === 'function' && result.IsNull())) {
+      console.warn('BOPAlgo_MakerVolume: Perform() returned null/empty shape.');
+      return null;
+    }
     console.info('BOPAlgo_MakerVolume succeeded.');
     return result;
   } catch (e) {
-    console.warn('BOPAlgo_MakerVolume unavailable:', e?.message ?? e);
+    console.warn('BOPAlgo_MakerVolume failed:', e?.message ?? e);
     return null;
   }
 }
@@ -1111,7 +1187,7 @@ function _buildSolid(oc, faceEntries, adjacency, groups,
   if (mv) return mv;
 
   // Robust path: Section-based analytical trimming.
-  console.info('MakerVolume unavailable — using Section-based analytical trimming.');
+  console.info('BOPAlgo_MakerVolume did not produce a result — using Section-based analytical trimming.');
   return _buildSolidViaSections(oc, faceEntries, adjacency, groups,
                                 modelDiag, sewTol, toDelete);
 }
