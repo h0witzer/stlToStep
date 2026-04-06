@@ -10,7 +10,7 @@
 
 import * as THREE from 'three';
 import {
-  initViewer, loadGeometry, setMeshMaterial, setWireframe,
+  initViewer, loadGeometry, setMeshMaterial, setMeshVisible, setWireframe,
   getCamera, getCurrentMesh, showFaceGroupColors, setViewerTheme,
   setGroupHighlight, setGroupHoverCallback,
   setBrepOverlay, setBrepOverlayVisible,
@@ -44,6 +44,7 @@ const dropZone      = document.getElementById('drop-zone');
 const dropHint      = document.getElementById('drop-hint');
 const stlFileInput  = document.getElementById('stl-file-input');
 const meshInfo      = document.getElementById('mesh-info');
+const meshToggle         = document.getElementById('mesh-toggle');
 const wireframeToggle    = document.getElementById('wireframe-toggle');
 const brepOverlayToggle  = document.getElementById('brep-overlay-toggle');
 const brepFacesToggle    = document.getElementById('brep-faces-toggle');
@@ -537,6 +538,11 @@ function wireEvents() {
     const exp = parseFloat(sewTolSlider.value);
     sewTolVal.textContent = `1e${exp}`;
   });
+
+  // Mesh visibility toggle
+  if (meshToggle) {
+    meshToggle.addEventListener('change', () => setMeshVisible(meshToggle.checked));
+  }
 
   // Wireframe
   wireframeToggle.addEventListener('change', () => setWireframe(wireframeToggle.checked));

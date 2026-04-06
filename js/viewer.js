@@ -511,6 +511,14 @@ export function setMeshMaterial(material) {
 }
 
 /**
+ * Show or hide the STL mesh (and its wireframe overlay).
+ * @param {boolean} visible
+ */
+export function setMeshVisible(visible) {
+  if (meshGroup) meshGroup.visible = visible;
+}
+
+/**
  * Swap only the geometry on the current mesh, keeping material and camera.
  * Rebuilds wireframe if visible.  Does NOT reset camera or grid.
  * The caller is responsible for disposing old geometry if needed.

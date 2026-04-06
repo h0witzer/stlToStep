@@ -25,7 +25,7 @@
 // ── Build version ─────────────────────────────────────────────────────────────
 
 /** Increment this string with each release to verify live-site deployments. */
-export const BUILD_VERSION = 'v0.2.20';
+export const BUILD_VERSION = 'v0.2.21';
 
 // ── OpenCASCADE lazy loader ───────────────────────────────────────────────────
 
@@ -648,14 +648,21 @@ function _faceGPropCentroid(oc, face, toDelete) {
  */
 function _tessellateShapeToBuffers(oc, shape, linearDefl, toDelete) {
   try {
-    // Mesh the shape — constructor triggers meshing automatically.
+    // Mesh the shape.
     let mesher;
+    let mesherOk = false;
     try {
-      // BRepMesh_IncrementalMesh_2(shape, deflection, isRelative=false, angDefl=0.5, inParallel=false)
       mesher = new oc.BRepMesh_IncrementalMesh_2(shape, linearDefl, false, 0.5, false);
-    } catch {
-      mesher = new oc.BRepMesh_IncrementalMesh_1(shape, linearDefl);
+      mesherOk = true;
+    } catch (e1) {
+      try {
+        mesher = new oc.BRepMesh_IncrementalMesh_1(shape, linearDefl);
+        mesherOk = true;
+      } catch (e2) {
+        console.warn('[Tessellate] BRepMesh_IncrementalMesh unavailable:', e2?.message ?? e2);
+      }
     }
+    if (!mesherOk) return null;
     toDelete.push(mesher);
 
     const FACE_T  = oc.TopAbs_ShapeEnum?.TopAbs_FACE  ?? 4;
@@ -665,6 +672,7 @@ function _tessellateShapeToBuffers(oc, shape, linearDefl, toDelete) {
     const allVerts   = [];
     const allIndices = [];
     let vertOffset = 0;
+    let facesOk = 0, facesFail = 0;
 
     const exp = new oc.TopExp_Explorer_2(shape, FACE_T, SHAPE_T);
     toDelete.push(exp);
@@ -674,74 +682,94 @@ function _tessellateShapeToBuffers(oc, shape, linearDefl, toDelete) {
       try { face = oc.TopoDS.Face_1 ? oc.TopoDS.Face_1(exp.Current()) : exp.Current(); }
       catch { face = exp.Current(); }
 
+      // Collect nodes and triangles for this face atomically —
+      // only append to global arrays if BOTH succeed.
+      const faceVerts   = [];
+      const faceIndices = [];
+      let faceOk = false;
+
       try {
         const loc = new oc.TopLoc_Location_1();
         toDelete.push(loc);
 
-        // BRep_Tool.Triangulation returns Handle_Poly_Triangulation
         const hTriang = oc.BRep_Tool.Triangulation(face, loc);
-        if (!hTriang || hTriang.IsNull?.()) { exp.Next(); continue; }
+        if (!hTriang || hTriang.IsNull?.()) { exp.Next(); facesFail++; continue; }
 
         const triang = hTriang.get ? hTriang.get() : hTriang;
         const nNodes = triang.NbNodes();
         const nTris  = triang.NbTriangles();
-        if (nNodes === 0 || nTris === 0) { exp.Next(); continue; }
+        if (nNodes === 0 || nTris === 0) { exp.Next(); facesFail++; continue; }
 
-        // Build location transform once per face. Skip for identity locations.
+        // Build transform if location is non-identity.
         const isIdentity = loc.IsIdentity?.() ?? true;
         let trsf = null;
         if (!isIdentity) {
-          try { trsf = loc.Transformation(); }
-          catch { trsf = null; }
+          try { trsf = loc.Transformation(); } catch { trsf = null; }
         }
 
-        // Extract nodes (1-indexed in OCCT).
+        // Extract nodes (1-indexed).
         for (let n = 1; n <= nNodes; n++) {
           const node = triang.Node(n);
           let x = node.X(), y = node.Y(), z = node.Z();
           if (trsf) {
             try {
-              // gp_Trsf.Transforms(x, y, z) modifies in-place — not available in JS.
-              // Use gp_Pnt_3 → Transform → get coords.
               const p = new oc.gp_Pnt_3(x, y, z);
               p.Transform(trsf);
               x = p.X(); y = p.Y(); z = p.Z();
-            } catch { /* transformation failed; use untransformed coordinates */ }
+            } catch { /* use untransformed */ }
           }
-          allVerts.push(x, y, z);
+          faceVerts.push(x, y, z);
         }
 
-        // Extract triangles (1-indexed), respecting face orientation.
+        // Extract triangles (1-indexed), trying multiple API styles.
         const reversed = face.Orientation?.() === REVERSED;
         for (let t = 1; t <= nTris; t++) {
           const tri = triang.Triangle(t);
-          // OCCT Poly_Triangle uses 1-indexed nodes.
           let n1, n2, n3;
-          if (tri.Get) {
-            // Some bindings expose a Get method; try it.
-            const ns = tri.Get();
-            [n1, n2, n3] = [ns.get(0), ns.get(1), ns.get(2)];
-          } else {
+
+          // Try N1()/N2()/N3() — most common in opencascade.js bindings.
+          if (typeof tri.N1 === 'function') {
+            n1 = tri.N1(); n2 = tri.N2(); n3 = tri.N3();
+          } else if (typeof tri.Value === 'function') {
             n1 = tri.Value(1); n2 = tri.Value(2); n3 = tri.Value(3);
+          } else if (typeof tri.get === 'function') {
+            n1 = tri.get(0) + 1; n2 = tri.get(1) + 1; n3 = tri.get(2) + 1;
+          } else {
+            // Unknown binding — throw to outer try so this face is skipped.
+            throw new Error('Poly_Triangle: no known node accessor');
           }
-          // Convert to 0-indexed and add offset.
+
           const a = vertOffset + n1 - 1;
           const b = vertOffset + n2 - 1;
           const c = vertOffset + n3 - 1;
           if (reversed) {
-            allIndices.push(a, c, b);
+            faceIndices.push(a, c, b);
           } else {
-            allIndices.push(a, b, c);
+            faceIndices.push(a, b, c);
           }
         }
-        vertOffset += nNodes;
-      } catch { /* single face tessellation failed — skip */ }
+        faceOk = true;
+      } catch (e) {
+        console.warn('[Tessellate] face extraction failed:', e?.message ?? e);
+        facesFail++;
+      }
+
+      if (faceOk) {
+        for (const v of faceVerts)   allVerts.push(v);
+        for (const i of faceIndices) allIndices.push(i);
+        vertOffset += faceVerts.length / 3;
+        facesOk++;
+      }
 
       exp.Next();
     }
 
-    if (vertOffset === 0) return null;
+    if (vertOffset === 0) {
+      console.warn(`[Tessellate] 0 vertices extracted (ok=${facesOk}, fail=${facesFail})`);
+      return null;
+    }
 
+    console.log(`[Tessellate] ${facesOk} faces → ${vertOffset} vertices, ${allIndices.length / 3 | 0} triangles (${facesFail} faces failed)`);
     return {
       vertices: new Float32Array(allVerts),
       indices:  new Uint32Array(allIndices),
