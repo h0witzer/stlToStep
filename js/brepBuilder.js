@@ -34,7 +34,7 @@
 // ── Build version ─────────────────────────────────────────────────────────────
 
 /** Increment this string with each release to verify live-site deployments. */
-export const BUILD_VERSION = 'v0.2.4';
+export const BUILD_VERSION = 'v0.2.5';
 
 // ── OpenCASCADE lazy loader ───────────────────────────────────────────────────
 
@@ -1029,21 +1029,155 @@ function _sewIntoSolid(oc, faces, sewTol, toDelete) {
 
 // ── BOPAlgo_MakerVolume fast-path ───────────────────────────────────────────
 
+// ── Mesh point-in-solid helpers (pure JS, no OCCT) ──────────────────────────
+
+/**
+ * Test whether a +Z ray from (px, py, pz) intersects triangle (A, B, C).
+ * Returns true when the intersection lies strictly above the ray origin
+ * (i.e. at t > 0 along the +Z axis).
+ *
+ * Uses Möller–Trumbore with D = (0,0,1) expanded at compile time for speed.
+ */
+function _rayTriangleHitAbove(px, py, pz,
+                               ax, ay, az, bx, by, bz, cx, cy, cz) {
+  const e1x = bx - ax, e1y = by - ay, e1z = bz - az;
+  const e2x = cx - ax, e2y = cy - ay, e2z = cz - az;
+  // H = (0,0,1) × E2  →  hx = -e2y, hy = e2x, hz = 0
+  const hx = -e2y, hy = e2x;
+  const det = e1x * hx + e1y * hy;           // E1 · H  (hz term = 0)
+  if (Math.abs(det) < 1e-14) return false;   // ray parallel to triangle
+  const inv = 1.0 / det;
+  const sx = px - ax, sy = py - ay, sz = pz - az;
+  const u = inv * (sx * hx + sy * hy);
+  if (u < 0.0 || u > 1.0) return false;
+  // Q = S × E1
+  const qx = sy * e1z - sz * e1y;
+  const qy = sz * e1x - sx * e1z;
+  const qz = sx * e1y - sy * e1x;
+  const v = inv * qz;                         // (0,0,1) · Q = Q.z
+  if (v < 0.0 || u + v > 1.0) return false;
+  const t = inv * (e2x * qx + e2y * qy + e2z * qz);
+  return t > 0.0;                             // hit strictly above origin
+}
+
+/**
+ * Return true when the point (px, py, pz) is inside the closed triangular
+ * mesh described by a THREE.BufferGeometry, using the parity (ray-casting)
+ * rule with a +Z ray.
+ *
+ * Handles indexed and non-indexed geometries.  Assumes a manifold, watertight
+ * mesh — the same requirement as the STL format.
+ */
+function _pointInMesh(geometry, px, py, pz) {
+  const pos = geometry.attributes.position;
+  const idx = geometry.index;
+  const triCount = idx ? idx.count / 3 : pos.count / 3;
+  let hits = 0;
+  for (let t = 0; t < triCount; t++) {
+    const i0 = idx ? idx.getX(t * 3)     : t * 3;
+    const i1 = idx ? idx.getX(t * 3 + 1) : t * 3 + 1;
+    const i2 = idx ? idx.getX(t * 3 + 2) : t * 3 + 2;
+    if (_rayTriangleHitAbove(
+          px, py, pz,
+          pos.getX(i0), pos.getY(i0), pos.getZ(i0),
+          pos.getX(i1), pos.getY(i1), pos.getZ(i1),
+          pos.getX(i2), pos.getY(i2), pos.getZ(i2))) hits++;
+  }
+  return (hits & 1) === 1;
+}
+
+// ── Per-solid sample-point finder ────────────────────────────────────────────
+
+/**
+ * Find a point that is verified to be in the interior of the given solid.
+ *
+ * The center of mass is correct for simply-connected cells, but can lie
+ * outside a cell that is concave (horseshoe / crescent shaped).  We always
+ * confirm with BRepClass3d_SolidClassifier before returning.  If the center
+ * of mass fails we fall back to the vertex centroid and then to individual
+ * vertices offset toward that centroid, so we find a valid interior point
+ * even for strongly non-convex cells.
+ *
+ * @returns {number[]|null}  [x, y, z] inside the solid, or null if not found
+ */
+function _getSamplePointInsideSolid(oc, solid, tol, toDelete) {
+  const classTol = Math.max(tol, 1e-7);
+  const IN  = oc.TopAbs_State?.TopAbs_IN  ?? 0;
+  const ON  = oc.TopAbs_State?.TopAbs_ON  ?? 2;
+
+  const _isIn = p => {
+    try {
+      const clf = new oc.BRepClass3d_SolidClassifier_3(
+        solid, makePnt(oc, p), classTol);
+      toDelete.push(clf);
+      const s = clf.State();
+      return s === IN || s === ON
+        || (typeof s === 'object' &&
+            (s === oc.TopAbs_State?.TopAbs_IN ||
+             s === oc.TopAbs_State?.TopAbs_ON));
+    } catch { return false; }
+  };
+
+  // 1. GProp centre of mass (exact, fast, correct for convex/simply-connected).
+  try {
+    const props = new oc.GProp_GProps_1();
+    toDelete.push(props);
+    oc.BRepGProp.VolumeProperties_1(solid, props, false, false, false);
+    const com = props.CentreOfMass();
+    const p = [com.X(), com.Y(), com.Z()];
+    if (_isIn(p)) return p;
+  } catch { /* fall through */ }
+
+  // 2. Vertex centroid — always inside convex cells; may be outside horseshoe.
+  const VERTEX_T = oc.TopAbs_ShapeEnum?.TopAbs_VERTEX ?? 7;
+  const SHAPE_T  = oc.TopAbs_ShapeEnum?.TopAbs_SHAPE  ?? 0;
+  const verts = [];
+  try {
+    const exp = new oc.TopExp_Explorer_2(solid, VERTEX_T, SHAPE_T);
+    toDelete.push(exp);
+    while (exp.More() && verts.length < 64) {
+      const vtx = oc.TopoDS.Vertex_1(exp.Current());
+      const pt  = oc.BRep_Tool.Pnt(vtx);
+      verts.push([pt.X(), pt.Y(), pt.Z()]);
+      exp.Next();
+    }
+  } catch { /* fall through */ }
+
+  if (verts.length === 0) return null;
+
+  const cx = verts.reduce((s, v) => s + v[0], 0) / verts.length;
+  const cy = verts.reduce((s, v) => s + v[1], 0) / verts.length;
+  const cz = verts.reduce((s, v) => s + v[2], 0) / verts.length;
+  const vc = [cx, cy, cz];
+  if (_isIn(vc)) return vc;
+
+  // 3. Vertices offset toward the vertex centroid — works for horseshoe cells
+  //    where the centroid lands in the concave gap.
+  for (const [vx, vy, vz] of verts) {
+    for (const frac of [0.1, 0.3, 0.5, 0.7]) {
+      const p = [
+        vx + (cx - vx) * frac,
+        vy + (cy - vy) * frac,
+        vz + (cz - vz) * frac,
+      ];
+      if (_isIn(p)) return p;
+    }
+  }
+
+  return null;
+}
+
+// ── MakerVolume solid filter ─────────────────────────────────────────────────
+
 /**
  * Use OCCT's BOPAlgo_MakerVolume to build a solid from oversized faces.
- * MakerVolume partitions all of space into closed cells — we then select
- * the one cell whose interior contains the mesh centroid.
+ * MakerVolume partitions all of space into closed cells — we then keep every
+ * cell whose interior lies within the original STL mesh, using a pure-JS
+ * ray-casting point-in-mesh test.
  *
- * @param {number[]} meshCentroid  [cx, cy, cz] — a point known to be inside
- *   the original part (typically the mesh bounding-box centre).
+ * @param {object} geometry  THREE.BufferGeometry of the original mesh
  */
-function _buildSolidViaMakerVolume(oc, faces, fuzzyTol, meshCentroid, toDelete) {
-  // opencascade.js 2.0 beta (verified from d.ts):
-  //   BOPAlgo_MakerVolume_1()  — no-arg constructor
-  //   SetArguments(TopTools_ListOfShape)  — via BOPAlgo_Builder base
-  //   Perform(Message_ProgressRange)      — required
-  //
-  // In 1.1.4 this class was marked RED (not exported); 2.0 beta exports it fully.
+function _buildSolidViaMakerVolume(oc, faces, fuzzyTol, geometry, toDelete) {
   if (typeof oc.BOPAlgo_MakerVolume_1 !== 'function') {
     console.warn('BOPAlgo_MakerVolume_1 not found in this opencascade.js build.');
     return null;
@@ -1073,17 +1207,19 @@ function _buildSolidViaMakerVolume(oc, faces, fuzzyTol, meshCentroid, toDelete) 
       return null;
     }
 
-    // ── Select the solid that contains the mesh centroid ────────────────────
-    // MakerVolume partitions ALL of space, producing many more solids than just
-    // the part itself (every bounded cell in the surface arrangement is a solid).
-    // We keep only the solid whose interior contains the original mesh centroid.
-    const solid = _selectSolidContaining(oc, result, meshCentroid, fuzzyTol, toDelete);
-    if (!solid) {
-      console.warn('BOPAlgo_MakerVolume: could not identify the part solid from the result compound.');
+    // ── Keep every cell that lies inside the original mesh ──────────────────
+    // MakerVolume creates one closed solid for every bounded region of space
+    // in the surface arrangement — interior cells, exterior octants, and all
+    // cross-cut slivers.  We keep only the cells that are physically inside
+    // the original part by testing a verified-interior sample point from each
+    // cell against the STL mesh with a ray-casting parity test.
+    const kept = _filterSolidsInsideMesh(oc, result, geometry, fuzzyTol, toDelete);
+    if (!kept) {
+      console.warn('BOPAlgo_MakerVolume: no cells classified as inside the mesh.');
       return null;
     }
     console.info('BOPAlgo_MakerVolume succeeded.');
-    return solid;
+    return kept;
   } catch (e) {
     console.warn('BOPAlgo_MakerVolume failed:', e?.message ?? e);
     return null;
@@ -1091,63 +1227,67 @@ function _buildSolidViaMakerVolume(oc, faces, fuzzyTol, meshCentroid, toDelete) 
 }
 
 /**
- * Given a shape (compound or solid) produced by BOPAlgo_MakerVolume, find the
- * single solid that contains the given test point.
+ * From a MakerVolume result compound, collect every solid whose interior
+ * lies within the original STL mesh and return them as a compound (or as a
+ * single solid if only one survives).
  *
- * Uses BRepClass3d_SolidClassifier — the constructor overload _3(S, P, Tol)
- * performs the classification immediately and is the most efficient path.
+ * For each solid we find a point that is verifiably inside the solid
+ * (handling non-convex/horseshoe-shaped cells) and then test it against the
+ * mesh using Möller–Trumbore ray-casting parity.
  *
- * @param {number[]} testPt  [x, y, z]
- * @returns {object|null}  TopoDS_Solid or null
+ * @param {object} geometry  THREE.BufferGeometry of the original mesh
+ * @returns {object|null}  TopoDS_Compound of kept solids, or a single
+ *   TopoDS_Solid, or null when nothing survived the filter
  */
-function _selectSolidContaining(oc, shape, testPt, tol, toDelete) {
+function _filterSolidsInsideMesh(oc, shape, geometry, tol, toDelete) {
   const SOLID_T = oc.TopAbs_ShapeEnum?.TopAbs_SOLID ?? 3;
   const SHAPE_T = oc.TopAbs_ShapeEnum?.TopAbs_SHAPE ?? 0;
-  const IN_STATE = oc.TopAbs_State?.TopAbs_IN ?? 0;
-  const ON_STATE = oc.TopAbs_State?.TopAbs_ON ?? 2;
 
-  const pnt = makePnt(oc, testPt);
-  const classTol = Math.max(tol, 1e-7);
-
-  // Collect all solids from the shape (handles both direct Solid and Compound).
+  // Collect all solids from the shape.
   const solids = [];
   try {
     const exp = new oc.TopExp_Explorer_2(shape, SOLID_T, SHAPE_T);
     toDelete.push(exp);
     while (exp.More()) {
-      solids.push(oc.TopoDS.Solid_1 ? oc.TopoDS.Solid_1(exp.Current()) : exp.Current());
+      solids.push(oc.TopoDS.Solid_1
+        ? oc.TopoDS.Solid_1(exp.Current())
+        : exp.Current());
       exp.Next();
     }
   } catch (e) {
-    console.warn('_selectSolidContaining: explorer failed:', e?.message ?? e);
+    console.warn('_filterSolidsInsideMesh: explorer failed:', e?.message ?? e);
   }
 
   if (solids.length === 0) return null;
+  if (solids.length === 1) return solids[0];  // no filtering needed
 
-  // If there is only one solid, return it immediately (no need to classify).
-  if (solids.length === 1) return solids[0];
+  console.info(`BOPAlgo_MakerVolume: filtering ${solids.length} cells against mesh boundary…`);
 
-  console.info(`BOPAlgo_MakerVolume: selecting from ${solids.length} solids using mesh centroid.`);
-
+  const kept = [];
   for (const solid of solids) {
-    try {
-      // BRepClass3d_SolidClassifier_3(S, P, Tol) — performs classification in ctor.
-      const clf = new oc.BRepClass3d_SolidClassifier_3(solid, pnt, classTol);
-      toDelete.push(clf);
-      const state = clf.State();
-      // State() returns an enum object; compare against the known IN/ON values.
-      const isIn = (state === IN_STATE)
-        || (typeof state === 'object' && (
-              state === oc.TopAbs_State?.TopAbs_IN
-           || state === oc.TopAbs_State?.TopAbs_ON));
-      if (isIn) return solid;
-    } catch { /* try next solid */ }
+    const pt = _getSamplePointInsideSolid(oc, solid, tol, toDelete);
+    if (pt && _pointInMesh(geometry, pt[0], pt[1], pt[2])) kept.push(solid);
   }
 
-  // Fallback: return the largest solid by bounding-box volume.
-  // This handles degenerate cases where the centroid lands exactly on a face.
-  console.warn('_selectSolidContaining: centroid not strictly inside any solid; returning largest.');
-  return solids[0];
+  console.info(`BOPAlgo_MakerVolume: kept ${kept.length} / ${solids.length} cells.`);
+
+  if (kept.length === 0) return null;
+  if (kept.length === 1) return kept[0];
+
+  // Multiple interior cells → return a compound so the STEP writer can
+  // export them all as separate (correctly bounded) solids.
+  try {
+    const compound = new oc.TopoDS_Compound();
+    const bb = new oc.BRep_Builder();
+    toDelete.push(bb);
+    bb.MakeCompound(compound);
+    toDelete.push(compound);
+    for (const s of kept) bb.Add(compound, s);
+    return compound;
+  } catch (e) {
+    console.warn('_filterSolidsInsideMesh: compound build failed:', e?.message ?? e);
+    return kept[0];  // best-effort single solid
+  }
 }
 
 // ── Section-based solid builder ─────────────────────────────────────────────
@@ -1240,13 +1380,14 @@ function _buildSolidViaSections(oc, faceEntries, adjacency, groups,
  * Both produce the same result: faces trimmed at exact analytical intersection
  * curves, assembled into a watertight solid.  No mesh-derived boundaries.
  *
- * @param {number[]} meshCentroid  [cx, cy, cz] inside the original mesh
+ * @param {object} geometry  THREE.BufferGeometry — used to filter MakerVolume
+ *   cells to only those that lie inside the original mesh boundary
  */
 function _buildSolid(oc, faceEntries, adjacency, groups,
-                     modelDiag, sewTol, meshCentroid, toDelete) {
+                     modelDiag, sewTol, geometry, toDelete) {
   // Fast path: BOPAlgo_MakerVolume.
   const faces = faceEntries.map(e => e.face);
-  const mv = _buildSolidViaMakerVolume(oc, faces, sewTol, meshCentroid, toDelete);
+  const mv = _buildSolidViaMakerVolume(oc, faces, sewTol, geometry, toDelete);
   if (mv) return mv;
 
   // Robust path: Section-based analytical trimming.
@@ -1288,11 +1429,6 @@ export async function buildAndExportSTEP(groups, geometry, options = {}, onStatu
     if (z < zmin) zmin = z; if (z > zmax) zmax = z;
   }
   const modelDiag = Math.sqrt((xmax-xmin)**2 + (ymax-ymin)**2 + (zmax-zmin)**2);
-
-  // Mesh bounding-box centroid — a point that lies inside the original solid for
-  // typical convex/simply-connected parts.  Used by MakerVolume to pick the
-  // correct volume from the space partition it creates.
-  const meshCentroid = [(xmin+xmax)/2, (ymin+ymax)/2, (zmin+zmax)/2];
 
   let sewTol = options.sewTol ?? 0;
   if (sewTol <= 0) sewTol = Math.max(1e-6, modelDiag * 5e-3);
@@ -1339,7 +1475,7 @@ export async function buildAndExportSTEP(groups, geometry, options = {}, onStatu
   //   • Section-based trimming — robust path using only core OCCT APIs
   // No fallback to untrimmed faces, no compound dumping.
   const topShape = _buildSolid(
-    oc, faceEntries, adjacency, groups, modelDiag, sewTol, meshCentroid, toDelete);
+    oc, faceEntries, adjacency, groups, modelDiag, sewTol, geometry, toDelete);
 
   if (!topShape) {
     throw new Error(
