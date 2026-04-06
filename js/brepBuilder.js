@@ -34,7 +34,7 @@
 // ── Build version ─────────────────────────────────────────────────────────────
 
 /** Increment this string with each release to verify live-site deployments. */
-export const BUILD_VERSION = 'v0.2.1';
+export const BUILD_VERSION = 'v0.3.0';
 
 // ── OpenCASCADE lazy loader ───────────────────────────────────────────────────
 
@@ -571,6 +571,8 @@ function _buildLargePatch(oc, group, geometry, toDelete, modelDiag) {
  * @returns {object|null}  resulting TopoDS_Shape (compound of edges) or null
  */
 function _section(oc, s1, s2, toDelete) {
+  // Probe from higher-numbered (more-arg) constructors first — _5 and _3 are
+  // typically (S1, S2, PerformNow) while _2/_1 are simpler overloads.
   for (const suffix of ['_5', '_3', '_2', '_1']) {
     const name = 'BRepAlgoAPI_Section' + suffix;
     if (typeof oc[name] !== 'function') continue;
@@ -768,7 +770,10 @@ function _vBoundsFromAdjacentPlanes(surfaceParams, surfaceType,
     axis = _u3(surfaceParams.axis);
   } else if (surfaceType === 'sphere') {
     axisPoint = surfaceParams.center;
-    axis = [0, 0, 1]; // sphere axis is always Z in OCCT parameterisation
+    // OCCT gp_Sphere_2(Ax3, R) always uses the Ax3 main direction as the
+    // sphere's pole axis.  We construct it with makeDir([0,0,1]) in
+    // _buildTrimmedFace, so V (latitude) is measured relative to Z.
+    axis = [0, 0, 1];
   } else {
     return null;
   }
@@ -785,6 +790,9 @@ function _vBoundsFromAdjacentPlanes(surfaceParams, surfaceType,
     const t = _d3(diff, nu) / denom;
 
     if (surfaceType === 'sphere') {
+      // t is the signed distance along the Z-axis from the sphere centre
+      // to the plane intersection.  Dividing by radius gives sin(latitude),
+      // so asin(t/R) converts it to the OCCT sphere V parameter.
       const lat = Math.asin(Math.max(-1, Math.min(1, t / surfaceParams.radius)));
       if (lat < vmin) vmin = lat;
       if (lat > vmax) vmax = lat;
@@ -1047,6 +1055,7 @@ function _buildSolidViaSections(oc, faceEntries, adjacency, groups,
 
     const adjCompound = new oc.TopoDS_Compound();
     const bb = new oc.BRep_Builder();
+    toDelete.push(bb);
     bb.MakeCompound(adjCompound);
     for (const af of adjFaces) bb.Add(adjCompound, af);
     toDelete.push(adjCompound);
