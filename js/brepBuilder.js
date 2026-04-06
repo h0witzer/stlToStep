@@ -25,7 +25,7 @@
 // ── Build version ─────────────────────────────────────────────────────────────
 
 /** Increment this string with each release to verify live-site deployments. */
-export const BUILD_VERSION = 'v0.2.18';
+export const BUILD_VERSION = 'v0.2.19';
 
 // ── OpenCASCADE lazy loader ───────────────────────────────────────────────────
 
@@ -754,10 +754,23 @@ function _buildSolidViaSplitter(oc, faceEntries, sewTol, toDelete, geometry) {
   //   Used when BRepExtrema_DistShapeShape or BRepBuilderAPI_MakeVertex are
   //   not exported by the opencascade.js build in use.
 
-  const VERTEX_SAMPLES = 8; // sample points per group (covers annular shapes well)
+  const VERTEX_SAMPLES = 8; // sample points per group (BRepExtrema fallback path)
   const pos = geometry?.attributes?.position;
 
-  // Detect BRepExtrema availability (single probe; consistent across all groups).
+  // ── Detect primary scorer: IntCurvesFace_ShapeIntersector ──────────────
+  // This is the most reliable scorer: cast a bidirectional ray from the
+  // centroid of the group's LARGEST mesh triangle along its face normal.
+  // Because the origin is ON (or nearest to) the mesh surface, the correct
+  // fragment scores ≈ 0 and all other fragments either miss the ray entirely
+  // or score a large positive distance.  This works for flat, cylindrical,
+  // conical, and spherical surfaces without any surface-type enumeration.
+  const _isiCtorName = oc.IntCurvesFace_ShapeIntersector_1 ? 'IntCurvesFace_ShapeIntersector_1'
+                     : oc.IntCurvesFace_ShapeIntersector   ? 'IntCurvesFace_ShapeIntersector'
+                     : null;
+  const raycastAvailable = _isiCtorName !== null;
+
+  // ── Detect secondary scorer: BRepExtrema_DistShapeShape ─────────────────
+  // Used when IntCurvesFace is unavailable.
   const _dssCtorName = oc.BRepExtrema_DistShapeShape_2   ? 'BRepExtrema_DistShapeShape_2'
                      : oc.BRepExtrema_DistShapeShape_3   ? 'BRepExtrema_DistShapeShape_3'
                      : oc.BRepExtrema_DistShapeShape_1   ? 'BRepExtrema_DistShapeShape_1'
@@ -768,40 +781,67 @@ function _buildSolidViaSplitter(oc, faceEntries, sewTol, toDelete, geometry) {
                      : null;
   const extremaAvailable = _dssCtorName !== null && _vmCtorName !== null;
 
-  if (!extremaAvailable) {
-    console.warn('[Splitter] BRepExtrema_DistShapeShape unavailable — ' +
-                 'falling back to centroid-based fragment selection (may fail for annular faces).');
+  if (!raycastAvailable) {
+    if (!extremaAvailable) {
+      console.warn('[Splitter] Neither IntCurvesFace_ShapeIntersector nor BRepExtrema available — ' +
+                   'falling back to centroid-based fragment selection (may fail for annular/curved faces).');
+    } else {
+      console.info('[Splitter] IntCurvesFace_ShapeIntersector unavailable — using BRepExtrema fallback.');
+    }
   }
 
-  // Pre-compute BRepExtrema call arguments once.
-  // OCCT 7.6.2 Emscripten bindings require ALL default C++ params explicitly:
-  //   BRepExtrema_DistShapeShape_2(S1, S2, ExtFlag, ExtAlgo, ProgressRange) — 5 args.
-  //   Perform(ProgressRange) — 1 arg.
-  // Without these the constructor throws every time, minDist stays Infinity,
-  // and the centroid fallback silently fires — breaking annular/donut shapes.
+  // Pre-compute BRepExtrema call arguments once (only needed for fallback path).
   const dssRange = extremaAvailable ? _mkRange(oc) : null;
   const extFlag  = extremaAvailable ? (oc.Extrema_ExtFlag?.Extrema_ExtFlag_MINMAX ?? 2) : 2;
   const extAlgo  = extremaAvailable ? (oc.Extrema_ExtAlgo?.Extrema_ExtAlgo_Grad   ?? 0) : 0;
 
-  // Per-group metadata: sample mesh vertices (primary) + centroid (fallback).
+  /**
+   * Find the largest-area triangle in a group and return its centroid + unit
+   * outward normal.  Pure JS, no OCCT.  Returns null if no triangles.
+   *
+   * The largest triangle is chosen because:
+   *   • It has the most reliable normal (tiny triangles can be very oblique).
+   *   • Its centroid is guaranteed to lie on (or very near) the analytical
+   *     surface, making the resulting ray origin highly discriminating.
+   */
+  function _largestTriangle(group) {
+    if (!pos || !group.triangleIndices) return null;
+    let bestArea = -1, result = null;
+    for (const t of group.triangleIndices) {
+      const ax = pos.getX(t*3),   ay = pos.getY(t*3),   az = pos.getZ(t*3);
+      const bx = pos.getX(t*3+1), by = pos.getY(t*3+1), bz = pos.getZ(t*3+1);
+      const cx = pos.getX(t*3+2), cy = pos.getY(t*3+2), cz = pos.getZ(t*3+2);
+      const ux = bx-ax, uy = by-ay, uz = bz-az;
+      const vx = cx-ax, vy = cy-ay, vz = cz-az;
+      const nx = uy*vz - uz*vy, ny = uz*vx - ux*vz, nz = ux*vy - uy*vx;
+      const area = Math.sqrt(nx*nx + ny*ny + nz*nz) * 0.5;
+      if (area > bestArea) {
+        bestArea = area;
+        const nl = Math.sqrt(nx*nx + ny*ny + nz*nz) || 1;
+        result = {
+          centroid: [(ax+bx+cx)/3, (ay+by+cy)/3, (az+bz+cz)/3],
+          normal:   [nx/nl, ny/nl, nz/nl],
+        };
+      }
+    }
+    return result;
+  }
+
+  // Per-group metadata.
   const groupData = faceEntries.map(({ group, groupIdx }) => {
     let cx = 0, cy = 0, cz = 0, n = 0;
     const samples = [];
 
     if (pos && group.triangleIndices) {
-      // triangleIndices is a Set<number> (triangle indices into geometry).
-      // Each triangle t has its 3 vertex positions at pos.getX(t*3+v) for v=0,1,2.
       const triCount = group.triangleIndices.size ?? group.triangleIndices.length ?? 0;
       if (triCount > 0) {
         const step = Math.max(1, Math.floor(triCount / VERTEX_SAMPLES));
         let si = 0;
         for (const t of group.triangleIndices) {
-          // Accumulate all 3 vertices for centroid computation.
           for (let v = 0; v < 3; v++) {
             const i = t * 3 + v;
             cx += pos.getX(i); cy += pos.getY(i); cz += pos.getZ(i); n++;
           }
-          // Sample first vertex of every step-th triangle for BRepExtrema queries.
           if (si % step === 0 && samples.length < VERTEX_SAMPLES) {
             const i0 = t * 3;
             samples.push([pos.getX(i0), pos.getY(i0), pos.getZ(i0)]);
@@ -817,8 +857,8 @@ function _buildSolidViaSplitter(oc, faceEntries, sewTol, toDelete, geometry) {
       cx = pt[0]; cy = pt[1]; cz = pt[2]; n = 1;
     }
     const centroid = [cx / n, cy / n, cz / n];
-    if (samples.length === 0) samples.push(centroid); // centroid as sole fallback sample
-    return { groupIdx, centroid, samples };
+    if (samples.length === 0) samples.push(centroid);
+    return { groupIdx, centroid, samples, largestTri: _largestTriangle(group) };
   });
 
   const FACE_T  = oc.TopAbs_ShapeEnum?.TopAbs_FACE  ?? 4;
@@ -846,35 +886,88 @@ function _buildSolidViaSplitter(oc, faceEntries, sewTol, toDelete, geometry) {
   }
 
   // ── Step B: per-group independent selection — ranked assignment ─────────
-  // Compute a score for every (group, fragment) pair, then do a greedy
-  // ranked assignment so EVERY group gets exactly one fragment.
+  // Score every (group, fragment) pair, then greedily assign best-first so
+  // every group gets exactly one fragment.
   //
-  // WHY RANKED ASSIGNMENT:
-  //   A single-pass "closest wins" dedup can leave a group with no fragment
-  //   when two groups both score best against the same fragment (the losing
-  //   group gets nothing → sewing fails even though the geometry is fine).
-  //   With BRepExtrema working, the correct fragment always scores ≈ 0 while
-  //   all other fragments score > 0.  Assigning in ascending-score order
-  //   therefore guarantees each group gets its rightful fragment.
+  // SCORING TIERS (tried in order, first successful result used):
   //
-  // ALGORITHM: collect all (gi, fi, score) triples → sort ascending →
-  //   iterate: first time we see a gi or fi that hasn't been assigned yet,
-  //   record the assignment.  O(G·F·log(G·F)) — negligible for typical N.
+  //  1. RAY-CAST (primary, pure-JS ray / OCCT face intersection):
+  //     For each group, find its largest mesh triangle (most reliable normal).
+  //     Cast a bidirectional ray from the triangle centroid along its face
+  //     normal using IntCurvesFace_ShapeIntersector.  Score = min |WParameter|
+  //     (signed distance from origin to intersection along the ray).  Fragments
+  //     not intersected by the ray score Infinity.
+  //
+  //     WHY THIS WORKS: the triangle centroid lies ON the mesh surface, so the
+  //     correct fragment is intersected at WParam ≈ 0.  Other fragments (e.g.
+  //     the caps on a cylinder, or the inner disc on a washer) are either not
+  //     intersected at all, or intersected at a larger distance.
+  //
+  //  2. BREP-EXTREMA (secondary): minimum distance from sample mesh vertices
+  //     to each fragment surface.  Falls back to centroid when extrema fail.
+  //
+  //  3. CENTROID (last resort): fragment centroid vs. group centroid.
 
-  // groupScores[gi] = [ { fi, score }, … ] one entry per fragment.
   const groupScores = groupData.map(() => /** @type {{fi:number,score:number}[]} */([]));
+  let rayFallbackWarned    = false;
   let extremaFallbackWarned = false;
 
   for (let gi = 0; gi < groupData.length; gi++) {
-    const { centroid, samples } = groupData[gi];
+    const { centroid, samples, largestTri } = groupData[gi];
+
+    // Pre-build the ray for this group once (reused across all fragments).
+    let groupRay = null; // { lin } when raycast is active for this group
+    if (raycastAvailable && largestTri) {
+      try {
+        const [ox, oy, oz] = largestTri.centroid;
+        const [dx, dy, dz] = largestTri.normal;
+        const pnt = new oc.gp_Pnt_3(ox, oy, oz);
+        const dir = new oc.gp_Dir_4(dx, dy, dz);
+        toDelete.push(pnt, dir);
+        let lin;
+        try { lin = new oc.gp_Lin_2(pnt, dir); }
+        catch {
+          const ax1 = new oc.gp_Ax1_2(pnt, dir);
+          toDelete.push(ax1);
+          lin = new oc.gp_Lin_1(ax1);
+        }
+        toDelete.push(lin);
+        groupRay = { lin };
+      } catch { /* ray construction failed for this group; use fallback scorers */ }
+    }
 
     for (let fi = 0; fi < frags.length; fi++) {
       const { fragFace, c } = frags[fi];
-      let score;
+      let score = Infinity;
 
-      if (extremaAvailable) {
-        // Primary: minimum vertex-to-face distance via BRepExtrema.
-        // ≈0 means a sample vertex lies on this fragment → correct match.
+      // ── Tier 1: IntCurvesFace_ShapeIntersector ray-cast ────────────────
+      if (groupRay) {
+        try {
+          const isi = new oc[_isiCtorName]();
+          toDelete.push(isi);
+          isi.Load(fragFace, 1e-6);
+
+          // PerformNearest is faster (stops at first hit); fall back to Perform.
+          try        { isi.PerformNearest(groupRay.lin, -1e15, 1e15); }
+          catch (e1) { try { isi.Perform(groupRay.lin, -1e15, 1e15); } catch {} }
+
+          if (isi.IsDone() && isi.NbPnt() > 0) {
+            let minW = Infinity;
+            for (let k = 1; k <= isi.NbPnt(); k++) {
+              // WParameter is the signed distance along the ray from the origin.
+              // The correct fragment (the one the origin lies on) will have
+              // |WParameter| ≈ 0.  Fragments missed by the ray aren't returned.
+              const w = Math.abs(isi.WParameter(k));
+              if (w < minW) minW = w;
+            }
+            score = minW;
+          }
+          // score stays Infinity if ray doesn't intersect this fragment.
+        } catch { /* single (gi,fi) raycast failure — stay Infinity for this fragment */ }
+      }
+
+      // ── Tier 2: BRepExtrema vertex-to-face distance ──────────────────────
+      if (!isFinite(score) && extremaAvailable) {
         let minDist = Infinity;
         for (const [sx, sy, sz] of samples) {
           try {
@@ -885,7 +978,6 @@ function _buildSolidViaSplitter(oc, faceEntries, sewTol, toDelete, geometry) {
             const vtx = vm.Shape ? vm.Shape() : vm.Vertex?.();
             if (!vtx) continue;
 
-            // OCCT 7.6.2 Emscripten: all 5 args required (S1,S2,F,A,Range).
             let dss;
             if (dssRange) {
               try { dss = new oc[_dssCtorName](vtx, fragFace, extFlag, extAlgo, dssRange); }
@@ -903,21 +995,25 @@ function _buildSolidViaSplitter(oc, faceEntries, sewTol, toDelete, geometry) {
               const d = dss.Value();
               if (d < minDist) minDist = d;
             }
-          } catch { /* single sample failure — try next */ }
+          } catch { /* single sample failure */ }
         }
         if (isFinite(minDist)) {
           score = minDist;
-        } else {
-          if (!extremaFallbackWarned) {
-            console.warn('[Splitter] BRepExtrema failed at runtime — falling back to centroid scoring.');
-            extremaFallbackWarned = true;
-          }
-          const [cx, cy, cz] = centroid;
-          score = (c[0]-cx)**2 + (c[1]-cy)**2 + (c[2]-cz)**2;
+        } else if (!extremaFallbackWarned) {
+          console.warn('[Splitter] BRepExtrema failed at runtime — using centroid fallback.');
+          extremaFallbackWarned = true;
         }
-      } else {
-        const [cx, cy, cz] = centroid;
-        score = (c[0]-cx)**2 + (c[1]-cy)**2 + (c[2]-cz)**2;
+      }
+
+      // ── Tier 3: centroid-to-centroid squared distance ────────────────────
+      if (!isFinite(score)) {
+        if (groupRay && !rayFallbackWarned) {
+          console.warn('[Splitter] Ray-cast missed all fragments for a group — ' +
+                       'centroid fallback active (may misassign on symmetric shapes).');
+          rayFallbackWarned = true;
+        }
+        const [cx2, cy2, cz2] = centroid;
+        score = (c[0]-cx2)**2 + (c[1]-cy2)**2 + (c[2]-cz2)**2;
       }
 
       groupScores[gi].push({ fi, score });
