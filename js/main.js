@@ -416,14 +416,12 @@ async function handleExport() {
 
     downloadSTEP(stepContent, `${currentStlName}.stp`);
 
-    // Build and show the OCCT solid preview layer from the tessellation data.
+    // Store the OCCT solid tessellation for dev diagnostics but do NOT
+    // auto-show it — the analytical Faces layer is the primary live preview.
+    // Developers can enable the "OCCT" toggle manually to inspect the raw mesh.
     if (tessellation?.vertices?.length > 0) {
       const solidGroup = buildOCCTSolidMesh(tessellation);
       setBrepSolidOverlay(solidGroup);
-      if (brepSolidToggle) {
-        brepSolidToggle.checked = true;
-        setBrepSolidVisible(true);
-      }
     }
   } catch (err) {
     console.error('Export failed:', err);

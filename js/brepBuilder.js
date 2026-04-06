@@ -25,7 +25,7 @@
 // ── Build version ─────────────────────────────────────────────────────────────
 
 /** Increment this string with each release to verify live-site deployments. */
-export const BUILD_VERSION = 'v0.2.22';
+export const BUILD_VERSION = 'v0.2.23';
 
 // ── OpenCASCADE lazy loader ───────────────────────────────────────────────────
 
