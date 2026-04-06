@@ -25,7 +25,7 @@
 // ── Build version ─────────────────────────────────────────────────────────────
 
 /** Increment this string with each release to verify live-site deployments. */
-export const BUILD_VERSION = 'v0.2.21';
+export const BUILD_VERSION = 'v0.2.22';
 
 // ── OpenCASCADE lazy loader ───────────────────────────────────────────────────
 
@@ -692,7 +692,13 @@ function _tessellateShapeToBuffers(oc, shape, linearDefl, toDelete) {
         const loc = new oc.TopLoc_Location_1();
         toDelete.push(loc);
 
-        const hTriang = oc.BRep_Tool.Triangulation(face, loc);
+        // BRep_Tool.Triangulation(face, loc [, meshPurpose]) — 3rd arg (Poly_MeshPurpose) required
+        // in OCCT 7.6.2 Emscripten bindings. Poly_MeshPurpose_NONE = 0.
+        const hTriang = (() => {
+          const purpose = oc.Poly_MeshPurpose?.Poly_MeshPurpose_NONE ?? 0;
+          try { return oc.BRep_Tool.Triangulation(face, loc, purpose); }
+          catch { return oc.BRep_Tool.Triangulation(face, loc); }
+        })();
         if (!hTriang || hTriang.IsNull?.()) { exp.Next(); facesFail++; continue; }
 
         const triang = hTriang.get ? hTriang.get() : hTriang;
