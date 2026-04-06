@@ -25,7 +25,7 @@
 // ── Build version ─────────────────────────────────────────────────────────────
 
 /** Increment this string with each release to verify live-site deployments. */
-export const BUILD_VERSION = 'v0.2.24';
+export const BUILD_VERSION = 'v0.2.25';
 
 // ── OpenCASCADE lazy loader ───────────────────────────────────────────────────
 
@@ -652,7 +652,8 @@ function _tessellateShapeToBuffers(oc, shape, linearDefl, toDelete) {
     let mesher;
     let mesherOk = false;
     try {
-      mesher = new oc.BRepMesh_IncrementalMesh_2(shape, linearDefl, false, 0.5, false);
+      // Angular deflection of 0.1 rad (vs default 0.5) gives much smoother curved surfaces.
+      mesher = new oc.BRepMesh_IncrementalMesh_2(shape, linearDefl, false, 0.1, false);
       mesherOk = true;
     } catch (e1) {
       try {
@@ -666,6 +667,7 @@ function _tessellateShapeToBuffers(oc, shape, linearDefl, toDelete) {
     toDelete.push(mesher);
 
     const FACE_T  = oc.TopAbs_ShapeEnum?.TopAbs_FACE  ?? 4;
+    const EDGE_T  = oc.TopAbs_ShapeEnum?.TopAbs_EDGE  ?? 6;
     const SHAPE_T = oc.TopAbs_ShapeEnum?.TopAbs_SHAPE ?? 0;
     const REVERSED = oc.TopAbs_Orientation?.TopAbs_REVERSED ?? 1;
 
@@ -775,10 +777,63 @@ function _tessellateShapeToBuffers(oc, shape, linearDefl, toDelete) {
       return null;
     }
 
-    console.log(`[Tessellate] ${facesOk} faces → ${vertOffset} vertices, ${allIndices.length / 3 | 0} triangles (${facesFail} faces failed)`);
+    // ── Extract B-rep edge curves (analytical intersection lines) ──────────────
+    // After BRepMesh the tessellated edge polygon is stored with each edge.
+    // We iterate all edges and collect consecutive-node line segments.
+    // These represent the exact trim curves between surfaces and are what the
+    // user wants to see as "analytical curves" — not tessellation mesh edges.
+    const edgePts = [];
+    try {
+      const edgeExp = new oc.TopExp_Explorer_2(shape, EDGE_T, SHAPE_T);
+      toDelete.push(edgeExp);
+      while (edgeExp.More()) {
+        let edge;
+        try { edge = oc.TopoDS.Edge_1 ? oc.TopoDS.Edge_1(edgeExp.Current()) : edgeExp.Current(); }
+        catch { edge = edgeExp.Current(); }
+
+        try {
+          const eloc = new oc.TopLoc_Location_1();
+          toDelete.push(eloc);
+          const hPoly = oc.BRep_Tool.Polygon3D(edge, eloc);
+          if (!hPoly || hPoly.IsNull?.()) { edgeExp.Next(); continue; }
+          const poly = hPoly.get ? hPoly.get() : hPoly;
+          const nn = poly.NbNodes();
+          if (nn < 2) { edgeExp.Next(); continue; }
+
+          const isId = eloc.IsIdentity?.() ?? true;
+          let etrsf = null;
+          if (!isId) { try { etrsf = eloc.Transformation(); } catch { etrsf = null; } }
+
+          const nodes = poly.Nodes();
+          const applyTrsf = (x, y, z) => {
+            if (!etrsf) return [x, y, z];
+            try {
+              const p = new oc.gp_Pnt_3(x, y, z);
+              p.Transform(etrsf);
+              return [p.X(), p.Y(), p.Z()];
+            } catch { return [x, y, z]; }
+          };
+
+          for (let ni = 1; ni < nn; ni++) {
+            const p0 = nodes.Value(ni);
+            const p1 = nodes.Value(ni + 1);
+            const [x0, y0, z0] = applyTrsf(p0.X(), p0.Y(), p0.Z());
+            const [x1, y1, z1] = applyTrsf(p1.X(), p1.Y(), p1.Z());
+            edgePts.push(x0, y0, z0, x1, y1, z1);
+          }
+        } catch { /* skip this edge silently */ }
+
+        edgeExp.Next();
+      }
+    } catch (e) {
+      console.warn('[Tessellate] edge extraction failed (non-fatal):', e?.message ?? e);
+    }
+
+    console.log(`[Tessellate] ${facesOk} faces → ${vertOffset} vertices, ${allIndices.length / 3 | 0} triangles (${facesFail} failed); ${edgePts.length / 6 | 0} edge segments`);
     return {
-      vertices: new Float32Array(allVerts),
-      indices:  new Uint32Array(allIndices),
+      vertices:     new Float32Array(allVerts),
+      indices:      new Uint32Array(allIndices),
+      edgeVertices: edgePts.length > 0 ? new Float32Array(edgePts) : null,
     };
   } catch (e) {
     console.warn('[Tessellate] Failed to tessellate shape:', e?.message ?? e);
@@ -1594,13 +1649,14 @@ export async function buildAndExportSTEP(groups, geometry, options = {}, onStatu
   onStatus?.('Tessellating B-rep preview…', 92);
 
   // Tessellate all island solids for the viewport preview layer.
-  // A linear deflection of ~0.5% of the model diagonal gives a reasonable
-  // trade-off between preview quality and tessellation time.
+  // A linear deflection of 0.1% of the model diagonal + angular deflection of 0.1 rad
+  // gives smooth-looking surfaces that aren't confused with the STL input mesh.
   let tessellation = null;
   try {
-    const tessDefl = Math.max(1e-5, modelDiag * 0.005);
-    const allVerts   = [];
-    const allIndices = [];
+    const tessDefl = Math.max(1e-5, modelDiag * 0.001);
+    const allVerts    = [];
+    const allIndices  = [];
+    const allEdgePts  = [];
     let vertOffset = 0;
     for (const solid of islandSolids) {
       const buffers = _tessellateShapeToBuffers(oc, solid, tessDefl, toDelete);
@@ -1608,11 +1664,15 @@ export async function buildAndExportSTEP(groups, geometry, options = {}, onStatu
       for (let i = 0; i < buffers.vertices.length; i++) allVerts.push(buffers.vertices[i]);
       for (let i = 0; i < buffers.indices.length;  i++) allIndices.push(buffers.indices[i] + vertOffset);
       vertOffset += buffers.vertices.length / 3;
+      if (buffers.edgeVertices) {
+        for (let i = 0; i < buffers.edgeVertices.length; i++) allEdgePts.push(buffers.edgeVertices[i]);
+      }
     }
     if (vertOffset > 0) {
       tessellation = {
-        vertices: new Float32Array(allVerts),
-        indices:  new Uint32Array(allIndices),
+        vertices:     new Float32Array(allVerts),
+        indices:      new Uint32Array(allIndices),
+        edgeVertices: allEdgePts.length > 0 ? new Float32Array(allEdgePts) : null,
       };
     }
   } catch (e) {

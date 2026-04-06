@@ -289,6 +289,7 @@ async function handleFit() {
     );
     setBrepFacesOverlay(facesOverlay);
     setBrepFacesVisible(true);
+    if (brepFacesToggle) brepFacesToggle.checked = true;
   } catch (err) {
     console.error('Surface fitting failed:', err);
     alert(`Surface fitting failed: ${err.message}`);
@@ -400,6 +401,7 @@ function renderSurfaceList() {
       );
       setBrepFacesOverlay(facesOverlay);
       setBrepFacesVisible(true);
+      if (brepFacesToggle) brepFacesToggle.checked = true;
       // Rebuild the OCCT solid preview with 800 ms debounce so rapid type
       // changes don't hammer the OCCT kernel.
       triggerLivePreview(800);
@@ -481,41 +483,47 @@ async function handleExport() {
 
 /**
  * Build a Three.js Group from OCCT tessellation buffers returned by
- * buildAndExportSTEP().  Renders a semi-transparent solid with a hard edge
- * wireframe overlay, distinct from the analytical face preview.
+ * buildAndExportSTEP().  Renders smooth semi-transparent surfaces plus the
+ * analytical intersection curves (B-rep edge polylines extracted after
+ * BRepMesh).  No tessellation mesh wireframe — that would be confused with
+ * the STL input.
  *
- * @param {{ vertices: Float32Array, indices: Uint32Array }} tessellation
+ * @param {{ vertices: Float32Array, indices: Uint32Array, edgeVertices: Float32Array|null }} tessellation
  * @returns {THREE.Group}
  */
-function buildOCCTSolidMesh({ vertices, indices }) {
+function buildOCCTSolidMesh({ vertices, indices, edgeVertices }) {
   const group = new THREE.Group();
   group.name = 'brep-solid-overlay';
 
+  // ── Smooth surface fill (no wireframe) ──────────────────────────────────
   const geo = new THREE.BufferGeometry();
   geo.setAttribute('position', new THREE.BufferAttribute(vertices, 3));
   geo.setIndex(new THREE.BufferAttribute(indices, 1));
   geo.computeVertexNormals();
 
-  // Semi-transparent filled surface.
   const fillMat = new THREE.MeshPhongMaterial({
     color: 0x22cc88,
-    opacity: 0.55,
+    opacity: 0.45,
     transparent: true,
     side: THREE.DoubleSide,
     depthWrite: false,
   });
   group.add(new THREE.Mesh(geo, fillMat));
 
-  // Wireframe edges — reuse the same geometry to avoid duplicating vertex data.
-  const wireMat = new THREE.MeshBasicMaterial({
-    color: 0x00aa66,
-    wireframe: true,
-    opacity: 0.25,
-    transparent: true,
-    depthTest: false,
-    depthWrite: false,
-  });
-  group.add(new THREE.Mesh(geo, wireMat));
+  // ── Analytical intersection curves (B-rep edge polylines) ───────────────
+  // These are the actual trim curves between surfaces — exactly what the user
+  // wants to see, as opposed to tessellation mesh edges.
+  if (edgeVertices && edgeVertices.length >= 6) {
+    const edgeGeo = new THREE.BufferGeometry();
+    edgeGeo.setAttribute('position', new THREE.BufferAttribute(edgeVertices, 3));
+    const edgeMat = new THREE.LineBasicMaterial({
+      color: 0x00ffaa,
+      linewidth: 1,
+      depthTest: true,
+      depthWrite: false,
+    });
+    group.add(new THREE.LineSegments(edgeGeo, edgeMat));
+  }
 
   return group;
 }
