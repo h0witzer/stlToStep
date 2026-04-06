@@ -11,9 +11,10 @@
  *      circles, ellipses, conics, …) simultaneously and trims every face into
  *      the exact fragments bounded by those intersections — no surface-type
  *      enumeration, no manual wire-building, no vertex math.
- *   3. For each input group, keep the one output fragment whose centroid (via
- *      BRepGProp.SurfaceProperties) is closest to the group's surface origin.
- *      This discards the "exterior" flaps from the oversized patches.
+ *   3. For each input group, keep the one output fragment whose trimmed surface
+ *      is nearest to that group's actual mesh sample vertices (via
+ *      BRepExtrema_DistShapeShape point-to-face distance).  Falls back to
+ *      GProp centroid comparison when BRepExtrema is unavailable.
  *   4. Sew the kept fragments into a watertight shell → solid.
  *   5. Write STEP via STEPControl_Writer.
  *
@@ -24,7 +25,7 @@
 // ── Build version ─────────────────────────────────────────────────────────────
 
 /** Increment this string with each release to verify live-site deployments. */
-export const BUILD_VERSION = 'v0.2.14';
+export const BUILD_VERSION = 'v0.2.15';
 
 // ── OpenCASCADE lazy loader ───────────────────────────────────────────────────
 
@@ -638,9 +639,17 @@ function _faceGPropCentroid(oc, face, toDelete) {
  *     OCCT handles all curve types (lines, circles, ellipses, conics) and all
  *     angle combinations internally — no surface-type enumeration needed.
  *
- *  2. Filter the resulting face fragments: keep only the fragment whose
- *     centroid (via BRepGProp.SurfaceProperties) is closest to the original
- *     mesh group's average vertex position.  One winning fragment per group.
+ *  2. Filter the resulting face fragments: for each input group, keep the one
+ *     output fragment whose trimmed surface is nearest to actual mesh sample
+ *     vertices from that group.  The minimum 3D distance from any sample vertex
+ *     to a candidate face's trimmed surface (via BRepExtrema_DistShapeShape) is
+ *     ≈0 when the vertex lies ON that fragment and positive otherwise — this
+ *     correctly handles annular/ring shapes where the group centroid falls in
+ *     the hole, making centroid-based comparison ambiguous.
+ *
+ *     Falls back to group-centroid vs. fragment-centroid distance when the
+ *     BRepExtrema_DistShapeShape or BRepBuilderAPI_MakeVertex bindings are not
+ *     available in the opencascade.js build.
  *
  *  3. Sew the winning fragments into a watertight shell → solid.
  *
@@ -723,39 +732,80 @@ function _buildSolidViaSplitter(oc, faceEntries, sewTol, toDelete, geometry) {
     return null;
   }
 
-  // ── Phase 2: Filter face fragments by proximity to mesh group centroids ──
-  // For each input group, compute its centroid from mesh triangle vertices
-  // (the most accurate representative point on each original surface patch).
-  // Fall back to the surface params origin if geometry is unavailable.
+  // ── Phase 2: Filter face fragments ─────────────────────────────────────
+  // For each input group we need to pick exactly one output fragment: the one
+  // whose trimmed surface actually covers the original mesh vertices for that
+  // group.
+  //
+  // WHY NOT CENTROID: for annular / ring-shaped faces (e.g. a flat washer, or
+  // a planar face surrounding a cylinder hole) the group's average vertex
+  // position — the centroid — lands at the geometric center of the hole, which
+  // is the SAME location as the centroid of the unwanted inner-disc fragment.
+  // Centroid-to-centroid distance is therefore ambiguous for such shapes.
+  //
+  // PRIMARY — BRepExtrema_DistShapeShape vertex-to-face distance:
+  //   Sample N actual mesh vertices from each group and compute the minimum 3D
+  //   distance from any sample to each candidate face fragment (respecting the
+  //   face's trim boundary).  When a sample vertex lies on the fragment the
+  //   distance is ≈0; when it lies in the hole or on the wrong side the
+  //   distance is positive.  The fragment with the lowest minimum distance wins.
+  //
+  // FALLBACK — centroid-to-centroid distance:
+  //   Used when BRepExtrema_DistShapeShape or BRepBuilderAPI_MakeVertex are
+  //   not exported by the opencascade.js build in use.
+
+  const VERTEX_SAMPLES = 8; // sample points per group (covers annular shapes well)
   const pos = geometry?.attributes?.position;
-  const groupCentroids = faceEntries.map(({ group, groupIdx }) => {
+
+  // Detect BRepExtrema availability (single probe; consistent across all groups).
+  const _dssCtorName = oc.BRepExtrema_DistShapeShape_2   ? 'BRepExtrema_DistShapeShape_2'
+                     : oc.BRepExtrema_DistShapeShape_3   ? 'BRepExtrema_DistShapeShape_3'
+                     : oc.BRepExtrema_DistShapeShape_1   ? 'BRepExtrema_DistShapeShape_1'
+                     : oc.BRepExtrema_DistShapeShape     ? 'BRepExtrema_DistShapeShape'
+                     : null;
+  const _vmCtorName  = oc.BRepBuilderAPI_MakeVertex_1    ? 'BRepBuilderAPI_MakeVertex_1'
+                     : oc.BRepBuilderAPI_MakeVertex      ? 'BRepBuilderAPI_MakeVertex'
+                     : null;
+  const extremaAvailable = _dssCtorName !== null && _vmCtorName !== null;
+
+  if (!extremaAvailable) {
+    console.warn('[Splitter] BRepExtrema_DistShapeShape unavailable — ' +
+                 'falling back to centroid-based fragment selection (may fail for annular faces).');
+  }
+
+  // Per-group metadata: sample mesh vertices (primary) + centroid (fallback).
+  const groupData = faceEntries.map(({ group, groupIdx }) => {
     let cx = 0, cy = 0, cz = 0, n = 0;
-    if (pos && group.triangleIndices) {
-      for (const t of group.triangleIndices) {
-        for (let v = 0; v < 3; v++) {
-          const i = t * 3 + v;
-          cx += pos.getX(i); cy += pos.getY(i); cz += pos.getZ(i); n++;
+    const samples = [];
+
+    if (pos && group.triangleIndices && group.triangleIndices.length > 0) {
+      const tris = group.triangleIndices;
+      const step = Math.max(1, Math.floor(tris.length / VERTEX_SAMPLES));
+      for (let si = 0; si < tris.length; si++) {
+        const i = tris[si] * 3;
+        const x = pos.getX(i), y = pos.getY(i), z = pos.getZ(i);
+        cx += x; cy += y; cz += z; n++;
+        if (si % step === 0 && samples.length < VERTEX_SAMPLES) {
+          samples.push([x, y, z]);
         }
       }
     }
+
     if (n === 0) {
-      // Fallback: use surface params origin / axisPoint / apex / center.
       const p = group.surface.params;
       const pt = p.origin ?? p.axisPoint ?? p.apex ?? p.center ?? [0, 0, 0];
       cx = pt[0]; cy = pt[1]; cz = pt[2]; n = 1;
     }
-    return { groupIdx, cx: cx/n, cy: cy/n, cz: cz/n };
+    const centroid = [cx / n, cy / n, cz / n];
+    if (samples.length === 0) samples.push(centroid); // centroid as sole fallback sample
+    return { groupIdx, centroid, samples };
   });
 
   const FACE_T  = oc.TopAbs_ShapeEnum?.TopAbs_FACE  ?? 4;
   const SHAPE_T = oc.TopAbs_ShapeEnum?.TopAbs_SHAPE ?? 0;
 
   // ── Step A: collect every output face fragment with its GProp centroid ──
-  // We gather ALL fragments first before doing any group assignment, so that
-  // each group can independently select its nearest fragment rather than
-  // having fragments assigned to groups (which caused wrong-side picks when a
-  // fragment's centroid happened to be geometrically closer to a different
-  // group's mesh centroid).
+  // Centroid is still needed for the fallback path and for dedup tiebreaking.
   const frags = [];
   try {
     const exp = new oc.TopExp_Explorer_2(allPieces, FACE_T, SHAPE_T);
@@ -776,23 +826,52 @@ function _buildSolidViaSplitter(oc, faceEntries, sewTol, toDelete, geometry) {
   }
 
   // ── Step B: per-group independent selection ─────────────────────────────
-  // For each analytical group, find the fragment whose centroid is nearest to
-  // that group's own mesh-vertex centroid.  This is the correct direction:
-  // "group → closest fragment", not "fragment → nearest group".
-  // Use a map from fragment index to {winnerGroupIdx, distSq} to enforce
-  // uniqueness: if two groups claim the same fragment the closer one wins.
-  const fragClaim = new Map(); // fragIdx → { groupIdx, distSq }
-  for (const { groupIdx, cx, cy, cz } of groupCentroids) {
-    let bestFragIdx = -1, bestDistSq = Infinity;
+  // Score each fragment for each group; pick the best fragment per group.
+  // Dedup: if two groups claim the same fragment the closer one keeps it.
+  const fragClaim = new Map(); // fragIdx → { groupIdx, score }
+
+  for (const { groupIdx, centroid, samples } of groupData) {
+    let bestFragIdx = -1, bestScore = Infinity;
+
     for (let fi = 0; fi < frags.length; fi++) {
-      const { c } = frags[fi];
-      const d = (c[0]-cx)**2 + (c[1]-cy)**2 + (c[2]-cz)**2;
-      if (d < bestDistSq) { bestDistSq = d; bestFragIdx = fi; }
+      const { fragFace, c } = frags[fi];
+      let score;
+
+      if (extremaAvailable) {
+        // Primary: minimum distance from any sample vertex to the fragment surface.
+        // ≈0 → sample vertex lies on this fragment → correct match.
+        let minDist = Infinity;
+        for (const [sx, sy, sz] of samples) {
+          try {
+            const pnt = new oc.gp_Pnt_3(sx, sy, sz);
+            toDelete.push(pnt);
+            const vm  = new oc[_vmCtorName](pnt);
+            toDelete.push(vm);
+            const vtx = vm.Shape ? vm.Shape() : vm.Vertex?.();
+            if (!vtx) continue;
+            const dss = new oc[_dssCtorName](vtx, fragFace);
+            toDelete.push(dss);
+            if (typeof dss.Perform === 'function') dss.Perform();
+            if (dss.IsDone?.() && dss.NbSolution?.() > 0) {
+              const d = dss.Value();
+              if (d < minDist) minDist = d;
+            }
+          } catch { /* single sample failure — continue to next sample */ }
+        }
+        score = isFinite(minDist) ? minDist : Infinity;
+      } else {
+        // Fallback: centroid-to-centroid squared distance.
+        const [cx, cy, cz] = centroid;
+        score = (c[0]-cx)**2 + (c[1]-cy)**2 + (c[2]-cz)**2;
+      }
+
+      if (score < bestScore) { bestScore = score; bestFragIdx = fi; }
     }
+
     if (bestFragIdx < 0) continue;
     const existing = fragClaim.get(bestFragIdx);
-    if (!existing || bestDistSq < existing.distSq) {
-      fragClaim.set(bestFragIdx, { groupIdx, distSq: bestDistSq });
+    if (!existing || bestScore < existing.score) {
+      fragClaim.set(bestFragIdx, { groupIdx, score: bestScore });
     }
   }
 
