@@ -25,7 +25,7 @@
 // ── Build version ─────────────────────────────────────────────────────────────
 
 /** Increment this string with each release to verify live-site deployments. */
-export const BUILD_VERSION = 'v0.2.23';
+export const BUILD_VERSION = 'v0.2.24';
 
 // ── OpenCASCADE lazy loader ───────────────────────────────────────────────────
 
@@ -1309,7 +1309,7 @@ function _buildSolid(oc, faceEntries, adjacency, groups,
  * @returns {Promise<string>}  STEP file content as UTF-8 string
  */
 export async function buildAndExportSTEP(groups, geometry, options = {}, onStatus) {
-  const { schema = 'AP214' } = options;
+  const { schema = 'AP214', previewOnly = false } = options;
 
   const oc = await initOC(msg => onStatus?.(msg, 5));
 
@@ -1416,9 +1416,10 @@ export async function buildAndExportSTEP(groups, geometry, options = {}, onStatu
       `${faceEntries.length} analytical faces.`);
   }
 
-  onStatus?.('Writing STEP file…', 80);
-
-  // Set STEP schema
+  // ── STEP file write (skipped in previewOnly mode) ────────────────────────────
+  let stepContent = null;
+  if (!previewOnly) {
+    onStatus?.('Writing STEP file…', 80);
   try {
     oc.Interface_Static_SetCVal(
       'write.step.schema',
@@ -1534,7 +1535,6 @@ export async function buildAndExportSTEP(groups, geometry, options = {}, onStatu
     '/home/' + stepFile,
   ];
 
-  let stepContent = null;
   let usedPath = null;
   for (const p of candidatePaths) {
     const c = tryRead(p);
@@ -1589,6 +1589,7 @@ export async function buildAndExportSTEP(groups, geometry, options = {}, onStatu
   if (!stepContent) {
     throw new Error('STEP export produced empty or invalid output. Transfer returned DONE but no ISO-10303 header found.');
   }
+  } // end if (!previewOnly)
 
   onStatus?.('Tessellating B-rep preview…', 92);
 
@@ -1626,7 +1627,7 @@ export async function buildAndExportSTEP(groups, geometry, options = {}, onStatu
   }
 
   onStatus?.('Done.', 100);
-  return { step: stepContent, tessellation };
+  return previewOnly ? { tessellation } : { step: stepContent, tessellation };
 }
 
 /**

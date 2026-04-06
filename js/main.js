@@ -37,6 +37,9 @@ let _triangleToGroup = null;
 // The currently highlighted group index (-1 = none)
 let _highlightedGroup = -1;
 
+// Debounce timer for live OCCT preview triggered by type-change dropdowns
+let _livePreviewTimer = null;
+
 // ── DOM refs ─────────────────────────────────────────────────────────────────
 
 const canvas        = document.getElementById('viewport');
@@ -219,6 +222,45 @@ async function handleDetect() {
 
 // ── Surface fitting ───────────────────────────────────────────────────────────
 
+/**
+ * Build the OCCT solid live (without writing STEP) and display the tessellated
+ * result in the OCCT overlay.  Called after "Fit Surfaces" and after each
+ * group type-change dropdown.  Failures are non-fatal and logged to console.
+ *
+ * @param {number} [debounceMs=0]  Delay before triggering; 0 = run immediately.
+ */
+function triggerLivePreview(debounceMs = 0) {
+  clearTimeout(_livePreviewTimer);
+  _livePreviewTimer = setTimeout(async () => {
+    if (!currentGroups || !currentGeometry) return;
+    if (!currentGroups.some(g => g.surface)) return;
+    exportProgress.classList.remove('hidden');
+    setProgress('Building OCCT preview…', 0);
+    try {
+      const sewTol = parseSewTol();
+      const result = await buildAndExportSTEP(
+        currentGroups,
+        currentGeometry,
+        { previewOnly: true, sewTol: sewTol || 1e-5 },
+        (msg, pct) => setProgress(msg, pct),
+      );
+      const tessellation = result?.tessellation ?? null;
+      if (tessellation?.vertices?.length > 0) {
+        const solidGroup = buildOCCTSolidMesh(tessellation);
+        setBrepSolidOverlay(solidGroup);
+        if (brepSolidToggle) {
+          brepSolidToggle.checked = true;
+          setBrepSolidVisible(true);
+        }
+      }
+    } catch (e) {
+      console.warn('[LivePreview] OCCT preview failed:', e?.message ?? e);
+    } finally {
+      setTimeout(() => exportProgress.classList.add('hidden'), 1500);
+    }
+  }, debounceMs);
+}
+
 async function handleFit() {
   if (!currentGroups || isBusy) return;
   setBusy(true, fitBtn);
@@ -252,6 +294,8 @@ async function handleFit() {
     alert(`Surface fitting failed: ${err.message}`);
   } finally {
     setBusy(false, fitBtn);
+    // Kick off the OCCT live preview immediately after fit (non-blocking).
+    triggerLivePreview(0);
   }
 }
 
@@ -356,6 +400,9 @@ function renderSurfaceList() {
       );
       setBrepFacesOverlay(facesOverlay);
       setBrepFacesVisible(true);
+      // Rebuild the OCCT solid preview with 800 ms debounce so rapid type
+      // changes don't hammer the OCCT kernel.
+      triggerLivePreview(800);
     });
     // Remember the auto classification
     g._autoSurface = g._autoSurface ?? g.surface;
