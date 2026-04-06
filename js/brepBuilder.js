@@ -30,7 +30,7 @@
 // ── Build version ─────────────────────────────────────────────────────────────
 
 /** Increment this string with each release to verify live-site deployments. */
-export const BUILD_VERSION = 'v0.2.9';
+export const BUILD_VERSION = 'v0.2.11';
 
 // ── OpenCASCADE lazy loader ───────────────────────────────────────────────────
 
@@ -895,35 +895,142 @@ function _vBoundsFromAdjacentPlanes(surfaceParams, surfaceType,
   return isFinite(vmin) && vmax - vmin > 1e-10 ? { vmin, vmax } : null;
 }
 
+// ── Edge–edge corner finder ──────────────────────────────────────────────────
+
+/**
+ * Find the 3D point where two OCCT section edges cross using
+ * BRepExtrema_DistShapeShape.
+ *
+ * When two boundary curves meet at a face corner the distance between the
+ * edges is zero; DistShapeShape computes that shared point robustly for any
+ * curve type (line, circle, ellipse, …) without any 2D projection or surface-
+ * type assumptions.
+ *
+ * @param {object}   oc
+ * @param {object}   edge1  TopoDS_Edge
+ * @param {object}   edge2  TopoDS_Edge
+ * @param {number}   tolerance
+ * @param {object[]} toDelete
+ * @returns {number[]|null}  [x,y,z] corner or null
+ */
+function _edgeEdgeCorner(oc, edge1, edge2, tolerance, toDelete) {
+  // Probe constructor overloads — opencascade.js numbers them from _1.
+  // The two-shape ctor is typically _2(S1, S2) or _3(S1, S2, ...).
+  for (const name of [
+    'BRepExtrema_DistShapeShape_2',
+    'BRepExtrema_DistShapeShape_3',
+  ]) {
+    if (typeof oc[name] !== 'function') continue;
+    try {
+      const dss = new oc[name](edge1, edge2);
+      toDelete.push(dss);
+      if (!dss.IsDone()) continue;
+      if (dss.Value() > tolerance) continue;
+      const pt = dss.PointOnShape1(1);
+      toDelete.push(pt);
+      return [pt.X(), pt.Y(), pt.Z()];
+    } catch { continue; }
+  }
+  return null;
+}
+
 // ── Trimmed face builder ────────────────────────────────────────────────────
 
 /**
- * Build a properly trimmed face from section edges (computed via
- * BRepAlgoAPI_Section with all neighbours).
+ * Build a properly trimmed face from section edges.
  *
- * • Plane faces: section edges are assembled into wires.  The largest wire
- *   becomes the outer boundary; smaller wires become holes.
+ * • Plane faces: for every pair of open section edges,
+ *   BRepExtrema_DistShapeShape finds the shared corner point where the two
+ *   boundary curves actually cross — no 2D projection, no surface-type
+ *   enumeration.  Closed section edges (circles/arcs from curved neighbours)
+ *   become inner hole wires.  Falls back to wire-chaining when no corners are
+ *   found (e.g. a circular cap whose only neighbour is a cylinder).
  *
  * • Curved faces (cylinder, cone, sphere): V-parameter bounds are computed
- *   analytically from adjacent plane positions — no mesh or OCCT edges.
- *
- * This generalises to fillets and NURBS: section edges provide exact trim
- * curves for any surface pair, and MakeFace(Geom_Surface, wire) will produce
- * the trimmed face.
+ *   analytically from adjacent plane positions.
  */
 function _buildTrimmedFace(oc, group, groupIdx, sectionEdges, adjacentIndices,
                            groups, modelDiag, tolerance, toDelete) {
   const { type, params } = group.surface;
 
   try {
-    // ── Plane: build face from section-edge wires ──────────────────────────
+    // ── Plane ──────────────────────────────────────────────────────────────
     if (type === 'plane') {
+      const { origin, normal } = params;
+      const nu = _u3(normal);
+      const pln = new oc.gp_Pln_3(makePnt(oc, origin), makeDir(oc, nu));
+      toDelete.push(pln);
+
+      // Partition section edges: closed = inner holes, open = outer boundary.
+      const closedEdges = [], openEdges = [];
+      for (const edge of sectionEdges) {
+        const pts = _edgePoints(oc, edge, toDelete, tolerance);
+        if (!pts) continue;
+        (pts.closed ? closedEdges : openEdges).push(edge);
+      }
+
+      // ── Primary path: OCCT edge–edge corner detection ──────────────────
+      // Two open section edges that share a face corner cross each other at
+      // that corner.  BRepExtrema_DistShapeShape finds that shared point
+      // exactly for any curve type, without projection assumptions.
+      const corners = [];
+      for (let a = 0; a < openEdges.length; a++) {
+        for (let b = a + 1; b < openEdges.length; b++) {
+          const pt = _edgeEdgeCorner(
+            oc, openEdges[a], openEdges[b], tolerance, toDelete);
+          if (pt) corners.push(pt);
+        }
+      }
+
+      // Deduplicate.
+      const tol2 = tolerance * tolerance * 4;
+      const unique = corners.filter((p, i) =>
+        !corners.slice(0, i).some(q =>
+          (p[0]-q[0])**2 + (p[1]-q[1])**2 + (p[2]-q[2])**2 < tol2));
+
+      if (unique.length >= 3) {
+        // Sort counter-clockwise around centroid in the plane's local frame.
+        const ref = Math.abs(nu[2]) < 0.9 ? [0, 0, 1] : [1, 0, 0];
+        const xA = _u3(_x3(nu, ref));
+        const yA = _x3(nu, xA);
+        const cu = unique.reduce((s, p) =>
+          s + _d3([p[0]-origin[0], p[1]-origin[1], p[2]-origin[2]], xA), 0) / unique.length;
+        const cv = unique.reduce((s, p) =>
+          s + _d3([p[0]-origin[0], p[1]-origin[1], p[2]-origin[2]], yA), 0) / unique.length;
+        unique.sort((a, b) => {
+          const ua = _d3([a[0]-origin[0], a[1]-origin[1], a[2]-origin[2]], xA) - cu;
+          const va = _d3([a[0]-origin[0], a[1]-origin[1], a[2]-origin[2]], yA) - cv;
+          const ub = _d3([b[0]-origin[0], b[1]-origin[1], b[2]-origin[2]], xA) - cu;
+          const vb = _d3([b[0]-origin[0], b[1]-origin[1], b[2]-origin[2]], yA) - cv;
+          return Math.atan2(va, ua) - Math.atan2(vb, ub);
+        });
+
+        const outerWire = buildWire(oc, unique, toDelete);
+        if (outerWire) {
+          const mf = new oc.BRepBuilderAPI_MakeFace_16(pln, outerWire, true);
+          toDelete.push(mf);
+          if (!mf.IsDone()) return null;
+
+          for (const he of closedEdges) {
+            try {
+              const wm = new oc.BRepBuilderAPI_MakeWire_1();
+              toDelete.push(wm);
+              wm.Add_1(he);
+              if (wm.IsDone()) mf.Add(wm.Wire());
+            } catch { /* skip malformed hole */ }
+          }
+
+          return mf.Face();
+        }
+      }
+
+      // ── Fallback: wire-chain all section edges ─────────────────────────
+      // Used when no corners were found (circular cap, single-curve boundary).
       if (sectionEdges.length === 0) return null;
 
       const wires = _groupEdgesIntoWires(oc, sectionEdges, tolerance, toDelete);
       if (wires.length === 0) return null;
 
-      // Identify the outer wire (largest bounding-box diagonal).
       let outerIdx = 0;
       if (wires.length > 1) {
         let maxDiag = -1;
@@ -942,16 +1049,10 @@ function _buildTrimmedFace(oc, group, groupIdx, sectionEdges, adjacentIndices,
         }
       }
 
-      const { origin, normal } = params;
-      const nu = _u3(normal);
-      const pln = new oc.gp_Pln_3(makePnt(oc, origin), makeDir(oc, nu));
-      toDelete.push(pln);
-
       const mf = new oc.BRepBuilderAPI_MakeFace_16(pln, wires[outerIdx], true);
       toDelete.push(mf);
       if (!mf.IsDone()) return null;
 
-      // Add inner wires (holes).
       for (let i = 0; i < wires.length; i++) {
         if (i === outerIdx) continue;
         try { mf.Add(wires[i]); } catch { /* skip */ }
