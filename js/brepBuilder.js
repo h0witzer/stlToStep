@@ -778,15 +778,25 @@ function _buildSolidViaSplitter(oc, faceEntries, sewTol, toDelete, geometry) {
     let cx = 0, cy = 0, cz = 0, n = 0;
     const samples = [];
 
-    if (pos && group.triangleIndices && group.triangleIndices.length > 0) {
-      const tris = group.triangleIndices;
-      const step = Math.max(1, Math.floor(tris.length / VERTEX_SAMPLES));
-      for (let si = 0; si < tris.length; si++) {
-        const i = tris[si] * 3;
-        const x = pos.getX(i), y = pos.getY(i), z = pos.getZ(i);
-        cx += x; cy += y; cz += z; n++;
-        if (si % step === 0 && samples.length < VERTEX_SAMPLES) {
-          samples.push([x, y, z]);
+    if (pos && group.triangleIndices) {
+      // triangleIndices is a Set<number> (triangle indices into geometry).
+      // Each triangle t has its 3 vertex positions at pos.getX(t*3+v) for v=0,1,2.
+      const triCount = group.triangleIndices.size ?? group.triangleIndices.length ?? 0;
+      if (triCount > 0) {
+        const step = Math.max(1, Math.floor(triCount / VERTEX_SAMPLES));
+        let si = 0;
+        for (const t of group.triangleIndices) {
+          // Accumulate all 3 vertices for centroid computation.
+          for (let v = 0; v < 3; v++) {
+            const i = t * 3 + v;
+            cx += pos.getX(i); cy += pos.getY(i); cz += pos.getZ(i); n++;
+          }
+          // Sample first vertex of every step-th triangle for BRepExtrema queries.
+          if (si % step === 0 && samples.length < VERTEX_SAMPLES) {
+            const i0 = t * 3;
+            samples.push([pos.getX(i0), pos.getY(i0), pos.getZ(i0)]);
+          }
+          si++;
         }
       }
     }
