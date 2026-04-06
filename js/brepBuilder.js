@@ -25,7 +25,7 @@
 // ── Build version ─────────────────────────────────────────────────────────────
 
 /** Increment this string with each release to verify live-site deployments. */
-export const BUILD_VERSION = 'v0.2.16';
+export const BUILD_VERSION = 'v0.2.17';
 
 // ── OpenCASCADE lazy loader ───────────────────────────────────────────────────
 
@@ -773,6 +773,16 @@ function _buildSolidViaSplitter(oc, faceEntries, sewTol, toDelete, geometry) {
                  'falling back to centroid-based fragment selection (may fail for annular faces).');
   }
 
+  // Pre-compute BRepExtrema call arguments once.
+  // OCCT 7.6.2 Emscripten bindings require ALL default C++ params explicitly:
+  //   BRepExtrema_DistShapeShape_2(S1, S2, ExtFlag, ExtAlgo, ProgressRange) — 5 args.
+  //   Perform(ProgressRange) — 1 arg.
+  // Without these the constructor throws every time, minDist stays Infinity,
+  // and the centroid fallback silently fires — breaking annular/donut shapes.
+  const dssRange = extremaAvailable ? _mkRange(oc) : null;
+  const extFlag  = extremaAvailable ? (oc.Extrema_ExtFlag?.Extrema_ExtFlag_MINMAX ?? 2) : 2;
+  const extAlgo  = extremaAvailable ? (oc.Extrema_ExtAlgo?.Extrema_ExtAlgo_Grad   ?? 0) : 0;
+
   // Per-group metadata: sample mesh vertices (primary) + centroid (fallback).
   const groupData = faceEntries.map(({ group, groupIdx }) => {
     let cx = 0, cy = 0, cz = 0, n = 0;
@@ -860,9 +870,25 @@ function _buildSolidViaSplitter(oc, faceEntries, sewTol, toDelete, geometry) {
             toDelete.push(vm);
             const vtx = vm.Shape ? vm.Shape() : vm.Vertex?.();
             if (!vtx) continue;
-            const dss = new oc[_dssCtorName](vtx, fragFace);
+
+            // OCCT 7.6.2 Emscripten: BRepExtrema_DistShapeShape_2 requires all 5
+            // args (S1, S2, ExtFlag, ExtAlgo, ProgressRange); omitting the 3 default
+            // params causes a throw every call, which was the root cause of the fallback.
+            let dss;
+            if (dssRange) {
+              try { dss = new oc[_dssCtorName](vtx, fragFace, extFlag, extAlgo, dssRange); }
+              catch  { dss = new oc[_dssCtorName](vtx, fragFace); } // older binding
+            } else {
+              try { dss = new oc[_dssCtorName](vtx, fragFace, extFlag, extAlgo); }
+              catch  { dss = new oc[_dssCtorName](vtx, fragFace); }
+            }
             toDelete.push(dss);
-            if (typeof dss.Perform === 'function') dss.Perform();
+
+            // The 2-shape constructor computes on construction; Perform() re-runs.
+            // Only invoke it if IsDone() is still false, and pass the range arg.
+            if (typeof dss.Perform === 'function' && !dss.IsDone?.()) {
+              try { dss.Perform(dssRange); } catch { try { dss.Perform(); } catch {} }
+            }
             if (dss.IsDone?.() && dss.NbSolution?.() > 0) {
               const d = dss.Value();
               if (d < minDist) minDist = d;
