@@ -252,15 +252,10 @@ function triggerLivePreview(debounceMs = 0) {
       const tessellation = result?.tessellation ?? null;
       if (tessellation?.vertices?.length > 0) {
         const solidGroup = buildOCCTSolidMesh(tessellation);
+        const shouldShow = !_brepSolidHiddenByUser;
         setBrepSolidOverlay(solidGroup);
-        if (brepSolidToggle && !_brepSolidHiddenByUser) {
-          // Auto-show on first render and whenever the user hasn't explicitly hidden it.
-          brepSolidToggle.checked = true;
-          setBrepSolidVisible(true);
-        } else {
-          // Respect the user's choice to hide the overlay during re-renders.
-          setBrepSolidVisible(!_brepSolidHiddenByUser);
-        }
+        if (brepSolidToggle) brepSolidToggle.checked = shouldShow;
+        setBrepSolidVisible(shouldShow);
       }
     } catch (e) {
       console.warn('[LivePreview] OCCT preview failed:', e?.message ?? e);
