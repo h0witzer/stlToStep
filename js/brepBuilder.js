@@ -25,7 +25,7 @@
 // ── Build version ─────────────────────────────────────────────────────────────
 
 /** Increment this string with each release to verify live-site deployments. */
-export const BUILD_VERSION = 'v0.2.17';
+export const BUILD_VERSION = 'v0.2.18';
 
 // ── OpenCASCADE lazy loader ───────────────────────────────────────────────────
 
@@ -845,22 +845,36 @@ function _buildSolidViaSplitter(oc, faceEntries, sewTol, toDelete, geometry) {
     return null;
   }
 
-  // ── Step B: per-group independent selection ─────────────────────────────
-  // Score each fragment for each group; pick the best fragment per group.
-  // Dedup: if two groups claim the same fragment the closer one keeps it.
-  const fragClaim = new Map(); // fragIdx → { groupIdx, score }
-  let extremaFallbackWarned = false; // warn once if BRepExtrema silently fails at runtime
+  // ── Step B: per-group independent selection — ranked assignment ─────────
+  // Compute a score for every (group, fragment) pair, then do a greedy
+  // ranked assignment so EVERY group gets exactly one fragment.
+  //
+  // WHY RANKED ASSIGNMENT:
+  //   A single-pass "closest wins" dedup can leave a group with no fragment
+  //   when two groups both score best against the same fragment (the losing
+  //   group gets nothing → sewing fails even though the geometry is fine).
+  //   With BRepExtrema working, the correct fragment always scores ≈ 0 while
+  //   all other fragments score > 0.  Assigning in ascending-score order
+  //   therefore guarantees each group gets its rightful fragment.
+  //
+  // ALGORITHM: collect all (gi, fi, score) triples → sort ascending →
+  //   iterate: first time we see a gi or fi that hasn't been assigned yet,
+  //   record the assignment.  O(G·F·log(G·F)) — negligible for typical N.
 
-  for (const { groupIdx, centroid, samples } of groupData) {
-    let bestFragIdx = -1, bestScore = Infinity;
+  // groupScores[gi] = [ { fi, score }, … ] one entry per fragment.
+  const groupScores = groupData.map(() => /** @type {{fi:number,score:number}[]} */([]));
+  let extremaFallbackWarned = false;
+
+  for (let gi = 0; gi < groupData.length; gi++) {
+    const { centroid, samples } = groupData[gi];
 
     for (let fi = 0; fi < frags.length; fi++) {
       const { fragFace, c } = frags[fi];
       let score;
 
       if (extremaAvailable) {
-        // Primary: minimum distance from any sample vertex to the fragment surface.
-        // ≈0 → sample vertex lies on this fragment → correct match.
+        // Primary: minimum vertex-to-face distance via BRepExtrema.
+        // ≈0 means a sample vertex lies on this fragment → correct match.
         let minDist = Infinity;
         for (const [sx, sy, sz] of samples) {
           try {
@@ -871,21 +885,17 @@ function _buildSolidViaSplitter(oc, faceEntries, sewTol, toDelete, geometry) {
             const vtx = vm.Shape ? vm.Shape() : vm.Vertex?.();
             if (!vtx) continue;
 
-            // OCCT 7.6.2 Emscripten: BRepExtrema_DistShapeShape_2 requires all 5
-            // args (S1, S2, ExtFlag, ExtAlgo, ProgressRange); omitting the 3 default
-            // params causes a throw every call, which was the root cause of the fallback.
+            // OCCT 7.6.2 Emscripten: all 5 args required (S1,S2,F,A,Range).
             let dss;
             if (dssRange) {
               try { dss = new oc[_dssCtorName](vtx, fragFace, extFlag, extAlgo, dssRange); }
-              catch  { dss = new oc[_dssCtorName](vtx, fragFace); } // older binding
+              catch  { dss = new oc[_dssCtorName](vtx, fragFace); }
             } else {
               try { dss = new oc[_dssCtorName](vtx, fragFace, extFlag, extAlgo); }
               catch  { dss = new oc[_dssCtorName](vtx, fragFace); }
             }
             toDelete.push(dss);
 
-            // The 2-shape constructor computes on construction; Perform() re-runs.
-            // Only invoke it if IsDone() is still false, and pass the range arg.
             if (typeof dss.Perform === 'function' && !dss.IsDone?.()) {
               try { dss.Perform(dssRange); } catch { try { dss.Perform(); } catch {} }
             }
@@ -893,40 +903,44 @@ function _buildSolidViaSplitter(oc, faceEntries, sewTol, toDelete, geometry) {
               const d = dss.Value();
               if (d < minDist) minDist = d;
             }
-          } catch { /* single sample failure — continue to next sample */ }
+          } catch { /* single sample failure — try next */ }
         }
         if (isFinite(minDist)) {
           score = minDist;
         } else {
-          // All BRepExtrema calls failed for this fragment (binding issue at runtime).
-          // Fall back to centroid-to-centroid squared distance so the export still
-          // produces output rather than returning an empty face list.
           if (!extremaFallbackWarned) {
-            console.warn('[Splitter] BRepExtrema succeeded at detection but failed at runtime — ' +
-                         'falling back to centroid scoring. Donut/annular shapes may still pick wrong fragment.');
+            console.warn('[Splitter] BRepExtrema failed at runtime — falling back to centroid scoring.');
             extremaFallbackWarned = true;
           }
           const [cx, cy, cz] = centroid;
           score = (c[0]-cx)**2 + (c[1]-cy)**2 + (c[2]-cz)**2;
         }
       } else {
-        // Fallback: centroid-to-centroid squared distance.
         const [cx, cy, cz] = centroid;
         score = (c[0]-cx)**2 + (c[1]-cy)**2 + (c[2]-cz)**2;
       }
 
-      if (score < bestScore) { bestScore = score; bestFragIdx = fi; }
-    }
-
-    if (bestFragIdx < 0) continue;
-    const existing = fragClaim.get(bestFragIdx);
-    if (!existing || bestScore < existing.score) {
-      fragClaim.set(bestFragIdx, { groupIdx, score: bestScore });
+      groupScores[gi].push({ fi, score });
     }
   }
 
+  // Flatten into a single sorted list of (gi, fi, score) and assign greedily.
+  const allPairs = [];
+  for (let gi = 0; gi < groupScores.length; gi++) {
+    for (const { fi, score } of groupScores[gi]) {
+      allPairs.push({ gi, fi, score });
+    }
+  }
+  allPairs.sort((a, b) => a.score - b.score);
+
+  const assignedGroup = new Set(); // gi values already matched
+  const assignedFrag  = new Set(); // fi values already claimed
   const keptFaces = [];
-  for (const [fi] of fragClaim) {
+
+  for (const { gi, fi } of allPairs) {
+    if (assignedGroup.has(gi) || assignedFrag.has(fi)) continue;
+    assignedGroup.add(gi);
+    assignedFrag.add(fi);
     keptFaces.push(frags[fi].fragFace);
   }
 
@@ -935,7 +949,13 @@ function _buildSolidViaSplitter(oc, faceEntries, sewTol, toDelete, geometry) {
     return null;
   }
 
-  console.info(`Splitter: ${keptFaces.length}/${faceEntries.length} face fragments kept.`);
+  if (keptFaces.length < faceEntries.length) {
+    console.warn(`Splitter: only ${keptFaces.length}/${faceEntries.length} groups assigned a fragment ` +
+                 `(${frags.length} total fragments from splitter). ` +
+                 `Not enough fragments to cover all surfaces — sewing may fail.`);
+  } else {
+    console.info(`Splitter: ${keptFaces.length}/${faceEntries.length} groups each assigned a unique fragment.`);
+  }
 
   // ── Phase 3: Sew into solid ─────────────────────────────────────────────
   return _sewIntoSolid(oc, keptFaces, sewTol, toDelete);
