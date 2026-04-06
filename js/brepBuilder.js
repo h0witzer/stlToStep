@@ -25,7 +25,7 @@
 // ── Build version ─────────────────────────────────────────────────────────────
 
 /** Increment this string with each release to verify live-site deployments. */
-export const BUILD_VERSION = 'v0.2.15';
+export const BUILD_VERSION = 'v0.2.16';
 
 // ── OpenCASCADE lazy loader ───────────────────────────────────────────────────
 
@@ -839,6 +839,7 @@ function _buildSolidViaSplitter(oc, faceEntries, sewTol, toDelete, geometry) {
   // Score each fragment for each group; pick the best fragment per group.
   // Dedup: if two groups claim the same fragment the closer one keeps it.
   const fragClaim = new Map(); // fragIdx → { groupIdx, score }
+  let extremaFallbackWarned = false; // warn once if BRepExtrema silently fails at runtime
 
   for (const { groupIdx, centroid, samples } of groupData) {
     let bestFragIdx = -1, bestScore = Infinity;
@@ -868,7 +869,20 @@ function _buildSolidViaSplitter(oc, faceEntries, sewTol, toDelete, geometry) {
             }
           } catch { /* single sample failure — continue to next sample */ }
         }
-        score = isFinite(minDist) ? minDist : Infinity;
+        if (isFinite(minDist)) {
+          score = minDist;
+        } else {
+          // All BRepExtrema calls failed for this fragment (binding issue at runtime).
+          // Fall back to centroid-to-centroid squared distance so the export still
+          // produces output rather than returning an empty face list.
+          if (!extremaFallbackWarned) {
+            console.warn('[Splitter] BRepExtrema succeeded at detection but failed at runtime — ' +
+                         'falling back to centroid scoring. Donut/annular shapes may still pick wrong fragment.');
+            extremaFallbackWarned = true;
+          }
+          const [cx, cy, cz] = centroid;
+          score = (c[0]-cx)**2 + (c[1]-cy)**2 + (c[2]-cz)**2;
+        }
       } else {
         // Fallback: centroid-to-centroid squared distance.
         const [cx, cy, cz] = centroid;
