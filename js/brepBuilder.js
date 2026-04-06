@@ -25,7 +25,7 @@
 // ── Build version ─────────────────────────────────────────────────────────────
 
 /** Increment this string with each release to verify live-site deployments. */
-export const BUILD_VERSION = 'v0.2.25';
+export const BUILD_VERSION = 'v0.2.26';
 
 // ── OpenCASCADE lazy loader ───────────────────────────────────────────────────
 
@@ -673,6 +673,7 @@ function _tessellateShapeToBuffers(oc, shape, linearDefl, toDelete) {
 
     const allVerts   = [];
     const allIndices = [];
+    const edgePts    = [];   // B-rep edge polylines (PolygonOnTriangulation, per face)
     let vertOffset = 0;
     let facesOk = 0, facesFail = 0;
 
@@ -756,6 +757,50 @@ function _tessellateShapeToBuffers(oc, shape, linearDefl, toDelete) {
             faceIndices.push(a, b, c);
           }
         }
+
+        // ── Extract B-rep edge polylines for this face ──────────────────────
+        // BRep_Tool.PolygonOnTriangulation gives the sequence of triangulation
+        // node indices that lie on each wire edge.  This is the correct API
+        // for face-boundary edges after BRepMesh (BRep_Tool.Polygon3D only
+        // works for free/wire edges with no adjacent face and returns null here).
+        try {
+          const wireExpE = new oc.TopExp_Explorer_2(face, EDGE_T, SHAPE_T);
+          toDelete.push(wireExpE);
+          while (wireExpE.More()) {
+            let edg;
+            try { edg = oc.TopoDS.Edge_1 ? oc.TopoDS.Edge_1(wireExpE.Current()) : wireExpE.Current(); }
+            catch { edg = wireExpE.Current(); }
+            try {
+              const eLoc = new oc.TopLoc_Location_1();
+              toDelete.push(eLoc);
+              const hPot = oc.BRep_Tool.PolygonOnTriangulation(edg, hTriang, eLoc);
+              if (!hPot || hPot.IsNull?.()) { wireExpE.Next(); continue; }
+              const pot = hPot.get ? hPot.get() : hPot;
+              const nb  = pot.NbNodes ? pot.NbNodes() : 0;
+              if (nb < 2) { wireExpE.Next(); continue; }
+              const nodeInds = pot.Nodes();
+              for (let ni = 1; ni < nb; ni++) {
+                const i0 = nodeInds.Value(ni);
+                const i1 = nodeInds.Value(ni + 1);
+                const p0 = triang.Node(i0);
+                const p1 = triang.Node(i1);
+                let [x0, y0, z0] = [p0.X(), p0.Y(), p0.Z()];
+                let [x1, y1, z1] = [p1.X(), p1.Y(), p1.Z()];
+                if (trsf) {
+                  try {
+                    const pp0 = new oc.gp_Pnt_3(x0, y0, z0); pp0.Transform(trsf);
+                    x0 = pp0.X(); y0 = pp0.Y(); z0 = pp0.Z();
+                    const pp1 = new oc.gp_Pnt_3(x1, y1, z1); pp1.Transform(trsf);
+                    x1 = pp1.X(); y1 = pp1.Y(); z1 = pp1.Z();
+                  } catch { /* use local coords */ }
+                }
+                edgePts.push(x0, y0, z0, x1, y1, z1);
+              }
+            } catch { /* skip this edge */ }
+            wireExpE.Next();
+          }
+        } catch { /* edge extraction failed for this face — non-fatal */ }
+
         faceOk = true;
       } catch (e) {
         console.warn('[Tessellate] face extraction failed:', e?.message ?? e);
@@ -775,58 +820,6 @@ function _tessellateShapeToBuffers(oc, shape, linearDefl, toDelete) {
     if (vertOffset === 0) {
       console.warn(`[Tessellate] 0 vertices extracted (ok=${facesOk}, fail=${facesFail})`);
       return null;
-    }
-
-    // ── Extract B-rep edge curves (analytical intersection lines) ──────────────
-    // After BRepMesh the tessellated edge polygon is stored with each edge.
-    // We iterate all edges and collect consecutive-node line segments.
-    // These represent the exact trim curves between surfaces and are what the
-    // user wants to see as "analytical curves" — not tessellation mesh edges.
-    const edgePts = [];
-    try {
-      const edgeExp = new oc.TopExp_Explorer_2(shape, EDGE_T, SHAPE_T);
-      toDelete.push(edgeExp);
-      while (edgeExp.More()) {
-        let edge;
-        try { edge = oc.TopoDS.Edge_1 ? oc.TopoDS.Edge_1(edgeExp.Current()) : edgeExp.Current(); }
-        catch { edge = edgeExp.Current(); }
-
-        try {
-          const eloc = new oc.TopLoc_Location_1();
-          toDelete.push(eloc);
-          const hPoly = oc.BRep_Tool.Polygon3D(edge, eloc);
-          if (!hPoly || hPoly.IsNull?.()) { edgeExp.Next(); continue; }
-          const poly = hPoly.get ? hPoly.get() : hPoly;
-          const nn = poly.NbNodes();
-          if (nn < 2) { edgeExp.Next(); continue; }
-
-          const isId = eloc.IsIdentity?.() ?? true;
-          let etrsf = null;
-          if (!isId) { try { etrsf = eloc.Transformation(); } catch { etrsf = null; } }
-
-          const nodes = poly.Nodes();
-          const applyTrsf = (x, y, z) => {
-            if (!etrsf) return [x, y, z];
-            try {
-              const p = new oc.gp_Pnt_3(x, y, z);
-              p.Transform(etrsf);
-              return [p.X(), p.Y(), p.Z()];
-            } catch { return [x, y, z]; }
-          };
-
-          for (let ni = 1; ni < nn; ni++) {
-            const p0 = nodes.Value(ni);
-            const p1 = nodes.Value(ni + 1);
-            const [x0, y0, z0] = applyTrsf(p0.X(), p0.Y(), p0.Z());
-            const [x1, y1, z1] = applyTrsf(p1.X(), p1.Y(), p1.Z());
-            edgePts.push(x0, y0, z0, x1, y1, z1);
-          }
-        } catch { /* skip this edge silently */ }
-
-        edgeExp.Next();
-      }
-    } catch (e) {
-      console.warn('[Tessellate] edge extraction failed (non-fatal):', e?.message ?? e);
     }
 
     console.log(`[Tessellate] ${facesOk} faces → ${vertOffset} vertices, ${allIndices.length / 3 | 0} triangles (${facesFail} failed); ${edgePts.length / 6 | 0} edge segments`);
@@ -1131,7 +1124,14 @@ function _buildSolidViaSplitter(oc, faceEntries, sewTol, toDelete, geometry) {
       try {
         const [ox, oy, oz] = largestTri.centroid;
         const [dx, dy, dz] = largestTri.normal;
-        const pnt = new oc.gp_Pnt_3(ox, oy, oz);
+        // Offset origin slightly INWARD (opposite the outward normal) by sewTol.
+        // This avoids the degenerate WParam≈0 case that occurs when the ray
+        // origin lies exactly on the face surface.  The correct fragment is
+        // then hit at WParam ≈ sewTol (non-degenerate), while coplanar wrong
+        // fragments are not hit because the offset origin is no longer on their
+        // trimmed plane region.  Using range [0, 1e15] ensures we only look
+        // forward (outward), not backward through the solid interior.
+        const pnt = new oc.gp_Pnt_3(ox - dx * sewTol, oy - dy * sewTol, oz - dz * sewTol);
         const dir = new oc.gp_Dir_4(dx, dy, dz);
         toDelete.push(pnt, dir);
         let lin;
@@ -1157,18 +1157,19 @@ function _buildSolidViaSplitter(oc, faceEntries, sewTol, toDelete, geometry) {
           toDelete.push(isi);
           isi.Load(fragFace, 1e-6);
 
-          // PerformNearest is faster (stops at first hit); fall back to Perform.
-          try        { isi.PerformNearest(groupRay.lin, -1e15, 1e15); }
-          catch (e1) { try { isi.Perform(groupRay.lin, -1e15, 1e15); } catch {} }
+          // Search only forward (range [0, 1e15]) from the inward-offset origin.
+          // PerformNearest stops at first hit; fall back to Perform if needed.
+          try        { isi.PerformNearest(groupRay.lin, 0, 1e15); }
+          catch (e1) { try { isi.Perform(groupRay.lin, 0, 1e15); } catch {} }
 
           if (isi.IsDone() && isi.NbPnt() > 0) {
             let minW = Infinity;
             for (let k = 1; k <= isi.NbPnt(); k++) {
-              // WParameter is the signed distance along the ray from the origin.
-              // The correct fragment (the one the origin lies on) will have
-              // |WParameter| ≈ 0.  Fragments missed by the ray aren't returned.
-              const w = Math.abs(isi.WParameter(k));
-              if (w < minW) minW = w;
+              // WParameter is the distance along the ray from the (offset) origin.
+              // The correct fragment is hit at WParam ≈ sewTol.  Wrong coplanar
+              // fragments are not hit (the offset origin is off their trim region).
+              const w = isi.WParameter(k);
+              if (w >= 0 && w < minW) minW = w;
             }
             score = minW;
           }

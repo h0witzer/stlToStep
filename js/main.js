@@ -40,6 +40,10 @@ let _highlightedGroup = -1;
 // Debounce timer for live OCCT preview triggered by type-change dropdowns
 let _livePreviewTimer = null;
 
+// Track whether the user has explicitly hidden the OCCT solid overlay so
+// that re-renders (on type-change, etc.) don't override their preference.
+let _brepSolidHiddenByUser = false;
+
 // ── DOM refs ─────────────────────────────────────────────────────────────────
 
 const canvas        = document.getElementById('viewport');
@@ -212,6 +216,7 @@ async function handleDetect() {
     setBrepSolidOverlay(null);
     if (brepOverlayToggle) brepOverlayToggle.checked = false;
     if (brepSolidToggle)   brepSolidToggle.checked   = false;
+    _brepSolidHiddenByUser = false;
   } catch (err) {
     console.error('Face detection failed:', err);
     alert(`Face detection failed: ${err.message}`);
@@ -248,9 +253,13 @@ function triggerLivePreview(debounceMs = 0) {
       if (tessellation?.vertices?.length > 0) {
         const solidGroup = buildOCCTSolidMesh(tessellation);
         setBrepSolidOverlay(solidGroup);
-        if (brepSolidToggle) {
+        if (brepSolidToggle && !_brepSolidHiddenByUser) {
+          // Auto-show on first render and whenever the user hasn't explicitly hidden it.
           brepSolidToggle.checked = true;
           setBrepSolidVisible(true);
+        } else {
+          // Respect the user's choice to hide the overlay during re-renders.
+          setBrepSolidVisible(!_brepSolidHiddenByUser);
         }
       }
     } catch (e) {
@@ -612,7 +621,10 @@ function wireEvents() {
 
   // OCCT-tessellated solid preview toggle
   if (brepSolidToggle) {
-    brepSolidToggle.addEventListener('change', () => setBrepSolidVisible(brepSolidToggle.checked));
+    brepSolidToggle.addEventListener('change', () => {
+      _brepSolidHiddenByUser = !brepSolidToggle.checked;
+      setBrepSolidVisible(brepSolidToggle.checked);
+    });
   }
 
   // License overlay
