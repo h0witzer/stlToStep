@@ -460,7 +460,7 @@ function buildOCCTSolidMesh({ vertices, indices }) {
   });
   group.add(new THREE.Mesh(geo, fillMat));
 
-  // Wireframe edges so face boundaries are clearly visible.
+  // Wireframe edges — reuse the same geometry to avoid duplicating vertex data.
   const wireMat = new THREE.MeshBasicMaterial({
     color: 0x00aa66,
     wireframe: true,
@@ -469,8 +469,7 @@ function buildOCCTSolidMesh({ vertices, indices }) {
     depthTest: false,
     depthWrite: false,
   });
-  const wireGeo = geo.clone();
-  group.add(new THREE.Mesh(wireGeo, wireMat));
+  group.add(new THREE.Mesh(geo, wireMat));
 
   return group;
 }

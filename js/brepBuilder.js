@@ -687,12 +687,11 @@ function _tessellateShapeToBuffers(oc, shape, linearDefl, toDelete) {
         const nTris  = triang.NbTriangles();
         if (nNodes === 0 || nTris === 0) { exp.Next(); continue; }
 
-        // Build location transform (4×4 matrix) once per face.
-        // If identity, skip transform for speed.
+        // Build location transform once per face. Skip for identity locations.
         const isIdentity = loc.IsIdentity?.() ?? true;
         let trsf = null;
         if (!isIdentity) {
-          try { trsf = loc.IsIdentity?.() ? null : loc.Transformation(); }
+          try { trsf = loc.Transformation(); }
           catch { trsf = null; }
         }
 
