@@ -15,6 +15,7 @@ let hoverMesh = null;        // semi-transparent yellow bucket-fill preview
 let groupHighlightMesh = null; // white highlight overlay for hovered surface-list row
 let brepOverlayGroup = null;   // analytic surface wireframe indicators
 let brepFacesGroup   = null;   // analytical face-mesh preview (semi-transparent)
+let brepSolidGroup   = null;   // OCCT-tessellated trimmed solid preview
 
 // Callback invoked when the canvas pointer hovers over a different face group.
 // Signature: (groupIndex: number) => void   (-1 = no group under cursor)
@@ -887,4 +888,32 @@ export function setBrepFacesOverlay(group) {
  */
 export function setBrepFacesVisible(visible) {
   if (brepFacesGroup) brepFacesGroup.visible = visible;
+}
+
+/**
+ * Replace the OCCT-tessellated solid preview overlay.
+ * Pass a THREE.Group built from tessellation data, or null to clear it.
+ * @param {THREE.Group|null} group
+ */
+export function setBrepSolidOverlay(group) {
+  if (brepSolidGroup) {
+    scene.remove(brepSolidGroup);
+    brepSolidGroup.traverse(obj => {
+      if (obj.geometry) obj.geometry.dispose();
+      if (obj.material) obj.material.dispose();
+    });
+    brepSolidGroup = null;
+  }
+  if (group) {
+    brepSolidGroup = group;
+    scene.add(brepSolidGroup);
+  }
+}
+
+/**
+ * Show or hide the OCCT-tessellated solid preview without destroying it.
+ * @param {boolean} visible
+ */
+export function setBrepSolidVisible(visible) {
+  if (brepSolidGroup) brepSolidGroup.visible = visible;
 }

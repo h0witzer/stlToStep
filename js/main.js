@@ -15,6 +15,7 @@ import {
   setGroupHighlight, setGroupHoverCallback,
   setBrepOverlay, setBrepOverlayVisible,
   setBrepFacesOverlay, setBrepFacesVisible,
+  setBrepSolidOverlay, setBrepSolidVisible,
 } from './viewer.js';
 import { loadModelFile, computeBounds, getTriangleCount } from './stlLoader.js';
 import { t, initLang, setLang, getLang, applyTranslations } from './i18n.js';
@@ -46,6 +47,7 @@ const meshInfo      = document.getElementById('mesh-info');
 const wireframeToggle    = document.getElementById('wireframe-toggle');
 const brepOverlayToggle  = document.getElementById('brep-overlay-toggle');
 const brepFacesToggle    = document.getElementById('brep-faces-toggle');
+const brepSolidToggle    = document.getElementById('brep-solid-toggle');
 
 // Face detection panel
 const creaseSlider  = document.getElementById('crease-angle');
@@ -203,7 +205,9 @@ async function handleDetect() {
     // Clear any stale B-rep overlays from a previous Fit Surfaces run
     setBrepOverlay(null);
     setBrepFacesOverlay(null);
+    setBrepSolidOverlay(null);
     if (brepOverlayToggle) brepOverlayToggle.checked = false;
+    if (brepSolidToggle)   brepSolidToggle.checked   = false;
   } catch (err) {
     console.error('Face detection failed:', err);
     alert(`Face detection failed: ${err.message}`);
@@ -398,14 +402,28 @@ async function handleExport() {
     const schema = schemaSelect.value;
     const sewTol = parseSewTol();
 
-    const stepContent = await buildAndExportSTEP(
+    const result = await buildAndExportSTEP(
       currentGroups,
       currentGeometry,
       { schema, sewTol: sewTol || 1e-5 },
       (msg, pct) => setProgress(msg, pct),
     );
 
+    // buildAndExportSTEP now returns { step, tessellation }.
+    const stepContent  = result?.step ?? result;
+    const tessellation = result?.tessellation ?? null;
+
     downloadSTEP(stepContent, `${currentStlName}.stp`);
+
+    // Build and show the OCCT solid preview layer from the tessellation data.
+    if (tessellation?.vertices?.length > 0) {
+      const solidGroup = buildOCCTSolidMesh(tessellation);
+      setBrepSolidOverlay(solidGroup);
+      if (brepSolidToggle) {
+        brepSolidToggle.checked = true;
+        setBrepSolidVisible(true);
+      }
+    }
   } catch (err) {
     console.error('Export failed:', err);
     alert(`Export failed: ${err.message}`);
@@ -413,6 +431,48 @@ async function handleExport() {
     setBusy(false, exportBtn);
     setTimeout(() => exportProgress.classList.add('hidden'), 2000);
   }
+}
+
+/**
+ * Build a Three.js Group from OCCT tessellation buffers returned by
+ * buildAndExportSTEP().  Renders a semi-transparent solid with a hard edge
+ * wireframe overlay, distinct from the analytical face preview.
+ *
+ * @param {{ vertices: Float32Array, indices: Uint32Array }} tessellation
+ * @returns {THREE.Group}
+ */
+function buildOCCTSolidMesh({ vertices, indices }) {
+  const group = new THREE.Group();
+  group.name = 'brep-solid-overlay';
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(vertices, 3));
+  geo.setIndex(new THREE.BufferAttribute(indices, 1));
+  geo.computeVertexNormals();
+
+  // Semi-transparent filled surface.
+  const fillMat = new THREE.MeshPhongMaterial({
+    color: 0x22cc88,
+    opacity: 0.55,
+    transparent: true,
+    side: THREE.DoubleSide,
+    depthWrite: false,
+  });
+  group.add(new THREE.Mesh(geo, fillMat));
+
+  // Wireframe edges so face boundaries are clearly visible.
+  const wireMat = new THREE.MeshBasicMaterial({
+    color: 0x00aa66,
+    wireframe: true,
+    opacity: 0.25,
+    transparent: true,
+    depthTest: false,
+    depthWrite: false,
+  });
+  const wireGeo = geo.clone();
+  group.add(new THREE.Mesh(wireGeo, wireMat));
+
+  return group;
 }
 
 function parseSewTol() {
@@ -490,6 +550,11 @@ function wireEvents() {
   // Analytical face-mesh preview toggle
   if (brepFacesToggle) {
     brepFacesToggle.addEventListener('change', () => setBrepFacesVisible(brepFacesToggle.checked));
+  }
+
+  // OCCT-tessellated solid preview toggle
+  if (brepSolidToggle) {
+    brepSolidToggle.addEventListener('change', () => setBrepSolidVisible(brepSolidToggle.checked));
   }
 
   // License overlay

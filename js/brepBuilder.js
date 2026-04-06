@@ -25,7 +25,7 @@
 // ── Build version ─────────────────────────────────────────────────────────────
 
 /** Increment this string with each release to verify live-site deployments. */
-export const BUILD_VERSION = 'v0.2.19';
+export const BUILD_VERSION = 'v0.2.20';
 
 // ── OpenCASCADE lazy loader ───────────────────────────────────────────────────
 
@@ -632,6 +632,128 @@ function _faceGPropCentroid(oc, face, toDelete) {
 }
 
 /**
+ * Tessellate an OCCT shape using BRepMesh_IncrementalMesh and extract vertex
+ * and index buffers suitable for building a Three.js BufferGeometry.
+ *
+ * Returns { vertices: Float32Array, indices: Uint32Array } or null on failure.
+ * Vertex positions are in the shape's coordinate system.
+ * Face orientation is respected so normals computed from the indices will
+ * point outward (front-face = CCW).
+ *
+ * @param {object}   oc
+ * @param {object}   shape          TopoDS_Shape (solid, shell, or face)
+ * @param {number}   linearDefl     Max chord error (world units)
+ * @param {object[]} toDelete       Shared cleanup list
+ * @returns {{ vertices: Float32Array, indices: Uint32Array }|null}
+ */
+function _tessellateShapeToBuffers(oc, shape, linearDefl, toDelete) {
+  try {
+    // Mesh the shape — constructor triggers meshing automatically.
+    let mesher;
+    try {
+      // BRepMesh_IncrementalMesh_2(shape, deflection, isRelative=false, angDefl=0.5, inParallel=false)
+      mesher = new oc.BRepMesh_IncrementalMesh_2(shape, linearDefl, false, 0.5, false);
+    } catch {
+      mesher = new oc.BRepMesh_IncrementalMesh_1(shape, linearDefl);
+    }
+    toDelete.push(mesher);
+
+    const FACE_T  = oc.TopAbs_ShapeEnum?.TopAbs_FACE  ?? 4;
+    const SHAPE_T = oc.TopAbs_ShapeEnum?.TopAbs_SHAPE ?? 0;
+    const REVERSED = oc.TopAbs_Orientation?.TopAbs_REVERSED ?? 1;
+
+    const allVerts   = [];
+    const allIndices = [];
+    let vertOffset = 0;
+
+    const exp = new oc.TopExp_Explorer_2(shape, FACE_T, SHAPE_T);
+    toDelete.push(exp);
+
+    while (exp.More()) {
+      let face;
+      try { face = oc.TopoDS.Face_1 ? oc.TopoDS.Face_1(exp.Current()) : exp.Current(); }
+      catch { face = exp.Current(); }
+
+      try {
+        const loc = new oc.TopLoc_Location_1();
+        toDelete.push(loc);
+
+        // BRep_Tool.Triangulation returns Handle_Poly_Triangulation
+        const hTriang = oc.BRep_Tool.Triangulation(face, loc);
+        if (!hTriang || hTriang.IsNull?.()) { exp.Next(); continue; }
+
+        const triang = hTriang.get ? hTriang.get() : hTriang;
+        const nNodes = triang.NbNodes();
+        const nTris  = triang.NbTriangles();
+        if (nNodes === 0 || nTris === 0) { exp.Next(); continue; }
+
+        // Build location transform (4×4 matrix) once per face.
+        // If identity, skip transform for speed.
+        const isIdentity = loc.IsIdentity?.() ?? true;
+        let trsf = null;
+        if (!isIdentity) {
+          try { trsf = loc.IsIdentity?.() ? null : loc.Transformation(); }
+          catch { trsf = null; }
+        }
+
+        // Extract nodes (1-indexed in OCCT).
+        for (let n = 1; n <= nNodes; n++) {
+          const node = triang.Node(n);
+          let x = node.X(), y = node.Y(), z = node.Z();
+          if (trsf) {
+            try {
+              // gp_Trsf.Transforms(x, y, z) modifies in-place — not available in JS.
+              // Use gp_Pnt_3 → Transform → get coords.
+              const p = new oc.gp_Pnt_3(x, y, z);
+              p.Transform(trsf);
+              x = p.X(); y = p.Y(); z = p.Z();
+            } catch { /* transformation failed; use untransformed coordinates */ }
+          }
+          allVerts.push(x, y, z);
+        }
+
+        // Extract triangles (1-indexed), respecting face orientation.
+        const reversed = face.Orientation?.() === REVERSED;
+        for (let t = 1; t <= nTris; t++) {
+          const tri = triang.Triangle(t);
+          // OCCT Poly_Triangle uses 1-indexed nodes.
+          let n1, n2, n3;
+          if (tri.Get) {
+            // Some bindings expose a Get method; try it.
+            const ns = tri.Get();
+            [n1, n2, n3] = [ns.get(0), ns.get(1), ns.get(2)];
+          } else {
+            n1 = tri.Value(1); n2 = tri.Value(2); n3 = tri.Value(3);
+          }
+          // Convert to 0-indexed and add offset.
+          const a = vertOffset + n1 - 1;
+          const b = vertOffset + n2 - 1;
+          const c = vertOffset + n3 - 1;
+          if (reversed) {
+            allIndices.push(a, c, b);
+          } else {
+            allIndices.push(a, b, c);
+          }
+        }
+        vertOffset += nNodes;
+      } catch { /* single face tessellation failed — skip */ }
+
+      exp.Next();
+    }
+
+    if (vertOffset === 0) return null;
+
+    return {
+      vertices: new Float32Array(allVerts),
+      indices:  new Uint32Array(allIndices),
+    };
+  } catch (e) {
+    console.warn('[Tessellate] Failed to tessellate shape:', e?.message ?? e);
+    return null;
+  }
+}
+
+/**
  * Build a watertight solid using BRepAlgoAPI_Splitter:
  *
  *  1. Feed all oversized analytical patches as both Arguments and Tools so the
@@ -908,7 +1030,7 @@ function _buildSolidViaSplitter(oc, faceEntries, sewTol, toDelete, geometry) {
   //
   //  3. CENTROID (last resort): fragment centroid vs. group centroid.
 
-  const groupScores = groupData.map(() => /** @type {{fi:number,score:number}[]} */([]));
+  const groupScores = groupData.map(() => /** @type {{fi:number,score:number,tier:string}[]} */([]));
   let rayFallbackWarned    = false;
   let extremaFallbackWarned = false;
 
@@ -967,7 +1089,9 @@ function _buildSolidViaSplitter(oc, faceEntries, sewTol, toDelete, geometry) {
       }
 
       // ── Tier 2: BRepExtrema vertex-to-face distance ──────────────────────
+      let tier = groupRay ? 'raycast' : (extremaAvailable ? 'extrema' : 'centroid');
       if (!isFinite(score) && extremaAvailable) {
+        tier = 'extrema';
         let minDist = Infinity;
         for (const [sx, sy, sz] of samples) {
           try {
@@ -1007,6 +1131,7 @@ function _buildSolidViaSplitter(oc, faceEntries, sewTol, toDelete, geometry) {
 
       // ── Tier 3: centroid-to-centroid squared distance ────────────────────
       if (!isFinite(score)) {
+        tier = 'centroid';
         if (groupRay && !rayFallbackWarned) {
           console.warn('[Splitter] Ray-cast missed all fragments for a group — ' +
                        'centroid fallback active (may misassign on symmetric shapes).');
@@ -1016,15 +1141,15 @@ function _buildSolidViaSplitter(oc, faceEntries, sewTol, toDelete, geometry) {
         score = (c[0]-cx2)**2 + (c[1]-cy2)**2 + (c[2]-cz2)**2;
       }
 
-      groupScores[gi].push({ fi, score });
+      groupScores[gi].push({ fi, score, tier });
     }
   }
 
   // Flatten into a single sorted list of (gi, fi, score) and assign greedily.
   const allPairs = [];
   for (let gi = 0; gi < groupScores.length; gi++) {
-    for (const { fi, score } of groupScores[gi]) {
-      allPairs.push({ gi, fi, score });
+    for (const { fi, score, tier } of groupScores[gi]) {
+      allPairs.push({ gi, fi, score, tier });
     }
   }
   allPairs.sort((a, b) => a.score - b.score);
@@ -1033,11 +1158,34 @@ function _buildSolidViaSplitter(oc, faceEntries, sewTol, toDelete, geometry) {
   const assignedFrag  = new Set(); // fi values already claimed
   const keptFaces = [];
 
-  for (const { gi, fi } of allPairs) {
+  // Log scoring summary and do greedy assignment.
+  // Gather per-gi assignment for diagnostics.
+  const giAssignment = new Map(); // gi → {fi, score, tier}
+  for (const { gi, fi, score, tier } of allPairs) {
     if (assignedGroup.has(gi) || assignedFrag.has(fi)) continue;
     assignedGroup.add(gi);
     assignedFrag.add(fi);
     keptFaces.push(frags[fi].fragFace);
+    giAssignment.set(gi, { fi, score, tier });
+  }
+
+  // Per-group diagnostic log: one line per group showing all fragment scores and selected assignment.
+  for (let gi = 0; gi < groupData.length; gi++) {
+    const { groupIdx } = groupData[gi];
+    const entry   = faceEntries[gi];
+    const type    = entry?.group?.surface?.type ?? '?';
+    const rayStr  = raycastAvailable ? (groupData[gi].largestTri ? 'ray=OK' : 'ray=noTri') : 'ray=N/A';
+    const scores  = groupScores[gi]
+      .map(({ fi, score, tier }) => {
+        const s = isFinite(score) ? score.toExponential(2) : '∞';
+        return `f${fi}=${s}(${tier[0]})`;
+      })
+      .join(', ');
+    const pick = giAssignment.get(gi);
+    const pickStr = pick
+      ? `→ f${pick.fi} score=${isFinite(pick.score) ? pick.score.toExponential(2) : '∞'} [${pick.tier}]`
+      : '→ NONE (unassigned)';
+    console.log(`[Splitter gi=${gi} g${groupIdx ?? gi} ${type}] ${rayStr} | ${scores} | ${pickStr}`);
   }
 
   if (keptFaces.length === 0) {
@@ -1409,6 +1557,34 @@ export async function buildAndExportSTEP(groups, geometry, options = {}, onStatu
     throw new Error('STEP export produced empty or invalid output. Transfer returned DONE but no ISO-10303 header found.');
   }
 
+  onStatus?.('Tessellating B-rep preview…', 92);
+
+  // Tessellate all island solids for the viewport preview layer.
+  // A linear deflection of ~0.5% of the model diagonal gives a reasonable
+  // trade-off between preview quality and tessellation time.
+  let tessellation = null;
+  try {
+    const tessDefl = Math.max(1e-5, modelDiag * 0.005);
+    const allVerts   = [];
+    const allIndices = [];
+    let vertOffset = 0;
+    for (const solid of islandSolids) {
+      const buffers = _tessellateShapeToBuffers(oc, solid, tessDefl, toDelete);
+      if (!buffers) continue;
+      for (let i = 0; i < buffers.vertices.length; i++) allVerts.push(buffers.vertices[i]);
+      for (let i = 0; i < buffers.indices.length;  i++) allIndices.push(buffers.indices[i] + vertOffset);
+      vertOffset += buffers.vertices.length / 3;
+    }
+    if (vertOffset > 0) {
+      tessellation = {
+        vertices: new Float32Array(allVerts),
+        indices:  new Uint32Array(allIndices),
+      };
+    }
+  } catch (e) {
+    console.warn('[Tessellate] Preview tessellation failed (non-fatal):', e?.message ?? e);
+  }
+
   onStatus?.('Cleaning up…', 95);
 
   // Free C++ objects (reverse order to respect OCCT ownership)
@@ -1417,7 +1593,7 @@ export async function buildAndExportSTEP(groups, geometry, options = {}, onStatu
   }
 
   onStatus?.('Done.', 100);
-  return stepContent;
+  return { step: stepContent, tessellation };
 }
 
 /**
