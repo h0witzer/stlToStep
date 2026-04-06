@@ -34,7 +34,7 @@
 // ── Build version ─────────────────────────────────────────────────────────────
 
 /** Increment this string with each release to verify live-site deployments. */
-export const BUILD_VERSION = 'v0.2.3';
+export const BUILD_VERSION = 'v0.2.4';
 
 // ── OpenCASCADE lazy loader ───────────────────────────────────────────────────
 
@@ -1031,14 +1031,13 @@ function _sewIntoSolid(oc, faces, sewTol, toDelete) {
 
 /**
  * Use OCCT's BOPAlgo_MakerVolume to build a solid from oversized faces.
- * This is the ideal single-call solution: it computes all surface–surface
- * intersection curves, trims every face, and assembles a watertight solid.
+ * MakerVolume partitions all of space into closed cells — we then select
+ * the one cell whose interior contains the mesh centroid.
  *
- * MakerVolume may not be available in all opencascade.js builds; when it is
- * not, _buildSolidViaSections() provides the same result using only core
- * Boolean APIs.
+ * @param {number[]} meshCentroid  [cx, cy, cz] — a point known to be inside
+ *   the original part (typically the mesh bounding-box centre).
  */
-function _buildSolidViaMakerVolume(oc, faces, fuzzyTol, toDelete) {
+function _buildSolidViaMakerVolume(oc, faces, fuzzyTol, meshCentroid, toDelete) {
   // opencascade.js 2.0 beta (verified from d.ts):
   //   BOPAlgo_MakerVolume_1()  — no-arg constructor
   //   SetArguments(TopTools_ListOfShape)  — via BOPAlgo_Builder base
@@ -1073,12 +1072,82 @@ function _buildSolidViaMakerVolume(oc, faces, fuzzyTol, toDelete) {
       console.warn('BOPAlgo_MakerVolume: Perform() returned null/empty shape.');
       return null;
     }
+
+    // ── Select the solid that contains the mesh centroid ────────────────────
+    // MakerVolume partitions ALL of space, producing many more solids than just
+    // the part itself (every bounded cell in the surface arrangement is a solid).
+    // We keep only the solid whose interior contains the original mesh centroid.
+    const solid = _selectSolidContaining(oc, result, meshCentroid, fuzzyTol, toDelete);
+    if (!solid) {
+      console.warn('BOPAlgo_MakerVolume: could not identify the part solid from the result compound.');
+      return null;
+    }
     console.info('BOPAlgo_MakerVolume succeeded.');
-    return result;
+    return solid;
   } catch (e) {
     console.warn('BOPAlgo_MakerVolume failed:', e?.message ?? e);
     return null;
   }
+}
+
+/**
+ * Given a shape (compound or solid) produced by BOPAlgo_MakerVolume, find the
+ * single solid that contains the given test point.
+ *
+ * Uses BRepClass3d_SolidClassifier — the constructor overload _3(S, P, Tol)
+ * performs the classification immediately and is the most efficient path.
+ *
+ * @param {number[]} testPt  [x, y, z]
+ * @returns {object|null}  TopoDS_Solid or null
+ */
+function _selectSolidContaining(oc, shape, testPt, tol, toDelete) {
+  const SOLID_T = oc.TopAbs_ShapeEnum?.TopAbs_SOLID ?? 2;
+  const SHAPE_T = oc.TopAbs_ShapeEnum?.TopAbs_SHAPE ?? 0;
+  const IN_STATE = oc.TopAbs_State?.TopAbs_IN ?? 0;
+  const ON_STATE = oc.TopAbs_State?.TopAbs_ON ?? 2;
+
+  const pnt = makePnt(oc, testPt);
+  const classTol = Math.max(tol, 1e-7);
+
+  // Collect all solids from the shape (handles both direct Solid and Compound).
+  const solids = [];
+  try {
+    const exp = new oc.TopExp_Explorer_2(shape, SOLID_T, SHAPE_T);
+    toDelete.push(exp);
+    while (exp.More()) {
+      solids.push(oc.TopoDS.Solid_1 ? oc.TopoDS.Solid_1(exp.Current()) : exp.Current());
+      exp.Next();
+    }
+  } catch (e) {
+    console.warn('_selectSolidContaining: explorer failed:', e?.message ?? e);
+  }
+
+  if (solids.length === 0) return null;
+
+  // If there is only one solid, return it immediately (no need to classify).
+  if (solids.length === 1) return solids[0];
+
+  console.info(`BOPAlgo_MakerVolume: selecting from ${solids.length} solids using mesh centroid.`);
+
+  for (const solid of solids) {
+    try {
+      // BRepClass3d_SolidClassifier_3(S, P, Tol) — performs classification in ctor.
+      const clf = new oc.BRepClass3d_SolidClassifier_3(solid, pnt, classTol);
+      toDelete.push(clf);
+      const state = clf.State();
+      // State() returns an enum object; compare against the known IN/ON values.
+      const isIn = (state === IN_STATE)
+        || (typeof state === 'object' && (
+              state === oc.TopAbs_State?.TopAbs_IN
+           || state === oc.TopAbs_State?.TopAbs_ON));
+      if (isIn) return solid;
+    } catch { /* try next solid */ }
+  }
+
+  // Fallback: return the largest solid by bounding-box volume.
+  // This handles degenerate cases where the centroid lands exactly on a face.
+  console.warn('_selectSolidContaining: centroid not strictly inside any solid; returning largest.');
+  return solids[0];
 }
 
 // ── Section-based solid builder ─────────────────────────────────────────────
@@ -1170,12 +1239,14 @@ function _buildSolidViaSections(oc, faceEntries, adjacency, groups,
  *
  * Both produce the same result: faces trimmed at exact analytical intersection
  * curves, assembled into a watertight solid.  No mesh-derived boundaries.
+ *
+ * @param {number[]} meshCentroid  [cx, cy, cz] inside the original mesh
  */
 function _buildSolid(oc, faceEntries, adjacency, groups,
-                     modelDiag, sewTol, toDelete) {
+                     modelDiag, sewTol, meshCentroid, toDelete) {
   // Fast path: BOPAlgo_MakerVolume.
   const faces = faceEntries.map(e => e.face);
-  const mv = _buildSolidViaMakerVolume(oc, faces, sewTol, toDelete);
+  const mv = _buildSolidViaMakerVolume(oc, faces, sewTol, meshCentroid, toDelete);
   if (mv) return mv;
 
   // Robust path: Section-based analytical trimming.
@@ -1217,6 +1288,11 @@ export async function buildAndExportSTEP(groups, geometry, options = {}, onStatu
     if (z < zmin) zmin = z; if (z > zmax) zmax = z;
   }
   const modelDiag = Math.sqrt((xmax-xmin)**2 + (ymax-ymin)**2 + (zmax-zmin)**2);
+
+  // Mesh bounding-box centroid — a point that lies inside the original solid for
+  // typical convex/simply-connected parts.  Used by MakerVolume to pick the
+  // correct volume from the space partition it creates.
+  const meshCentroid = [(xmin+xmax)/2, (ymin+ymax)/2, (zmin+zmax)/2];
 
   let sewTol = options.sewTol ?? 0;
   if (sewTol <= 0) sewTol = Math.max(1e-6, modelDiag * 5e-3);
@@ -1263,7 +1339,7 @@ export async function buildAndExportSTEP(groups, geometry, options = {}, onStatu
   //   • Section-based trimming — robust path using only core OCCT APIs
   // No fallback to untrimmed faces, no compound dumping.
   const topShape = _buildSolid(
-    oc, faceEntries, adjacency, groups, modelDiag, sewTol, toDelete);
+    oc, faceEntries, adjacency, groups, modelDiag, sewTol, meshCentroid, toDelete);
 
   if (!topShape) {
     throw new Error(
