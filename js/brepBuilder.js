@@ -34,7 +34,7 @@
 // ── Build version ─────────────────────────────────────────────────────────────
 
 /** Increment this string with each release to verify live-site deployments. */
-export const BUILD_VERSION = 'v0.2.5';
+export const BUILD_VERSION = 'v0.2.8';
 
 // ── OpenCASCADE lazy loader ───────────────────────────────────────────────────
 
@@ -203,6 +203,50 @@ export function buildGroupAdjacencyMap(groups, geometry) {
   }
 
   return result;
+}
+
+/**
+ * Partition face groups into disconnected mesh islands using BFS over the
+ * group adjacency map.  Each island is the set of group indices that are
+ * transitively connected by shared mesh edges.
+ *
+ * A multi-body STL (e.g. a part + a separate washer) produces multiple
+ * islands.  Processing each island independently avoids spurious cross-body
+ * face intersections inside BOPAlgo_MakerVolume and BRepAlgoAPI_Section.
+ *
+ * @param {Map<number, Set<number>>} adjacency  from buildGroupAdjacencyMap()
+ * @param {number} groupCount  total number of groups (indices 0…groupCount-1)
+ * @returns {Array<number[]>}  one entry per island; each entry is a sorted
+ *   array of group indices belonging to that island
+ */
+export function findMeshIslands(adjacency, groupCount) {
+  const visited = new Set();
+  const islands = [];
+
+  for (let start = 0; start < groupCount; start++) {
+    if (visited.has(start)) continue;
+
+    // BFS from this unvisited group.
+    const island = [];
+    const queue = [start];
+    visited.add(start);
+    let head = 0;  // read-index pointer avoids O(N) shift()
+
+    while (head < queue.length) {
+      const cur = queue[head++];
+      island.push(cur);
+      for (const nb of (adjacency.get(cur) ?? [])) {
+        if (!visited.has(nb)) {
+          visited.add(nb);
+          queue.push(nb);
+        }
+      }
+    }
+
+    islands.push(island);
+  }
+
+  return islands;
 }
 
 // ── Vector math utilities ────────────────────────────────────────────────────
@@ -1227,6 +1271,75 @@ function _buildSolidViaMakerVolume(oc, faces, fuzzyTol, geometry, toDelete) {
 }
 
 /**
+ * Fuse an array of solids into one using sequential BRepAlgoAPI_Fuse calls
+ * (fold-left).  Returns a single fused solid, or the first element unchanged
+ * when the array has length 1.
+ *
+ * This is used after _filterSolidsInsideMesh so that MakerVolume's multiple
+ * interior cells are merged into the single topologically-correct solid that
+ * the STEP writer expects.
+ *
+ * In opencascade.js 2.0 beta the numbered overloads follow the same
+ * convention as BRepAlgoAPI_Section:
+ *   BRepAlgoAPI_Fuse_2(S1, S2)           — two shapes, PerformNow=true
+ *   BRepAlgoAPI_Fuse_1()                 — empty ctor + SetShape1/2 + Build
+ *
+ * @param {object[]} solids   array of TopoDS_Solid (length ≥ 1)
+ * @param {number}   tol      fuzzy tolerance forwarded to the boolean op
+ * @returns {object|null}  fused solid, or null when every attempt failed
+ */
+function _unionSolids(oc, solids, tol, toDelete) {
+  if (solids.length === 0) return null;
+  if (solids.length === 1) return solids[0];
+
+  // Helper: fuse exactly two shapes, trying numbered overloads in order.
+  const _fuseTwo = (a, b) => {
+    // Attempt 1: two-arg ctor (BRepAlgoAPI_Fuse_2 in 2.0 beta).
+    for (const name of ['BRepAlgoAPI_Fuse_2', 'BRepAlgoAPI_Fuse_3']) {
+      if (typeof oc[name] !== 'function') continue;
+      try {
+        const fuse = new oc[name](a, b, true);
+        toDelete.push(fuse);
+        if (typeof fuse.IsDone === 'function' && !fuse.IsDone()) continue;
+        const shape = fuse.Shape();
+        if (!shape || (typeof shape.IsNull === 'function' && shape.IsNull())) continue;
+        return shape;
+      } catch { continue; }
+    }
+    // Attempt 2: empty ctor + SetShape1/SetShape2 + Build (BRepAlgoAPI_Fuse_1).
+    if (typeof oc.BRepAlgoAPI_Fuse_1 === 'function') {
+      try {
+        const fuse = new oc.BRepAlgoAPI_Fuse_1();
+        toDelete.push(fuse);
+        if (typeof fuse.SetShape1 === 'function') fuse.SetShape1(a);
+        if (typeof fuse.SetShape2 === 'function') fuse.SetShape2(b);
+        if (typeof fuse.Build === 'function') {
+          const range = _mkRange(oc);
+          try { fuse.Build(range); } catch { try { fuse.Build(); } catch {} }
+        }
+        if (typeof fuse.IsDone === 'function' && !fuse.IsDone()) return null;
+        const shape = fuse.Shape();
+        if (!shape || (typeof shape.IsNull === 'function' && shape.IsNull())) return null;
+        return shape;
+      } catch { /* fall through */ }
+    }
+    return null;
+  };
+
+  // Fold-left: repeatedly fuse the accumulator with the next solid.
+  let acc = solids[0];
+  for (let i = 1; i < solids.length; i++) {
+    const fused = _fuseTwo(acc, solids[i]);
+    if (fused) {
+      acc = fused;
+    } else {
+      console.warn(`_unionSolids: BRepAlgoAPI_Fuse failed at step ${i}; accumulator unchanged.`);
+    }
+  }
+  return acc;
+}
+
+/**
  * From a MakerVolume result compound, collect every solid whose interior
  * lies within the original STL mesh and return them as a compound (or as a
  * single solid if only one survives).
@@ -1236,8 +1349,8 @@ function _buildSolidViaMakerVolume(oc, faces, fuzzyTol, geometry, toDelete) {
  * mesh using Möller–Trumbore ray-casting parity.
  *
  * @param {object} geometry  THREE.BufferGeometry of the original mesh
- * @returns {object|null}  TopoDS_Compound of kept solids, or a single
- *   TopoDS_Solid, or null when nothing survived the filter
+ * @returns {object|null}  fused TopoDS_Solid, or null when nothing survived
+ *   the filter
  */
 function _filterSolidsInsideMesh(oc, shape, geometry, tol, toDelete) {
   const SOLID_T = oc.TopAbs_ShapeEnum?.TopAbs_SOLID ?? 3;
@@ -1273,20 +1386,16 @@ function _filterSolidsInsideMesh(oc, shape, geometry, tol, toDelete) {
   if (kept.length === 0) return null;
   if (kept.length === 1) return kept[0];
 
-  // Multiple interior cells → return a compound so the STEP writer can
-  // export them all as separate (correctly bounded) solids.
-  try {
-    const compound = new oc.TopoDS_Compound();
-    const bb = new oc.BRep_Builder();
-    toDelete.push(bb);
-    bb.MakeCompound(compound);
-    toDelete.push(compound);
-    for (const s of kept) bb.Add(compound, s);
-    return compound;
-  } catch (e) {
-    console.warn('_filterSolidsInsideMesh: compound build failed:', e?.message ?? e);
-    return kept[0];  // best-effort single solid
-  }
+  // Multiple interior cells → fuse into one solid so the STEP writer produces
+  // a single body.  Sequential BRepAlgoAPI_Fuse (fold-left) is fast for the
+  // typical 2–20 cells that survive the mesh filter.
+  console.info(`BOPAlgo_MakerVolume: fusing ${kept.length} interior cells into one solid…`);
+  const fused = _unionSolids(oc, kept, tol, toDelete);
+  if (fused) return fused;
+
+  // Fuse failed entirely — fall back to first kept cell rather than a compound.
+  console.warn('_unionSolids failed entirely; returning first kept cell.');
+  return kept[0];
 }
 
 // ── Section-based solid builder ─────────────────────────────────────────────
@@ -1369,28 +1478,41 @@ function _buildSolidViaSections(oc, faceEntries, adjacency, groups,
 
 // ── Main solid builder ──────────────────────────────────────────────────────
 
+// Maximum number of faces for which we permit the global BOPAlgo_MakerVolume
+// call.  MakerVolume builds a global surface arrangement — O(N²) intersections,
+// O(N³) cells — so it is only safe to use on small per-island face counts.
+// Above this threshold we go directly to the Section-based path, which is
+// O(N·k) in the face count N and average neighbour count k.
+const MAX_GLOBAL_MV_FACES = 50;
+
 /**
  * Build a watertight solid from oversized analytical faces.
  *
- * Two implementations of the same face-based analytical-trimming approach:
- *   1. BOPAlgo_MakerVolume — ideal single-call (if available in this build).
- *   2. Section-based trimming — robust path using only core OCCT APIs.
- *
- * Both produce the same result: faces trimmed at exact analytical intersection
- * curves, assembled into a watertight solid.  No mesh-derived boundaries.
+ * Strategy:
+ *   1. BOPAlgo_MakerVolume — fast single-call path, capped at
+ *      MAX_GLOBAL_MV_FACES faces to prevent O(N²) blowup on large islands.
+ *   2. Section-based trimming — robust O(N·k) path using only core OCCT APIs.
+ *      Always used when face count exceeds the cap.
  *
  * @param {object} geometry  THREE.BufferGeometry — used to filter MakerVolume
  *   cells to only those that lie inside the original mesh boundary
  */
 function _buildSolid(oc, faceEntries, adjacency, groups,
                      modelDiag, sewTol, geometry, toDelete) {
-  // Fast path: BOPAlgo_MakerVolume.
   const faces = faceEntries.map(e => e.face);
-  const mv = _buildSolidViaMakerVolume(oc, faces, sewTol, geometry, toDelete);
-  if (mv) return mv;
+
+  if (faces.length <= MAX_GLOBAL_MV_FACES) {
+    // Fast path: BOPAlgo_MakerVolume (safe at small face counts).
+    const mv = _buildSolidViaMakerVolume(oc, faces, sewTol, geometry, toDelete);
+    if (mv) return mv;
+    console.info('BOPAlgo_MakerVolume did not produce a result — falling back to Section-based trimming.');
+  } else {
+    console.info(
+      `Skipping BOPAlgo_MakerVolume (${faces.length} faces > MAX=${MAX_GLOBAL_MV_FACES}) ` +
+      '— using Section-based trimming directly.');
+  }
 
   // Robust path: Section-based analytical trimming.
-  console.info('BOPAlgo_MakerVolume did not produce a result — using Section-based analytical trimming.');
   return _buildSolidViaSections(oc, faceEntries, adjacency, groups,
                                 modelDiag, sewTol, toDelete);
 }
@@ -1468,17 +1590,48 @@ export async function buildAndExportSTEP(groups, geometry, options = {}, onStatu
   // analytically by OCCT's geometry kernel.
   const adjacency = buildGroupAdjacencyMap(groups, geometry);
 
-  // ── Build a watertight solid ────────────────────────────────────────────────
-  // One approach (face-based analytical trimming) with two implementations:
-  //   • BOPAlgo_MakerVolume — ideal, single-call (if available in this build)
-  //   • Section-based trimming — robust path using only core OCCT APIs
-  // No fallback to untrimmed faces, no compound dumping.
-  const topShape = _buildSolid(
-    oc, faceEntries, adjacency, groups, modelDiag, sewTol, geometry, toDelete);
+  // ── Detect mesh islands ─────────────────────────────────────────────────────
+  // A multi-body STL (e.g. a part + a separate washer) has multiple connected
+  // components in the group adjacency graph.  We process each island completely
+  // independently so that face patches from one body never enter the boolean
+  // operations of another.
+  const islands = findMeshIslands(adjacency, groups.length);
+  console.info(`Mesh island detection: ${islands.length} island(s).`);
 
-  if (!topShape) {
+  // Map groupIdx → faceEntry for O(1) lookup when splitting by island.
+  const faceEntryByGroup = new Map(faceEntries.map(e => [e.groupIdx, e]));
+
+  // ── Build one solid per island ──────────────────────────────────────────────
+  // Each island is run through the full solid-building pipeline independently.
+  // Results are transferred to a single STEPControl_Writer so the output file
+  // contains all bodies together (as separate product solids).
+  const islandSolids = [];
+  for (let ii = 0; ii < islands.length; ii++) {
+    const islandGroupIdxs = islands[ii];
+    const islandFaceEntries = islandGroupIdxs
+      .map(gi => faceEntryByGroup.get(gi))
+      .filter(Boolean);
+
+    if (islandFaceEntries.length === 0) continue;
+
+    onStatus?.(
+      `Building solid ${ii + 1}/${islands.length} (${islandFaceEntries.length} faces)…`,
+      40 + 35 * ii / islands.length,
+    );
+
+    const solid = _buildSolid(
+      oc, islandFaceEntries, adjacency, groups, modelDiag, sewTol, geometry, toDelete);
+
+    if (solid) {
+      islandSolids.push(solid);
+    } else {
+      console.warn(`Island ${ii + 1}/${islands.length}: solid construction failed — skipped.`);
+    }
+  }
+
+  if (islandSolids.length === 0) {
     throw new Error(
-      'Solid construction failed.  Neither BOPAlgo_MakerVolume nor ' +
+      'Solid construction failed for all islands.  Neither BOPAlgo_MakerVolume nor ' +
       'Section-based trimming could produce a watertight solid from ' +
       `${faceEntries.length} analytical faces.`);
   }
@@ -1499,15 +1652,26 @@ export async function buildAndExportSTEP(groups, geometry, options = {}, onStatu
   // IFSelect_RetDone = 1 in all OCCT versions; also accept the enum object form.
   const DONE = oc.IFSelect_ReturnStatus?.IFSelect_RetDone ?? 1;
 
-  const transferResult = writer.Transfer(
-    topShape,
-    oc.STEPControl_StepModelType?.STEPControl_AsIs ?? 0,
-    true,
-    _mkRange(oc),
-  );
+  // Transfer each island solid into the writer.  STEPControl_Writer accumulates
+  // multiple Transfer() calls before a single Write() — each Transfer becomes
+  // one product shape in the output file.
+  let transferred = 0;
+  for (const solid of islandSolids) {
+    const transferResult = writer.Transfer(
+      solid,
+      oc.STEPControl_StepModelType?.STEPControl_AsIs ?? 0,
+      true,
+      _mkRange(oc),
+    );
+    if (transferResult === DONE) {
+      transferred++;
+    } else {
+      console.warn(`STEPControl_Writer.Transfer returned status ${transferResult} for an island — skipping.`);
+    }
+  }
 
-  if (transferResult !== DONE) {
-    throw new Error(`STEPControl_Writer.Transfer failed (status ${transferResult}).`);
+  if (transferred === 0) {
+    throw new Error(`STEPControl_Writer.Transfer failed for all ${islandSolids.length} island(s).`);
   }
 
   // ── STEP file write ─────────────────────────────────────────────────────────
