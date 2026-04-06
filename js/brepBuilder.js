@@ -24,7 +24,7 @@
 // ── Build version ─────────────────────────────────────────────────────────────
 
 /** Increment this string with each release to verify live-site deployments. */
-export const BUILD_VERSION = 'v0.2.13';
+export const BUILD_VERSION = 'v0.2.14';
 
 // ── OpenCASCADE lazy loader ───────────────────────────────────────────────────
 
@@ -750,10 +750,13 @@ function _buildSolidViaSplitter(oc, faceEntries, sewTol, toDelete, geometry) {
   const FACE_T  = oc.TopAbs_ShapeEnum?.TopAbs_FACE  ?? 4;
   const SHAPE_T = oc.TopAbs_ShapeEnum?.TopAbs_SHAPE ?? 0;
 
-  // Map groupIdx → {face, distSq} — best (closest) fragment per group.
-  const best = new Map();
-  for (const { groupIdx } of faceEntries) best.set(groupIdx, { face: null, distSq: Infinity });
-
+  // ── Step A: collect every output face fragment with its GProp centroid ──
+  // We gather ALL fragments first before doing any group assignment, so that
+  // each group can independently select its nearest fragment rather than
+  // having fragments assigned to groups (which caused wrong-side picks when a
+  // fragment's centroid happened to be geometrically closer to a different
+  // group's mesh centroid).
+  const frags = [];
   try {
     const exp = new oc.TopExp_Explorer_2(allPieces, FACE_T, SHAPE_T);
     toDelete.push(exp);
@@ -763,21 +766,7 @@ function _buildSolidViaSplitter(oc, faceEntries, sewTol, toDelete, geometry) {
       catch { fragFace = exp.Current(); }
 
       const c = _faceGPropCentroid(oc, fragFace, toDelete);
-      if (c) {
-        // Find the nearest group centroid.
-        let bestGroupIdx = -1, bestDist = Infinity;
-        for (const g of groupCentroids) {
-          const d = (c[0]-g.cx)**2 + (c[1]-g.cy)**2 + (c[2]-g.cz)**2;
-          if (d < bestDist) { bestDist = d; bestGroupIdx = g.groupIdx; }
-        }
-        if (bestGroupIdx >= 0) {
-          const slot = best.get(bestGroupIdx);
-          if (slot && bestDist < slot.distSq) {
-            slot.face = fragFace;
-            slot.distSq = bestDist;
-          }
-        }
-      }
+      if (c) frags.push({ fragFace, c });
 
       exp.Next();
     }
@@ -786,9 +775,30 @@ function _buildSolidViaSplitter(oc, faceEntries, sewTol, toDelete, geometry) {
     return null;
   }
 
+  // ── Step B: per-group independent selection ─────────────────────────────
+  // For each analytical group, find the fragment whose centroid is nearest to
+  // that group's own mesh-vertex centroid.  This is the correct direction:
+  // "group → closest fragment", not "fragment → nearest group".
+  // Use a map from fragment index to {winnerGroupIdx, distSq} to enforce
+  // uniqueness: if two groups claim the same fragment the closer one wins.
+  const fragClaim = new Map(); // fragIdx → { groupIdx, distSq }
+  for (const { groupIdx, cx, cy, cz } of groupCentroids) {
+    let bestFragIdx = -1, bestDistSq = Infinity;
+    for (let fi = 0; fi < frags.length; fi++) {
+      const { c } = frags[fi];
+      const d = (c[0]-cx)**2 + (c[1]-cy)**2 + (c[2]-cz)**2;
+      if (d < bestDistSq) { bestDistSq = d; bestFragIdx = fi; }
+    }
+    if (bestFragIdx < 0) continue;
+    const existing = fragClaim.get(bestFragIdx);
+    if (!existing || bestDistSq < existing.distSq) {
+      fragClaim.set(bestFragIdx, { groupIdx, distSq: bestDistSq });
+    }
+  }
+
   const keptFaces = [];
-  for (const { face, distSq } of best.values()) {
-    if (face && isFinite(distSq)) keptFaces.push(face);
+  for (const [fi] of fragClaim) {
+    keptFaces.push(frags[fi].fragFace);
   }
 
   if (keptFaces.length === 0) {
