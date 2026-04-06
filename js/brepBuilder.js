@@ -1101,7 +1101,7 @@ function _buildSolidViaMakerVolume(oc, faces, fuzzyTol, meshCentroid, toDelete) 
  * @returns {object|null}  TopoDS_Solid or null
  */
 function _selectSolidContaining(oc, shape, testPt, tol, toDelete) {
-  const SOLID_T = oc.TopAbs_ShapeEnum?.TopAbs_SOLID ?? 2;
+  const SOLID_T = oc.TopAbs_ShapeEnum?.TopAbs_SOLID ?? 3;
   const SHAPE_T = oc.TopAbs_ShapeEnum?.TopAbs_SHAPE ?? 0;
   const IN_STATE = oc.TopAbs_State?.TopAbs_IN ?? 0;
   const ON_STATE = oc.TopAbs_State?.TopAbs_ON ?? 2;
